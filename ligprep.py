@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 """
 Molecule Preparation Script for Docking
