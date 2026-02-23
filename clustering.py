@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 """
 This script performs clustering of molecules based on Morgan fingerprint similarity

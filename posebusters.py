@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 """
 PoseBusters CLI Wrapper for Counting Failed Pose Quality Checks

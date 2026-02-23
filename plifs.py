@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 """
 This script calculates protein-ligand interaction fingerprint similarities using ODDT.
