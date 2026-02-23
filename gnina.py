@@ -8,7 +8,7 @@ Combined script for three docking precision modes:
   htvs   High-throughput virtual screening. CPU-only, no CNN scoring.
          Spawns one GNINA process per CPU core for maximum throughput.
 
-  sp     Single-point GPU docking with CNN rescoring.
+  sp     Standard-precision GPU docking with CNN rescoring.
          CPUs are split evenly across GPUs for pose generation.
 
   xp     Extra-precision GPU docking with full CNN refinement.
@@ -521,7 +521,7 @@ Examples:
     # ── SP ────────────────────────────────────────────────────────────────────
     sp = subs.add_parser(
         "sp",
-        help="Single-point GPU docking with CNN rescoring",
+        help="Standard-precision GPU docking with CNN rescoring",
         formatter_class=RawDescriptionRichHelpFormatter,
         epilog=(
             "GPU-accelerated docking. CPU threads are divided evenly across GPUs.\n"
