@@ -9,6 +9,7 @@ dependencies:
   - biopython
   - pdbfixer
   - openmm
+  - oddt
 
   # Data / numerics / plotting
   - numpy
@@ -25,4 +26,3 @@ dependencies:
   - pip:
     - rich-argparse
     - argcomplete
-    - oddt
