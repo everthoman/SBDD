@@ -31,6 +31,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 try:
@@ -50,6 +52,7 @@ try:
     _BIOPYTHON = True
 except ImportError:
     _BIOPYTHON = False
+    Select = object  # placeholder so the class definition below doesn't crash
 
 try:
     from pdbfixer import PDBFixer
@@ -76,6 +79,23 @@ def format_time(seconds):
         return f"{seconds / 60:.2f} minutes"
     else:
         return f"{seconds / 3600:.2f} hours"
+
+
+# ─── Fetch ────────────────────────────────────────────────────────────────────
+
+def step_fetch(pdb_id, output_path):
+    """Download a PDB file from RCSB."""
+    pdb_id = pdb_id.upper()
+    url = f'https://files.rcsb.org/download/{pdb_id}.pdb'
+    print(f"  URL: {url}")
+    try:
+        urllib.request.urlretrieve(url, str(output_path))
+    except urllib.error.HTTPError as e:
+        print(f"[ERROR] Failed to fetch {pdb_id}: HTTP {e.code}")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"[ERROR] Network error: {e.reason}")
+        sys.exit(1)
 
 
 # ─── BioPython helpers ────────────────────────────────────────────────────────
@@ -157,7 +177,7 @@ def step_fix(input_pdb, output_pdb):
     fixer.findMissingResidues()
     n_res = sum(len(v) for v in fixer.missingResidues.values())
 
-    fixer.findNonStandardResidues()
+    fixer.findNonstandardResidues()
     nonstandard = [(r.name, s) for r, s in fixer.nonstandardResidues]
 
     fixer.findMissingAtoms()
@@ -191,8 +211,12 @@ def step_protonate_pdb2pqr(input_pdb, output_pdb, ph, ff='AMBER'):
         str(input_pdb),
         str(pqr_out),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True,
-                            cwd=str(output_pdb.parent))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                cwd=str(output_pdb.parent))
+    except FileNotFoundError:
+        print("  [WARNING] pdb2pqr not found in PATH")
+        return False
     if result.returncode != 0:
         print(f"  [WARNING] PDB2PQR exited with code {result.returncode}:")
         for line in result.stderr.strip().splitlines()[:8]:
@@ -320,8 +344,12 @@ Examples:
     )
 
     io = p.add_argument_group('Input / Output')
-    inp = io.add_argument('-i', '--input', required=True, metavar='PDB',
-                          help='Input PDB file')
+    io.add_argument('--fetch', metavar='PDBID',
+                    help='Fetch structure from RCSB PDB before preparing '
+                         '(e.g. --fetch 1ABC). Sets --input to <PDBID>.pdb '
+                         'if --input is not given.')
+    inp = io.add_argument('-i', '--input', metavar='PDB',
+                          help='Input PDB file (required unless --fetch is used)')
     io.add_argument('-o', '--output', metavar='PDB',
                     help='Output path for prepared structure '
                          '(default: <input>_prepared.pdb)')
@@ -373,8 +401,20 @@ def main():
     args = parse_args()
     t0 = time.time()
 
+    if not args.input and not args.fetch:
+        print("[ERROR] Provide --input or --fetch PDBID")
+        sys.exit(1)
+
+    if args.fetch and not args.input:
+        args.input = f'{args.fetch.upper()}.pdb'
+
     input_pdb = Path(args.input).resolve()
-    if not input_pdb.exists():
+
+    if args.fetch:
+        print(f"\n[FETCH] Downloading {args.fetch.upper()} from RCSB PDB...")
+        step_fetch(args.fetch, input_pdb)
+        print(f"[INFO] Saved  →  {input_pdb.name}")
+    elif not input_pdb.exists():
         print(f"[ERROR] File not found: {input_pdb}")
         sys.exit(1)
 
@@ -387,6 +427,8 @@ def main():
     prot_method = 'PDBFixer' if args.no_pdb2pqr else 'PDB2PQR + PROPKA'
 
     print()
+    if args.fetch:
+        print(f"[CONFIG] Fetch:        {args.fetch.upper()} (RCSB PDB)")
     print(f"[CONFIG] Input:        {input_pdb}")
     print(f"[CONFIG] Output:       {prepared_pdb}")
     if args.minimize:
