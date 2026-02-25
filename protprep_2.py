@@ -43,6 +43,13 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+try:
+    import numpy as np
+    _NUMPY = True
+except ImportError:
+    np = None  # type: ignore
+    _NUMPY = False
+
 # ─── Optional imports ────────────────────────────────────────────────────────
 
 try:
@@ -211,6 +218,19 @@ _DEFAULT_VDW_NM = 0.170
 
 def _element_vdw(element: str) -> float:
     return _VDW_RADII_NM.get(element.upper(), _DEFAULT_VDW_NM)
+
+
+def _rotate_around_axis(pos, p1, p2):
+    """Rotate *pos* (numpy array) by 180° around the axis p1→p2.
+
+    Uses the 180° special case of Rodrigues' rotation formula:
+        R₁₈₀(v) = 2(v·n̂)n̂ − v
+    where v = pos − p1 and n̂ = normalise(p2 − p1).
+    """
+    v = pos - p1
+    n = p2 - p1
+    n = n / np.linalg.norm(n)
+    return p1 + 2.0 * np.dot(v, n) * n - v
 
 
 class _ChainSelector(Select):
@@ -788,41 +808,355 @@ def _add_ligand_wall_forces(system, topology, hetatm_heavy: List[dict]) -> int:
     return len(hetatm_heavy)
 
 
-def step_minimize(fixed_pdb: Path, output_pdb: Path, ph: float,
+def step_protonate_ligand(
+        hetatm_lines: List[str], work_dir: Path,
+        output_sdf: Path, ph: float) -> Tuple[bool, List[dict], List[str]]:
+    """Protonate HETATM residues at target pH using OpenBabel.
+
+    Writes a protonated SDF file (for use as a GNINA reference ligand),
+    returns heavy-atom positions in nm for frozen wall forces during OpenMM
+    minimization, and returns the protonated HETATM lines for H-bond scoring
+    in the rotamer flip step.  Falls back to original coordinates if obabel
+    is absent or fails.
+
+    Returns (sdf_written: bool, hetatm_heavy: list[dict], prot_hetatm_lines: list[str]).
+    """
+    lig_pdb      = work_dir / 'ligand_raw.pdb'
+    lig_prot_pdb = work_dir / 'ligand_protonated.pdb'
+
+    text = ''.join(hetatm_lines)
+    if not text.rstrip().endswith('END'):
+        text += 'END\n'
+    lig_pdb.write_text(text)
+
+    # Protonate with OpenBabel (-p sets pH, coordinates unchanged)
+    protonated_ok = False
+    try:
+        result = subprocess.run(
+            ['obabel', str(lig_pdb), '-O', str(lig_prot_pdb), f'-p{ph}'],
+            capture_output=True, text=True,
+        )
+        protonated_ok = result.returncode == 0 and lig_prot_pdb.exists()
+        if not protonated_ok:
+            _warn(f"OpenBabel protonation failed (code {result.returncode}); "
+                  "using original HETATM coordinates for wall forces")
+    except FileNotFoundError:
+        _warn("obabel not found — ligand protonation skipped; "
+              "install openbabel for pH-aware ligand preparation")
+
+    source_pdb = lig_prot_pdb if protonated_ok else lig_pdb
+
+    # Convert to SDF for GNINA
+    sdf_ok = False
+    try:
+        result2 = subprocess.run(
+            ['obabel', str(source_pdb), '-O', str(output_sdf)],
+            capture_output=True, text=True,
+        )
+        sdf_ok = result2.returncode == 0 and output_sdf.exists()
+        if not sdf_ok:
+            _warn("OpenBabel SDF conversion failed; no ligand SDF written")
+    except FileNotFoundError:
+        pass
+
+    # Parse heavy-atom positions (Å → nm) for frozen wall forces
+    hetatm_heavy: List[dict] = []
+    for line in source_pdb.read_text().splitlines():
+        if line[:6].strip() != 'HETATM':
+            continue
+        try:
+            x = float(line[30:38]) / 10.0
+            y = float(line[38:46]) / 10.0
+            z = float(line[46:54]) / 10.0
+            raw_elem = line[76:78].strip() if len(line) > 76 else ''
+            if not raw_elem:
+                raw_elem = ''.join(c for c in line[12:16].strip()
+                                   if c.isalpha())[:2]
+            element = raw_elem.upper()
+            if element and element[0] != 'H':
+                hetatm_heavy.append({'pos': (x, y, z), 'element': element})
+        except (ValueError, IndexError):
+            pass
+
+    # Collect protonated HETATM lines for rotamer H-bond scoring
+    prot_hetatm_lines: List[str] = []
+    for line in source_pdb.read_text().splitlines(keepends=True):
+        if line[:6].strip() == 'HETATM':
+            prot_hetatm_lines.append(line)
+
+    return sdf_ok, hetatm_heavy, prot_hetatm_lines
+
+
+def step_flip_rotamers(
+        prot_pdb: Path,
+        output_pdb: Path,
+        hetatm_lines: Optional[List[str]] = None,
+        neighbor_cutoff: float = 5.0) -> Tuple[int, int]:
+    """Optimise ASN / GLN amide orientation and HIS tautomer assignment.
+
+    For each ASN and GLN residue the amide group (O + N + attached H atoms)
+    is tested in both the current orientation and rotated 180° around the
+    Cα–Cβ–CG or CG–CD bond axis.  The orientation that maximises H···acceptor
+    contacts (< 2.5 Å) with the surrounding environment (protein + ligand)
+    is kept.
+
+    For HIS the HID (H on Nδ) ↔ HIE (H on Nε) assignment is optimised with
+    the same distance-based score.  The imidazole H is repositioned using
+    ideal sp² geometry when a tautomer swap is beneficial.
+
+    Protonation states and all other atom positions are never changed.
+
+    Parameters
+    ----------
+    prot_pdb : Path
+        Protonated protein-only PDB (pdb2pqr / PDBFixer output).
+    output_pdb : Path
+        Path for the optimised output PDB.
+    hetatm_lines : list[str] | None
+        Protonated HETATM lines (ligand) for including the ligand in
+        H-bond scoring.
+    neighbor_cutoff : float
+        Search radius in Å for environment atoms (default 5 Å).
+
+    Returns
+    -------
+    (n_asn_gln, n_his)
+        Number of ASN/GLN and HIS residues that were actually flipped.
+    """
+    if not _BIOPYTHON:
+        _warn("BioPython not available — skipping rotamer flip")
+        shutil.copy(prot_pdb, output_pdb)
+        return 0, 0
+    if not _NUMPY:
+        _warn("NumPy not available — skipping rotamer flip")
+        shutil.copy(prot_pdb, output_pdb)
+        return 0, 0
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('p', str(prot_pdb))
+    model = structure[0]
+
+    # ── Collect protonated ligand atom positions for scoring ──────────────────
+    lig_heavy_pos: List[np.ndarray] = []
+    lig_h_pos:     List[np.ndarray] = []
+    if hetatm_lines:
+        for line in hetatm_lines:
+            if line[:6].strip() != 'HETATM':
+                continue
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                raw_elem = line[76:78].strip() if len(line) > 76 else ''
+                if not raw_elem:
+                    raw_elem = ''.join(c for c in line[12:16].strip()
+                                       if c.isalpha())[:2]
+                elem = raw_elem.upper()
+                pos = np.array([x, y, z])
+                if elem.startswith('H') or elem == 'D':
+                    lig_h_pos.append(pos)
+                else:
+                    lig_heavy_pos.append(pos)
+            except (ValueError, IndexError):
+                pass
+
+    # ── Neighbour search over all protein atoms ───────────────────────────────
+    all_atoms = list(model.get_atoms())
+    ns = NeighborSearch(all_atoms)
+
+    def _get_env(center_positions, exclude_ids, cutoff):
+        """Return (acceptor_positions, donor_H_positions) arrays from environment."""
+        acc: List[np.ndarray] = []
+        don: List[np.ndarray] = []
+        seen: set = set()
+        for cp in center_positions:
+            for atom in ns.search(list(cp), cutoff, 'A'):
+                aid = id(atom)
+                if aid in seen or aid in exclude_ids:
+                    continue
+                seen.add(aid)
+                elem = (atom.element or '').upper().strip()
+                apos = atom.coord.copy()
+                if elem in ('H', 'D'):
+                    don.append(apos)
+                elif elem in ('O', 'N', 'S'):
+                    acc.append(apos)
+        for pos in lig_heavy_pos:
+            if any(np.linalg.norm(pos - cp) < cutoff for cp in center_positions):
+                acc.append(pos.copy())
+        for pos in lig_h_pos:
+            if any(np.linalg.norm(pos - cp) < cutoff for cp in center_positions):
+                don.append(pos.copy())
+        A = np.array(acc) if acc else np.zeros((0, 3))
+        D = np.array(don) if don else np.zeros((0, 3))
+        return A, D
+
+    def _hbond_score(h_positions, acc_env, o_positions, don_env, cutoff=2.5):
+        """Weighted H···acceptor + acceptor···donor-H contact score."""
+        score = 0.0
+        c2 = cutoff * cutoff
+        for h in h_positions:
+            if len(acc_env):
+                d2 = np.sum((acc_env - h) ** 2, axis=1)
+                close = d2[d2 < c2]
+                score += float(np.sum(1.0 - np.sqrt(close) / cutoff))
+        for o in o_positions:
+            if len(don_env):
+                d2 = np.sum((don_env - o) ** 2, axis=1)
+                close = d2[d2 < c2]
+                score += float(np.sum(1.0 - np.sqrt(close) / cutoff))
+        return score
+
+    n_asn_gln = 0
+    n_his = 0
+
+    # ── ASN / GLN amide flips ─────────────────────────────────────────────────
+    for chain in model:
+        for res in chain:
+            resname = res.get_resname().strip().upper()
+            if resname == 'ASN':
+                axis_names = ('CB', 'CG')
+                flip_heavy = ['OD1', 'ND2']
+                h_names    = ['HD21', 'HD22']
+                acc_name   = 'OD1'
+            elif resname == 'GLN':
+                axis_names = ('CG', 'CD')
+                flip_heavy = ['OE1', 'NE2']
+                h_names    = ['HE21', 'HE22']
+                acc_name   = 'OE1'
+            else:
+                continue
+
+            if not all(n in res for n in list(axis_names) + flip_heavy):
+                continue
+
+            p1 = res[axis_names[0]].coord.copy()
+            p2 = res[axis_names[1]].coord.copy()
+            to_rotate    = [n for n in flip_heavy + h_names if n in res]
+            exclude_ids  = {id(res[n]) for n in to_rotate}
+
+            cur_h_pos = [res[n].coord.copy() for n in h_names if n in res]
+            cur_o_pos = [res[acc_name].coord.copy()]
+
+            rot: dict = {n: _rotate_around_axis(res[n].coord.copy(), p1, p2)
+                         for n in to_rotate}
+            rot_h_pos = [rot[n] for n in h_names if n in res]
+            rot_o_pos = [rot[acc_name]]
+
+            centers = [res[n].coord.copy() for n in flip_heavy]
+            acc_env, don_env = _get_env(centers, exclude_ids, neighbor_cutoff)
+
+            cur_score = _hbond_score(cur_h_pos, acc_env, cur_o_pos, don_env)
+            rot_score = _hbond_score(rot_h_pos, acc_env, rot_o_pos, don_env)
+
+            if rot_score > cur_score + 0.05:
+                for n, new_pos in rot.items():
+                    res[n].coord = new_pos
+                n_asn_gln += 1
+
+    # ── HIS tautomer (HID ↔ HIE) optimisation ────────────────────────────────
+    for chain in model:
+        for res in chain:
+            resname = res.get_resname().strip().upper()
+            if resname not in ('HIS', 'HID', 'HIE', 'HIP', 'HSP', 'HSE', 'HSD'):
+                continue
+
+            has_HD1 = 'HD1' in res
+            has_HE2 = 'HE2' in res
+            if has_HD1 and has_HE2:
+                continue  # HIP: fully protonated
+            if not has_HD1 and not has_HE2:
+                continue  # no imidazole H to optimise
+            if not all(n in res for n in ('ND1', 'NE2', 'CE1', 'CD2', 'CG')):
+                continue
+
+            nd1 = res['ND1'].coord.copy()
+            ne2 = res['NE2'].coord.copy()
+            ce1 = res['CE1'].coord.copy()
+            cd2 = res['CD2'].coord.copy()
+            cg  = res['CG'].coord.copy()
+
+            def _ideal_h(n_pos, c1, c2, bond=1.01):
+                """Place H at ideal sp² geometry given two bonded C atoms."""
+                mid = 0.5 * (c1 + c2)
+                d = n_pos - mid
+                norm = np.linalg.norm(d)
+                if norm < 1e-6:
+                    return n_pos + np.array([0.0, 0.0, bond])
+                return n_pos + (d / norm) * bond
+
+            hd1_ideal = _ideal_h(nd1, cg,  ce1)   # H on Nδ1
+            he2_ideal = _ideal_h(ne2, cd2, ce1)   # H on Nε2
+
+            exclude_ids = set()
+            if has_HD1: exclude_ids.add(id(res['HD1']))
+            if has_HE2: exclude_ids.add(id(res['HE2']))
+            acc_env, don_env = _get_env([nd1, ne2], exclude_ids, neighbor_cutoff)
+
+            if has_HD1:
+                cur_h, cur_acc = [hd1_ideal], [ne2]
+                alt_h, alt_acc = [he2_ideal], [nd1]
+            else:
+                cur_h, cur_acc = [he2_ideal], [nd1]
+                alt_h, alt_acc = [hd1_ideal], [ne2]
+
+            cur_score = _hbond_score(cur_h, acc_env, cur_acc, don_env)
+            alt_score = _hbond_score(alt_h, acc_env, alt_acc, don_env)
+
+            if alt_score > cur_score + 0.05:
+                from Bio.PDB.Atom import Atom as _BioAtom
+                if has_HD1:
+                    res.detach_child('HD1')
+                    new_h = _BioAtom('HE2', he2_ideal, 0.0, 1.0, ' ', ' HE2', None, 'H')
+                    res.add(new_h)
+                else:
+                    res.detach_child('HE2')
+                    new_h = _BioAtom('HD1', hd1_ideal, 0.0, 1.0, ' ', ' HD1', None, 'H')
+                    res.add(new_h)
+                n_his += 1
+
+    # ── Write output ──────────────────────────────────────────────────────────
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(str(output_pdb))
+
+    return n_asn_gln, n_his
+
+
+def step_minimize(protein_pdb: Path, output_pdb: Path, ph: float,
                   max_iter: int = 1000, restraint_k: float = 1000.0,
-                  restrain_sidechains: bool = False) -> bool:
+                  restrain_sidechains: bool = False,
+                  hetatm_heavy: Optional[List[dict]] = None,
+                  has_hydrogens: bool = False) -> bool:
     """OpenMM restrained energy minimization.
 
-    HETATM residues (e.g. a co-crystallised reference ligand kept via
-    --keep-het) are handled without force-field parameterisation:
-      • They are stripped from the OpenMM topology so AMBER14 can build the
-        system without errors.
-      • Their heavy atoms are re-introduced as frozen *wall* forces
-        (r⁻¹² repulsion from fixed positions) so the binding-site protein
-        geometry adapts correctly during minimisation.
-      • Their original coordinates are appended verbatim to the output PDB.
+    protein_pdb must contain protein atoms only (no HETATM).  When
+    has_hydrogens=True the structure is assumed to be already protonated
+    (e.g. by pdb2pqr) and addHydrogens() is skipped, preserving the
+    assigned protonation states exactly.
 
-    Pass restrain_sidechains=True to restrain all protein heavy atoms.
-    Default (False here, but True from CLI) restrains all heavy atoms.
+    Frozen ligand wall forces are built from hetatm_heavy (a list of
+    {'pos': (x,y,z) nm, 'element': str} dicts for the protonated ligand)
+    when provided.  The output PDB is protein-only; the prepared ligand
+    lives in its separately-written SDF.
     """
     if not _OPENMM:
         _warn("OpenMM not found — skipping minimization.")
         _info("Install:  conda install -c conda-forge openmm")
         return False
 
-    # ── Split HETATM from protein ────────────────────────────────────────────
-    prot_only_pdb = fixed_pdb.with_name(fixed_pdb.stem + '_prot_only.pdb')
-    hetatm_lines, hetatm_heavy = _split_protein_hetatm(fixed_pdb, prot_only_pdb)
-    omm_input = prot_only_pdb if hetatm_lines else fixed_pdb
     if hetatm_heavy:
         _info(f"HETATM heavy atoms (frozen walls): {len(hetatm_heavy)}")
 
     # ── Cap chain breaks before OpenMM sees the structure ────────────────────
     if _PDBFIXER:
-        fixer = PDBFixer(filename=str(omm_input))
+        fixer = PDBFixer(filename=str(protein_pdb))
         fixer.findMissingResidues()
         fixer.missingResidues = {}
         fixer.findMissingAtoms()
+        if has_hydrogens:
+            # H already assigned — only let PDBFixer add missing terminal atoms
+            fixer.missingAtoms = {}
         n_term = sum(len(v) for v in fixer.missingTerminals.values())
         if n_term:
             _info(f"Chain-break termini: capping {n_term} atom(s) for OpenMM")
@@ -832,12 +1166,21 @@ def step_minimize(fixed_pdb: Path, output_pdb: Path, ph: float,
         buf.seek(0)
         pdb = omm_app.PDBFile(buf)
     else:
-        pdb = omm_app.PDBFile(str(omm_input))
+        pdb = omm_app.PDBFile(str(protein_pdb))
 
     ff_obj = omm_app.ForceField('amber14-all.xml')
     modeller = omm_app.Modeller(pdb.topology, pdb.positions)
-    modeller.addHydrogens(ff_obj, pH=ph)
-    system = ff_obj.createSystem(modeller.topology, nonbondedMethod=omm_app.NoCutoff)
+    if not has_hydrogens:
+        modeller.addHydrogens(ff_obj, pH=ph)
+
+    try:
+        system = ff_obj.createSystem(modeller.topology,
+                                     nonbondedMethod=omm_app.NoCutoff)
+    except Exception as e:
+        _warn(f"Force field setup failed: {e}")
+        _warn("Check for non-standard residue names (e.g. from pdb2pqr output).")
+        _warn("Try --no-pdb2pqr or inspect the structure manually.")
+        return False
 
     # ── Frozen ligand wall forces ────────────────────────────────────────────
     if hetatm_heavy:
@@ -885,20 +1228,10 @@ def step_minimize(fixed_pdb: Path, output_pdb: Path, ph: float,
     e_after = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
     _info(f"Energy after:  {e_after:>12.1f} kcal/mol  (Δ = {e_after - e_before:+.1f})")
 
-    # ── Write output: minimised protein + original HETATM ───────────────────
+    # ── Write protein-only output (ligand lives in its separate SDF) ─────────
     buf = _io.StringIO()
     omm_app.PDBFile.writeFile(sim.topology, state.getPositions(), buf, keepIds=True)
-    text = buf.getvalue()
-    if hetatm_lines:
-        # Remove trailing END record so we can append HETATM before it
-        end_pos = text.rfind('\nEND')
-        if end_pos >= 0:
-            text = text[:end_pos + 1]
-        text += ''.join(hetatm_lines)
-        if not text.endswith('\n'):
-            text += '\n'
-        text += 'END\n'
-    output_pdb.write_text(text)
+    output_pdb.write_text(buf.getvalue())
     return True
 
 
@@ -958,6 +1291,11 @@ def _print_summary(stats: dict, args, prepared_pdb: Path,
         row("Protonation method",      prot_labels.get(prot, prot))
         row("pH",                      args.ph)
 
+        flips = stats.get('flips')
+        if flips is not None:
+            row("Rotamer flips (ASN/GLN)", flips['asn_gln'])
+            row("Rotamer flips (HIS)",     flips['his'])
+
         clashes = stats.get('clashes_before', -1)
         clashes_after = stats.get('clashes_after', -1)
         if clashes >= 0:
@@ -968,6 +1306,8 @@ def _print_summary(stats: dict, args, prepared_pdb: Path,
         row("Output (prepared)",       str(prepared_pdb))
         if minimized_pdb and minimized_pdb.exists():
             row("Output (minimized)",  str(minimized_pdb))
+        if stats.get('ligand_sdf') and Path(stats['ligand_sdf']).exists():
+            row("Ligand SDF (prepared)", stats['ligand_sdf'])
         row("Elapsed",                 _fmt_time(elapsed))
 
         console.print(tbl)
@@ -978,9 +1318,14 @@ def _print_summary(stats: dict, args, prepared_pdb: Path,
         _print(f"  Standard residues:      {info.get('n_std', '?')}")
         _print(f"  Waters removed:         {info.get('n_water', '?')}")
         _print(f"  Protonation:            {prot_labels.get(prot, prot)}  (pH {args.ph})")
+        flips = stats.get('flips')
+        if flips is not None:
+            _print(f"  Rotamer flips:          {flips['asn_gln']} ASN/GLN,  {flips['his']} HIS")
         _print(f"  Output:                 {prepared_pdb}")
         if minimized_pdb and minimized_pdb.exists():
             _print(f"  Minimized:              {minimized_pdb}")
+        if stats.get('ligand_sdf'):
+            _print(f"  Ligand SDF:             {stats['ligand_sdf']}")
         _print(f"  Elapsed:                {_fmt_time(elapsed)}")
         _rule()
 
@@ -1041,6 +1386,10 @@ Examples:
                       help='Force field for PDB2PQR atom naming (default: AMBER)')
     prot.add_argument('--no-pdb2pqr', action='store_true',
                       help='Skip PDB2PQR/PROPKA; use PDBFixer for H addition')
+    prot.add_argument('--no-flip', action='store_true',
+                      help='Skip ASN/GLN/HIS rotamer optimisation (flips amide '
+                           'groups and HIS tautomers to maximise H-bond contacts '
+                           'with the environment and any kept ligand)')
 
     fix_grp = p.add_argument_group('Structure Repair')
     fix_grp.add_argument('--skip-fix', action='store_true',
@@ -1099,7 +1448,8 @@ def main():
             "Inspired by Schrödinger Protein Preparation Wizard")
 
     prot_method = 'PDBFixer' if args.no_pdb2pqr else 'PDB2PQR + PROPKA'
-    n_steps = 2 + int(bool(args.fetch)) + int(not args.skip_fix) + int(args.cap) + int(args.minimize)
+    n_steps = (2 + int(bool(args.fetch)) + int(not args.skip_fix)
+               + int(args.cap) + int(not args.no_flip) + int(args.minimize))
 
     _print()
     _info(f"Input:         {input_pdb}")
@@ -1115,6 +1465,7 @@ def main():
               f"max_iter = {args.max_iter}, restrain = {restrain_str})")
     else:
         _info("Minimize:      no")
+    _info(f"Flip rotamers: {'no' if args.no_flip else 'yes  (ASN/GLN/HIS, 5 Å cutoff)'}")
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     prepared_pdb = (Path(args.output).resolve() if args.output
@@ -1196,15 +1547,25 @@ def main():
             _info(f"Sequence gaps: {n_gaps} TER record(s) inserted at chain break(s)")
         fixed_pdb = gap_pdb
 
-        # ── Step: Protonate ───────────────────────────────────────────────────
+        # ── Separate protein from HETATM before protonation ───────────────────
+        # pdb2pqr runs on the protein only (avoids failures on unknown ligands).
+        # The ligand is protonated separately by OpenBabel so each tool handles
+        # what it is designed for, and protonation states are never re-assigned.
+        prot_input_pdb = tmp / 'protein_only.pdb'
+        hetatm_lines, _ = _split_protein_hetatm(gap_pdb, prot_input_pdb)
+        if hetatm_lines:
+            n_het_rec = sum(1 for l in hetatm_lines if l[:6].strip() == 'HETATM')
+            _info(f"HETATM separated: {n_het_rec} record(s) — protonated separately")
+
+        # ── Step: Protonate (protein) ──────────────────────────────────────────
         next_step(f"Protonation at pH {args.ph}")
         prot_pdb = tmp / 'protonated.pdb'
 
         if args.no_pdb2pqr:
-            step_protonate_pdbfixer(fixed_pdb, prot_pdb, args.ph)
+            step_protonate_pdbfixer(prot_input_pdb, prot_pdb, args.ph)
             stats['prot'] = 'pdbfixer'
         else:
-            ok, propka_info = step_protonate_pdb2pqr(fixed_pdb, prot_pdb,
+            ok, propka_info = step_protonate_pdb2pqr(prot_input_pdb, prot_pdb,
                                                       args.ph, args.ff)
             if ok:
                 stats['prot'] = 'pdb2pqr+propka'
@@ -1212,11 +1573,39 @@ def main():
                     _report_protonation(propka_info, args.ph)
             else:
                 _warn("Falling back to PDBFixer hydrogen addition")
-                step_protonate_pdbfixer(fixed_pdb, prot_pdb, args.ph)
+                step_protonate_pdbfixer(prot_input_pdb, prot_pdb, args.ph)
                 stats['prot'] = 'pdbfixer_fallback'
 
+        _ok("Protein protonation done  (protein only)")
+
+        # ── Protonate ligand with OpenBabel; write SDF for GNINA ──────────────
+        hetatm_heavy_for_walls: List[dict] = []
+        prot_hetatm_lines: List[str] = []
+        if hetatm_lines:
+            lig_sdf = prepared_pdb.with_name(stem + '_prepared_ligand.sdf')
+            _info(f"Protonating ligand at pH {args.ph} with OpenBabel...")
+            sdf_ok, hetatm_heavy_for_walls, prot_hetatm_lines = step_protonate_ligand(
+                hetatm_lines, tmp, lig_sdf, args.ph)
+            if sdf_ok:
+                _ok(f"Ligand SDF  →  {lig_sdf.name}")
+                stats['ligand_sdf'] = str(lig_sdf)
+            else:
+                _warn("Ligand SDF not written; wall forces use raw coordinates")
+
+        # ── Step: Flip ASN/GLN/HIS rotamers ───────────────────────────────────
+        if not args.no_flip:
+            next_step("Optimising ASN/GLN/HIS rotamers (H-bond scoring)")
+            flipped_pdb = tmp / 'flipped.pdb'
+            n_asn_gln, n_his = step_flip_rotamers(
+                prot_pdb, flipped_pdb,
+                hetatm_lines=prot_hetatm_lines or None,
+                neighbor_cutoff=5.0)
+            prot_pdb = flipped_pdb
+            stats['flips'] = {'asn_gln': n_asn_gln, 'his': n_his}
+            _ok(f"Rotamer flips: {n_asn_gln} ASN/GLN,  {n_his} HIS")
+
         shutil.copy(prot_pdb, prepared_pdb)
-        _ok(f"Protonation done  →  {prepared_pdb.name}")
+        _ok(f"Prepared protein  →  {prepared_pdb.name}")
 
         # Clash check (optional)
         if args.clash_check:
@@ -1233,9 +1622,11 @@ def main():
         # ── Step: Minimize ────────────────────────────────────────────────────
         if args.minimize:
             next_step("Energy minimization (OpenMM, ff14SB, vacuum)")
-            ok = step_minimize(fixed_pdb, minimized_pdb, ph=args.ph,
+            ok = step_minimize(prot_pdb, minimized_pdb, ph=args.ph,
                                max_iter=args.max_iter, restraint_k=args.restraint_k,
-                               restrain_sidechains=not args.relax_sidechains)
+                               restrain_sidechains=not args.relax_sidechains,
+                               hetatm_heavy=hetatm_heavy_for_walls,
+                               has_hydrogens=True)
             if ok:
                 _ok(f"Minimization done  →  {minimized_pdb.name}")
                 if args.clash_check:
