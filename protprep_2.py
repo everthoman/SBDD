@@ -787,11 +787,19 @@ def _add_ligand_wall_forces(system, topology, hetatm_heavy: List[dict]) -> int:
     This keeps the binding-site protein geometry consistent with the
     ligand's presence without requiring force-field parameters for the ligand.
 
+    Wall forces are applied only to non-polar protein heavy atoms (C, S, P,
+    halogens, metals).  Polar O and N atoms are excluded because they may be
+    in H-bond contact with the ligand; applying a repulsive wall to them
+    would break those H-bonds during minimization.
+
     Returns the number of wall forces added (= number of HETATM heavy atoms).
     """
+    # Elements that can H-bond: excluded so contacts are not disturbed
+    _POLAR = frozenset({'O', 'N'})
     protein_heavy_indices = [
         atom.index for atom in topology.atoms()
-        if atom.element is not None and atom.element.symbol != 'H'
+        if atom.element is not None
+        and atom.element.symbol not in ('H',) | _POLAR
     ]
     for lig in hetatm_heavy:
         x0, y0, z0 = lig['pos']
@@ -1105,6 +1113,11 @@ def step_flip_rotamers(
 
             if alt_score > cur_score + 0.05:
                 from Bio.PDB.Atom import Atom as _BioAtom
+                # Residue-name map: old name → new name after tautomer swap
+                _his_rename = {
+                    'HID': 'HIE', 'HIE': 'HID',   # AMBER naming
+                    'HSD': 'HSE', 'HSE': 'HSD',   # CHARMM naming
+                }
                 if has_HD1:
                     res.detach_child('HD1')
                     new_h = _BioAtom('HE2', he2_ideal, 0.0, 1.0, ' ', ' HE2', None, 'H')
@@ -1113,6 +1126,10 @@ def step_flip_rotamers(
                     res.detach_child('HE2')
                     new_h = _BioAtom('HD1', hd1_ideal, 0.0, 1.0, ' ', ' HD1', None, 'H')
                     res.add(new_h)
+                # Keep residue name consistent with the H atom now present
+                old_name = res.get_resname().strip()
+                if old_name in _his_rename:
+                    res.resname = _his_rename[old_name]
                 n_his += 1
 
     # ── Write output ──────────────────────────────────────────────────────────
