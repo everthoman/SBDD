@@ -1132,6 +1132,38 @@ def step_flip_rotamers(
                     res.resname = _his_rename[old_name]
                 n_his += 1
 
+    # ── Normalise HIS residue names to match H atom assignments ──────────────
+    # pdb2pqr may output generic 'HIS' for some residues.  Regardless of
+    # whether a flip was performed, ensure the residue name reflects the H
+    # atom that is actually present on the imidazole ring:
+    #   HD1 present, HE2 absent  →  HID (AMBER) / HSD (CHARMM)
+    #   HE2 present, HD1 absent  →  HIE (AMBER) / HSE (CHARMM)
+    #   both present             →  HIP (AMBER) / HSP (CHARMM)
+    _charmm_his = frozenset({'HSD', 'HSE', 'HSP'})
+    _his_variants = frozenset({'HIS', 'HID', 'HIE', 'HIP', 'HSD', 'HSE', 'HSP'})
+    n_renamed = 0
+    for chain in model:
+        for res in chain:
+            rn = res.get_resname().strip().upper()
+            if rn not in _his_variants:
+                continue
+            use_charmm = rn in _charmm_his
+            hd1 = 'HD1' in res
+            he2 = 'HE2' in res
+            if hd1 and he2:
+                correct = 'HSP' if use_charmm else 'HIP'
+            elif hd1:
+                correct = 'HSD' if use_charmm else 'HID'
+            elif he2:
+                correct = 'HSE' if use_charmm else 'HIE'
+            else:
+                continue  # no imidazole H — leave name as-is
+            if res.get_resname().strip() != correct:
+                res.resname = correct
+                n_renamed += 1
+    if n_renamed:
+        _info(f"HIS residue names normalised: {n_renamed}")
+
     # ── Write output ──────────────────────────────────────────────────────────
     io = PDBIO()
     io.set_structure(structure)
