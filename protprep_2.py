@@ -1,0 +1,1258 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+"""
+ProtPrep — Protein Preparation Pipeline
+========================================
+Inspired by the Schrödinger Protein Preparation Wizard.
+
+Pipeline
+--------
+  1. Fetch      — download from RCSB (optional)
+  2. Clean      — chain selection, altloc resolution, water / HETATM removal
+  3. Fix        — missing residues, heavy atoms, selenomethionine → Met
+  4. Cap        — ACE / NME terminus capping (optional)
+  5. Protonate  — pH-aware H addition (PDB2PQR + PROPKA, or PDBFixer)
+  6. Minimize   — restrained vacuum minimization (OpenMM, optional)
+
+Outputs
+-------
+  <stem>_prepared.pdb    protonated structure (docking / scoring)
+  <stem>_minimized.pdb   minimized structure  (MD / GB-SA, --minimize)
+  <stem>_prep.log        full preparation log
+
+Dependencies
+------------
+  Required:     biopython, pdbfixer, openmm
+  Protonation:  pdb2pqr  (conda install -c conda-forge pdb2pqr)
+  Rich output:  rich     (pip install rich)        — highly recommended
+  CLI extras:   rich_argparse, argcomplete         — optional
+
+Written by Claude Sonnet 4.6, 2026-02-25
+"""
+
+import argparse
+import io as _io
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ─── Optional imports ────────────────────────────────────────────────────────
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+    from rich.text import Text
+    from rich import box
+    from rich.rule import Rule
+    _RICH = True
+except ImportError:
+    _RICH = False
+
+try:
+    from rich_argparse import RawDescriptionRichHelpFormatter as _HelpFmt
+except ImportError:
+    from argparse import RawDescriptionHelpFormatter as _HelpFmt  # type: ignore
+
+try:
+    import argcomplete
+    from argcomplete.completers import FilesCompleter
+    _ARGCOMPLETE = True
+except ImportError:
+    _ARGCOMPLETE = False
+
+try:
+    from Bio.PDB import PDBParser, PDBIO, Select, NeighborSearch
+    from Bio.PDB.vectors import Vector
+    _BIOPYTHON = True
+except ImportError:
+    _BIOPYTHON = False
+    Select = object
+
+try:
+    from pdbfixer import PDBFixer
+    from openmm.app import PDBFile as OmmPDBFile
+    _PDBFIXER = True
+except ImportError:
+    _PDBFIXER = False
+
+try:
+    import openmm
+    import openmm.app as omm_app
+    import openmm.unit as unit
+    _OPENMM = True
+except ImportError:
+    _OPENMM = False
+
+
+# ─── Console / logging setup ─────────────────────────────────────────────────
+
+_log_lines: List[str] = []
+
+if _RICH:
+    console = Console(highlight=False)
+
+    def _print(msg: str = "", style: str = ""):
+        console.print(msg, style=style)
+        _log_lines.append(re.sub(r'\[/?[^\]]*\]', '', msg))
+
+    def _rule(title: str = ""):
+        console.rule(f"[bold]{title}[/bold]" if title else "")
+        _log_lines.append(f"{'─' * 60}  {title}")
+
+    def _header(title: str, subtitle: str = ""):
+        console.print(Panel(
+            f"[bold white]{title}[/bold white]\n[dim]{subtitle}[/dim]" if subtitle else
+            f"[bold white]{title}[/bold white]",
+            style="bold blue", expand=False, padding=(0, 2)))
+        _log_lines.append(f"\n{'═' * 60}")
+        _log_lines.append(f"  {title}")
+        if subtitle:
+            _log_lines.append(f"  {subtitle}")
+        _log_lines.append(f"{'═' * 60}")
+
+    def _step(n: int, total: int, label: str):
+        console.print(f"\n[bold cyan]┌─ Step {n}/{total}: {label}[/bold cyan]")
+        _log_lines.append(f"\n[Step {n}/{total}] {label}")
+
+    def _ok(msg: str):
+        console.print(f"[green]│  ✓ {msg}[/green]")
+        _log_lines.append(f"  ✓ {msg}")
+
+    def _warn(msg: str):
+        console.print(f"[yellow]│  ⚠ {msg}[/yellow]")
+        _log_lines.append(f"  ⚠ {msg}")
+
+    def _info(msg: str):
+        console.print(f"[dim]│    {msg}[/dim]")
+        _log_lines.append(f"    {msg}")
+
+    def _err(msg: str):
+        console.print(f"[bold red]│  ✗ {msg}[/bold red]")
+        _log_lines.append(f"  ✗ {msg}")
+
+else:
+    def _print(msg: str = "", style: str = ""):
+        print(msg); _log_lines.append(msg)
+
+    def _rule(title: str = ""):
+        print(f"{'─' * 60}  {title}" if title else "─" * 60)
+        _log_lines.append(f"{'─' * 60}  {title}")
+
+    def _header(title: str, subtitle: str = ""):
+        bar = "=" * 60
+        print(f"\n{bar}\n  {title}\n{bar}")
+        _log_lines.extend([f"\n{bar}", f"  {title}", bar])
+
+    def _step(n: int, total: int, label: str):
+        msg = f"\n[Step {n}/{total}] {label}"
+        print(msg); _log_lines.append(msg)
+
+    def _ok(msg: str):   line = f"  ✓ {msg}"; print(line); _log_lines.append(line)
+    def _warn(msg: str): line = f"  ⚠ {msg}"; print(line); _log_lines.append(line)
+    def _info(msg: str): line = f"    {msg}";  print(line); _log_lines.append(line)
+    def _err(msg: str):  line = f"  ✗ {msg}"; print(line); _log_lines.append(line)
+
+
+def _fatal(msg: str):
+    _err(msg)
+    sys.exit(1)
+
+
+def _fmt_time(s: float) -> str:
+    if s < 60:   return f"{s:.1f} s"
+    if s < 3600: return f"{s/60:.1f} min"
+    return f"{s/3600:.1f} h"
+
+
+# ─── BioPython helpers ────────────────────────────────────────────────────────
+
+# Standard amino acid residue names
+_STD_AA = {
+    'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+    'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+    # protonation variants
+    'HID','HIE','HIP','HSD','HSE','HSP','CYX','ASH','GLH','LYN',
+    'MSE',  # selenomethionine — treated as standard
+}
+
+# Titratable residues and their typical pKa ranges
+_TITRATABLE = {
+    'ASP': (3.5, 4.5), 'GLU': (4.0, 5.0),
+    'HIS': (6.0, 7.0), 'LYS': (10.0, 11.0),
+    'ARG': (12.0, 13.5), 'TYR': (9.5, 10.5),
+    'CYS': (8.0, 9.5),
+}
+
+# Disulfide bond SG-SG distance threshold (Å)
+_SSBOND_DIST = 2.5
+
+# Backbone heavy atoms — restrained during minimization by default
+_BACKBONE_ATOMS = frozenset({'N', 'CA', 'C', 'O', 'OXT'})
+
+# Van der Waals radii (nm) used for the frozen-ligand repulsion model.
+# Values are approximate Bondi radii; unmapped elements fall back to carbon.
+_VDW_RADII_NM: Dict[str, float] = {
+    'C':  0.170, 'N':  0.155, 'O':  0.152, 'S':  0.180,
+    'P':  0.180, 'F':  0.147, 'CL': 0.175, 'BR': 0.185,
+    'I':  0.198, 'ZN': 0.139, 'MG': 0.130, 'CA': 0.197,
+    'B':  0.191,
+    'FE': 0.156, 'MN': 0.161, 'CU': 0.140, 'NA': 0.227,
+}
+_DEFAULT_VDW_NM = 0.170
+
+def _element_vdw(element: str) -> float:
+    return _VDW_RADII_NM.get(element.upper(), _DEFAULT_VDW_NM)
+
+
+class _ChainSelector(Select):
+    """Keep selected chains, resolve altlocs, remove waters and unwanted HETATM.
+
+    Altloc resolution strategy:
+      • Prefer altloc ' ' (no disorder) or 'A'.
+      • If only higher-letter conformers exist for an atom (e.g. only 'B'),
+        accept the one present rather than dropping the atom entirely.
+    A pre-scan of the full structure is used to determine which altlocs exist
+    for each (chain, residue, atom_name) triple.
+    """
+
+    def __init__(self, chains=None, keep_resnames=None, structure=None):
+        self.chains = set(chains) if chains else None
+        self.keep_res = {r.strip().upper() for r in (keep_resnames or [])}
+        # (chain_id, res_full_id, atom_name) → set of altloc chars present
+        self._atom_altlocs: Dict[tuple, set] = {}
+        if structure is not None:
+            self._scan_altlocs(structure)
+
+    def _scan_altlocs(self, structure):
+        """Pre-scan: record every altloc that exists for every atom."""
+        for model in structure:
+            for chain in model:
+                cid = chain.get_id()
+                for residue in chain:
+                    rid = residue.get_id()
+                    for atom in residue.get_unpacked_list():
+                        key = (cid, rid, atom.get_name())
+                        self._atom_altlocs.setdefault(key, set()).add(
+                            atom.get_altloc()
+                        )
+
+    def accept_chain(self, chain):
+        return self.chains is None or chain.get_id() in self.chains
+
+    def accept_residue(self, residue):
+        hetflag, _, _ = residue.get_id()
+        if hetflag == ' ':   return True
+        if hetflag == 'W':   return False
+        return residue.get_resname().strip().upper() in self.keep_res
+
+    def accept_atom(self, atom):
+        altloc = atom.get_altloc()
+        if altloc in (' ', 'A'):
+            return True
+        # Non-A altloc: accept only when no preferred conformer (' ' or 'A')
+        # exists for this specific atom, so we never drop an atom entirely.
+        if not self._atom_altlocs:
+            return False
+        key = (
+            atom.get_parent().get_parent().get_id(),
+            atom.get_parent().get_id(),
+            atom.get_name(),
+        )
+        existing = self._atom_altlocs.get(key, set())
+        return not (existing & {' ', 'A'})
+
+
+def _inspect(pdb_path: Path) -> dict:
+    """Extract structural statistics from a PDB file."""
+    parser = PDBParser(QUIET=True)
+    s = parser.get_structure('p', str(pdb_path))[0]
+
+    chains = list(s.get_chains())
+    residues = list(s.get_residues())
+    atoms = list(s.get_atoms())
+
+    std_res = [r for r in residues if r.get_id()[0] == ' ']
+    het_res = [r for r in residues if r.get_id()[0] not in (' ', 'W')]
+    water    = [r for r in residues if r.get_id()[0] == 'W']
+    mse      = [r for r in std_res   if r.get_resname().strip() == 'MSE']
+    altlocs  = [a for a in atoms if a.get_altloc() not in (' ', 'A')]
+
+    # Chain-level residue counts
+    chain_info = {}
+    for ch in chains:
+        std = [r for r in ch.get_residues() if r.get_id()[0] == ' ']
+        chain_info[ch.get_id()] = len(std)
+
+    # Disulfide bond detection
+    cys_sg = []
+    for r in std_res:
+        if r.get_resname().strip() in ('CYS', 'CYX') and 'SG' in r:
+            cys_sg.append(r['SG'])
+    ssbonds = []
+    if len(cys_sg) >= 2:
+        ns = NeighborSearch(cys_sg)
+        seen = set()
+        for sg in cys_sg:
+            neighbors = ns.search(sg.get_vector().get_array(), _SSBOND_DIST, 'A')
+            for nb in neighbors:
+                if nb is not sg:
+                    pair = tuple(sorted([id(sg), id(nb)]))
+                    if pair not in seen:
+                        seen.add(pair)
+                        r1 = sg.get_parent()
+                        r2 = nb.get_parent()
+                        ssbonds.append((
+                            r1.get_parent().get_id(),
+                            r1.get_id()[1],
+                            r2.get_parent().get_id(),
+                            r2.get_id()[1],
+                        ))
+
+    # Titratable residue count per type
+    titr_counts: Dict[str, int] = {}
+    for r in std_res:
+        name = r.get_resname().strip()
+        if name in _TITRATABLE:
+            titr_counts[name] = titr_counts.get(name, 0) + 1
+
+    het_groups = {}
+    for r in het_res:
+        name = r.get_resname().strip()
+        ch   = r.get_parent().get_id()
+        seqid = r.get_id()[1]
+        het_groups.setdefault(name, []).append(f"{ch}:{seqid}")
+
+    return {
+        'chains':       [c.get_id() for c in chains],
+        'chain_info':   chain_info,
+        'n_std':        len(std_res),
+        'n_water':      len(water),
+        'n_het':        len(het_res),
+        'n_mse':        len(mse),
+        'het_groups':   het_groups,
+        'n_altloc':     len(altlocs),
+        'ssbonds':      ssbonds,
+        'titr_counts':  titr_counts,
+        'n_atoms':      len(atoms),
+    }
+
+
+# ─── Gap handling ─────────────────────────────────────────────────────────────
+
+def _insert_ter_at_gaps(pdb_in: Path, pdb_out: Path, gap_threshold: int = 2) -> int:
+    """Insert TER records where residue numbers jump within the same chain.
+
+    Without TER records at sequence gaps, pdb2pqr and OpenMM/PDBFixer treat
+    structurally disconnected segments as covalently bonded across the gap.
+    """
+    lines = pdb_in.read_text().splitlines(keepends=True)
+    out_lines = []
+    prev_chain: Optional[str] = None
+    prev_resseq: Optional[int] = None
+    n_inserted = 0
+
+    for line in lines:
+        record = line[:6].strip()
+        if record in ('ATOM', 'HETATM'):
+            chain = line[21]
+            try:
+                resseq = int(line[22:26])
+            except ValueError:
+                out_lines.append(line)
+                continue
+            if (prev_chain is not None
+                    and chain == prev_chain
+                    and resseq - prev_resseq >= gap_threshold):
+                out_lines.append('TER\n')
+                n_inserted += 1
+            prev_chain = chain
+            prev_resseq = resseq
+        out_lines.append(line)
+
+    pdb_out.write_text(''.join(out_lines))
+    return n_inserted
+
+
+# ─── Pipeline steps ───────────────────────────────────────────────────────────
+
+def step_fetch(pdb_id: str, output_path: Path):
+    pdb_id = pdb_id.upper()
+    url = f'https://files.rcsb.org/download/{pdb_id}.pdb'
+    _info(f"URL: {url}")
+    try:
+        urllib.request.urlretrieve(url, str(output_path))
+    except urllib.error.HTTPError as e:
+        _fatal(f"Failed to fetch {pdb_id}: HTTP {e.code}")
+    except urllib.error.URLError as e:
+        _fatal(f"Network error: {e.reason}")
+
+
+def step_clean(input_pdb: Path, output_pdb: Path,
+               chains=None, keep_het=None) -> dict:
+    if not _BIOPYTHON:
+        _fatal("BioPython is required:  pip install biopython")
+
+    info = _inspect(input_pdb)
+
+    _info(f"Chains found:        {', '.join(info['chains'])}")
+    for ch, n in info['chain_info'].items():
+        _info(f"  Chain {ch}:          {n} residues")
+    _info(f"Total standard res:  {info['n_std']}")
+    _info(f"Water molecules:     {info['n_water']}")
+    _info(f"HETATM groups:       {info['n_het']}")
+
+    if info['het_groups']:
+        for name, locs in info['het_groups'].items():
+            kept = name.upper() in {h.upper() for h in (keep_het or [])}
+            tag = '[keep]' if kept else '[remove]'
+            _info(f"  {name:<6} {tag:<8} at {', '.join(locs[:4])}"
+                  + (' …' if len(locs) > 4 else ''))
+
+    if info['n_mse']:
+        _warn(f"Selenomethionine (MSE): {info['n_mse']} residues — will be converted to MET by PDBFixer")
+
+    if info['n_altloc']:
+        _warn(f"Alternate locations: {info['n_altloc']} atoms — "
+              "keeping conformer A (fallback: highest-occupancy conformer)")
+
+    if info['ssbonds']:
+        _ok(f"Disulfide bonds detected: {len(info['ssbonds'])}")
+        for c1, r1, c2, r2 in info['ssbonds']:
+            _info(f"  CYS {c1}:{r1} — CYS {c2}:{r2}")
+    else:
+        _info("No disulfide bonds detected")
+
+    if info['titr_counts']:
+        _info("Titratable residues:")
+        for res, count in sorted(info['titr_counts'].items()):
+            lo, hi = _TITRATABLE[res]
+            _info(f"  {res}: {count}  (typical pKa {lo}–{hi})")
+
+    if chains:
+        missing = [c for c in chains if c not in info['chains']]
+        if missing:
+            _fatal(f"Chain(s) not found: {', '.join(missing)}. "
+                   f"Available: {', '.join(info['chains'])}")
+
+    parser = PDBParser(QUIET=True)
+    struct = parser.get_structure('p', str(input_pdb))
+    pdb_io = PDBIO()
+    pdb_io.set_structure(struct)
+    pdb_io.save(str(output_pdb),
+                _ChainSelector(chains=chains, keep_resnames=keep_het,
+                               structure=struct))
+    return info
+
+
+def step_fix(input_pdb: Path, output_pdb: Path,
+             convert_mse: bool = True,
+             replace_nonstandard: bool = True) -> dict:
+    if not _PDBFIXER:
+        _fatal("PDBFixer is required:  pip install pdbfixer")
+
+    fixer = PDBFixer(filename=str(input_pdb))
+
+    # MSE → MET is handled automatically by PDBFixer's replaceNonstandardResidues
+    fixer.findMissingResidues()
+    n_miss_res = sum(len(v) for v in fixer.missingResidues.values())
+
+    fixer.findNonstandardResidues()
+    nonstandard = [(r.name, s) for r, s in fixer.nonstandardResidues]
+    if replace_nonstandard:
+        fixer.replaceNonstandardResidues()
+
+    fixer.findMissingAtoms()
+    n_miss_atoms = sum(len(v) for v in fixer.missingAtoms.values())
+    n_term_atoms = sum(len(v) for v in fixer.missingTerminals.values())
+
+    _info(f"Missing residues:    {n_miss_res}")
+    _info(f"Missing heavy atoms: {n_miss_atoms}  (+{n_term_atoms} terminal atoms)")
+
+    if nonstandard:
+        for orig, repl in nonstandard:
+            _warn(f"Non-standard residue: {orig} → {repl}")
+
+    fixer.addMissingAtoms()
+
+    with open(str(output_pdb), 'w') as fh:
+        OmmPDBFile.writeFile(fixer.topology, fixer.positions, fh, keepIds=True)
+
+    return {
+        'n_missing_res':   n_miss_res,
+        'n_missing_atoms': n_miss_atoms,
+        'nonstandard':     nonstandard,
+    }
+
+
+def step_cap_termini(input_pdb: Path, output_pdb: Path) -> dict:
+    """
+    Complete missing terminal atoms at chain breaks and real termini (OXT, H, etc.).
+    Uses PDBFixer's addMissingAtoms() — no ACE/NME cap residues are inserted.
+    """
+    if not _PDBFIXER:
+        _warn("PDBFixer not available — skipping terminus capping.")
+        shutil.copy(input_pdb, output_pdb)
+        return {'n_caps': 0}
+
+    fixer = PDBFixer(filename=str(input_pdb))
+    fixer.findMissingResidues()
+    fixer.missingResidues = {}          # don't insert gap residues
+    fixer.findMissingAtoms()
+    n_term = sum(len(v) for v in fixer.missingTerminals.values())
+    fixer.addMissingAtoms()
+
+    with open(str(output_pdb), 'w') as fh:
+        OmmPDBFile.writeFile(fixer.topology, fixer.positions, fh, keepIds=True)
+
+    return {'n_caps': n_term}
+
+
+def step_protonate_pdb2pqr(input_pdb: Path, output_pdb: Path,
+                            ph: float, ff: str = 'AMBER') -> Tuple[bool, dict]:
+    """PDB2PQR + PROPKA: assign protonation states at target pH."""
+    pqr_out = output_pdb.with_suffix('.pqr')
+    propka_out = output_pdb.with_suffix('.propka')
+
+    cmd = [
+        'pdb2pqr',
+        '--ff', ff,
+        '--titration-state-method', 'propka',
+        '--with-ph', str(ph),
+        '--pdb-output', str(output_pdb),
+        '--keep-chain',
+        '--drop-water',
+        str(input_pdb),
+        str(pqr_out),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                cwd=str(output_pdb.parent))
+    except FileNotFoundError:
+        _warn("pdb2pqr not found in PATH — falling back to PDBFixer")
+        return False, {}
+
+    if result.returncode != 0:
+        _warn(f"PDB2PQR exited with code {result.returncode}")
+        for line in result.stderr.strip().splitlines()[:6]:
+            _info(f"  {line}")
+        return False, {}
+
+    # Parse PROPKA output for ionization report
+    propka_info = _parse_propka(propka_out, ph)
+
+    # Clean up temporary files
+    for f in list(output_pdb.parent.glob('*.pqr')) + \
+              list(output_pdb.parent.glob('*.propka')):
+        f.unlink(missing_ok=True)
+
+    return True, propka_info
+
+
+def _parse_propka(propka_path: Path, ph: float) -> dict:
+    """Parse PROPKA output to extract pKa predictions and protonation states."""
+    if not propka_path.exists():
+        return {}
+    try:
+        text = propka_path.read_text()
+    except Exception:
+        return {}
+
+    results = []
+    # Match lines like:  ASP  18 A    3.80  (3.80)  ...
+    pattern = re.compile(
+        r'^(ASP|GLU|HIS|LYS|ARG|TYR|CYS|NTR|CTR)\s+(\d+)\s+(\w)\s+([\d.]+)',
+        re.MULTILINE
+    )
+    for m in pattern.finditer(text):
+        resname, resid, chain, pka = m.groups()
+        pka_val = float(pka)
+        protonated = pka_val > ph  # residue is protonated if pKa > pH
+        # for acids: protonated = neutral (COOH); for bases: protonated = charged (+NH3)
+        results.append({
+            'resname': resname, 'resid': int(resid), 'chain': chain,
+            'pka': pka_val, 'protonated': protonated,
+        })
+    return {'propka': results}
+
+
+def _report_protonation(propka_info: dict, ph: float):
+    """Print a PPW-style ionization table."""
+    entries = propka_info.get('propka', [])
+    if not entries:
+        return
+
+    acids   = [e for e in entries if e['resname'] in ('ASP','GLU','CTR')]
+    bases   = [e for e in entries if e['resname'] in ('LYS','ARG','HIS','NTR')]
+    other   = [e for e in entries if e['resname'] in ('TYR','CYS')]
+    special = []
+
+    # Flag residues with unusual protonation at this pH
+    for e in entries:
+        rn = e['resname']
+        pka = e['pka']
+        # Flag if pKa is "near" pH (within 1 unit) — these could be ambiguous
+        if abs(pka - ph) < 1.0 and rn not in ('NTR','CTR'):
+            special.append(e)
+
+    _info(f"Ionization report at pH {ph}:")
+
+    if _RICH:
+        tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold magenta",
+                    show_edge=False, padding=(0, 1))
+        tbl.add_column("Residue", style="cyan", no_wrap=True)
+        tbl.add_column("Chain")
+        tbl.add_column("Seq#", justify="right")
+        tbl.add_column("pKa", justify="right")
+        tbl.add_column("State at pH " + str(ph))
+        tbl.add_column("Note")
+
+        for e in sorted(entries, key=lambda x: (x['chain'], x['resid'])):
+            rn = e['resname']
+            state, color = _protonation_label(rn, e['protonated'])
+            note = "[yellow]⚠ near pH[/yellow]" if e in special else ""
+            tbl.add_row(rn, e['chain'], str(e['resid']),
+                        f"{e['pka']:.2f}", f"[{color}]{state}[/{color}]", note)
+        console.print(tbl)
+        _log_lines.append(f"  {len(entries)} titratable residues analyzed by PROPKA")
+    else:
+        _info(f"  {'Res':<6} {'Chain':>5} {'Seq#':>5}  {'pKa':>6}  State")
+        for e in sorted(entries, key=lambda x: (x['chain'], x['resid'])):
+            state, _ = _protonation_label(e['resname'], e['protonated'])
+            flag = " ⚠" if e in special else ""
+            _info(f"  {e['resname']:<6} {e['chain']:>5} {e['resid']:>5}  "
+                  f"{e['pka']:>6.2f}  {state}{flag}")
+
+    if special:
+        _warn(f"{len(special)} residue(s) have pKa within 1 unit of pH {ph} "
+              f"— protonation state may be ambiguous; consider manual inspection.")
+
+
+def _protonation_label(resname: str, protonated: bool) -> Tuple[str, str]:
+    """Return human-readable state label and rich color."""
+    mapping = {
+        ('ASP', True):  ("neutral (–COOH)",   "white"),
+        ('ASP', False): ("anionic (–COO⁻)",   "green"),
+        ('GLU', True):  ("neutral (–COOH)",   "white"),
+        ('GLU', False): ("anionic (–COO⁻)",   "green"),
+        ('HIS', True):  ("protonated (HIP+)", "yellow"),
+        ('HIS', False): ("neutral (HIE/HID)", "green"),
+        ('LYS', True):  ("protonated (+NH₃)", "green"),
+        ('LYS', False): ("neutral (–NH₂)",    "yellow"),
+        ('ARG', True):  ("protonated (+)",     "green"),
+        ('ARG', False): ("neutral",            "yellow"),
+        ('TYR', True):  ("neutral (–OH)",      "white"),
+        ('TYR', False): ("anionic (–O⁻)",      "yellow"),
+        ('CYS', True):  ("neutral (–SH)",      "white"),
+        ('CYS', False): ("thiolate (–S⁻)",     "yellow"),
+        ('NTR', True):  ("N-term protonated",  "green"),
+        ('NTR', False): ("N-term neutral",     "white"),
+        ('CTR', True):  ("C-term neutral",     "white"),
+        ('CTR', False): ("C-term anionic",     "green"),
+    }
+    return mapping.get((resname, protonated), ("unknown", "dim"))
+
+
+def step_protonate_pdbfixer(input_pdb: Path, output_pdb: Path, ph: float):
+    """PDBFixer fallback: add hydrogens at target pH without PROPKA."""
+    if not _PDBFIXER:
+        _fatal("PDBFixer is required:  pip install pdbfixer")
+    fixer = PDBFixer(filename=str(input_pdb))
+    fixer.addMissingHydrogens(ph)
+    with open(str(output_pdb), 'w') as fh:
+        OmmPDBFile.writeFile(fixer.topology, fixer.positions, fh, keepIds=True)
+
+
+def _count_clashes(pdb_path: Path, cutoff: float = 1.5) -> int:
+    """Count severe steric clashes (heavy-atom pairs closer than cutoff Å)."""
+    if not _BIOPYTHON:
+        return -1
+    try:
+        parser = PDBParser(QUIET=True)
+        s = parser.get_structure('p', str(pdb_path))[0]
+        heavy = [a for a in s.get_atoms()
+                 if a.element not in (None, 'H') and a.get_altloc() in (' ', 'A')]
+        if not heavy:
+            return 0
+        ns = NeighborSearch(heavy)
+        clashes = 0
+        seen = set()
+        for atom in heavy:
+            nbs = ns.search(atom.get_vector().get_array(), cutoff, 'A')
+            for nb in nbs:
+                if nb is atom:
+                    continue
+                pair = tuple(sorted([id(atom), id(nb)]))
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                r1 = atom.get_parent()
+                r2 = nb.get_parent()
+                # Skip intra-residue pairs and adjacent-residue backbone bonds
+                # (e.g. C(i)–N(i+1) ~1.33 Å is below the clash cutoff)
+                if r1 is r2:
+                    continue
+                if (r1.get_parent() is r2.get_parent() and
+                        abs(r1.get_id()[1] - r2.get_id()[1]) <= 1):
+                    continue
+                clashes += 1
+        return clashes
+    except Exception:
+        return -1
+
+
+def _split_protein_hetatm(
+        pdb_path: Path, protein_out: Path) -> Tuple[List[str], List[dict]]:
+    """Write a protein-only PDB (no HETATM) to *protein_out*.
+
+    Returns
+    -------
+    hetatm_lines : list[str]
+        Original HETATM record lines, preserved verbatim to reattach after
+        minimization.
+    hetatm_heavy : list[dict]
+        One entry per HETATM heavy atom: {'pos': (x, y, z) in nm, 'element': str}.
+        Used to build repulsive wall forces during minimization.
+    """
+    lines = pdb_path.read_text().splitlines(keepends=True)
+    protein_lines: List[str] = []
+    hetatm_lines:  List[str] = []
+    hetatm_heavy:  List[dict] = []
+
+    for line in lines:
+        record = line[:6].strip()
+        if record == 'HETATM':
+            hetatm_lines.append(line)
+            try:
+                x = float(line[30:38]) / 10.0   # Å → nm
+                y = float(line[38:46]) / 10.0
+                z = float(line[46:54]) / 10.0
+                # Element column (cols 77-78) preferred; fall back to atom name
+                raw_elem = line[76:78].strip() if len(line) > 76 else ''
+                if not raw_elem:
+                    raw_elem = ''.join(c for c in line[12:16].strip()
+                                       if c.isalpha())[:2]
+                element = raw_elem.upper()
+                if element and element[0] != 'H':   # heavy atoms only
+                    hetatm_heavy.append({'pos': (x, y, z), 'element': element})
+            except (ValueError, IndexError):
+                pass
+        else:
+            protein_lines.append(line)
+
+    protein_out.write_text(''.join(protein_lines))
+    return hetatm_lines, hetatm_heavy
+
+
+def _add_ligand_wall_forces(system, topology, hetatm_heavy: List[dict]) -> int:
+    """Add one CustomExternalForce per HETATM heavy atom.
+
+    Each force repels all protein heavy atoms from a fixed ligand-atom
+    position using a purely-repulsive r⁻¹² wall:
+
+        U = ε · (σ / max(r, r_floor))¹²
+
+    where σ = r_vdW(protein_generic) + r_vdW(ligand_atom) and ε = 1 kJ/mol.
+    The floor (0.1 nm) prevents a singularity at r → 0.
+
+    This keeps the binding-site protein geometry consistent with the
+    ligand's presence without requiring force-field parameters for the ligand.
+
+    Returns the number of wall forces added (= number of HETATM heavy atoms).
+    """
+    protein_heavy_indices = [
+        atom.index for atom in topology.atoms()
+        if atom.element is not None and atom.element.symbol != 'H'
+    ]
+    for lig in hetatm_heavy:
+        x0, y0, z0 = lig['pos']
+        sigma = _DEFAULT_VDW_NM + _element_vdw(lig['element'])
+        expr = (
+            f'epsilon * (sigma / max(r, r_floor))^12; '
+            f'r = sqrt((x - {x0:.6f})^2 + (y - {y0:.6f})^2 + (z - {z0:.6f})^2); '
+            f'sigma = {sigma:.4f}; epsilon = 1.0; r_floor = 0.10'
+        )
+        wall = openmm.CustomExternalForce(expr)
+        for idx in protein_heavy_indices:
+            wall.addParticle(idx, [])
+        system.addForce(wall)
+    return len(hetatm_heavy)
+
+
+def step_minimize(fixed_pdb: Path, output_pdb: Path, ph: float,
+                  max_iter: int = 1000, restraint_k: float = 1000.0,
+                  restrain_sidechains: bool = False) -> bool:
+    """OpenMM restrained energy minimization.
+
+    HETATM residues (e.g. a co-crystallised reference ligand kept via
+    --keep-het) are handled without force-field parameterisation:
+      • They are stripped from the OpenMM topology so AMBER14 can build the
+        system without errors.
+      • Their heavy atoms are re-introduced as frozen *wall* forces
+        (r⁻¹² repulsion from fixed positions) so the binding-site protein
+        geometry adapts correctly during minimisation.
+      • Their original coordinates are appended verbatim to the output PDB.
+
+    Pass restrain_sidechains=True to restrain all protein heavy atoms.
+    Default (False here, but True from CLI) restrains all heavy atoms.
+    """
+    if not _OPENMM:
+        _warn("OpenMM not found — skipping minimization.")
+        _info("Install:  conda install -c conda-forge openmm")
+        return False
+
+    # ── Split HETATM from protein ────────────────────────────────────────────
+    prot_only_pdb = fixed_pdb.with_name(fixed_pdb.stem + '_prot_only.pdb')
+    hetatm_lines, hetatm_heavy = _split_protein_hetatm(fixed_pdb, prot_only_pdb)
+    omm_input = prot_only_pdb if hetatm_lines else fixed_pdb
+    if hetatm_heavy:
+        _info(f"HETATM heavy atoms (frozen walls): {len(hetatm_heavy)}")
+
+    # ── Cap chain breaks before OpenMM sees the structure ────────────────────
+    if _PDBFIXER:
+        fixer = PDBFixer(filename=str(omm_input))
+        fixer.findMissingResidues()
+        fixer.missingResidues = {}
+        fixer.findMissingAtoms()
+        n_term = sum(len(v) for v in fixer.missingTerminals.values())
+        if n_term:
+            _info(f"Chain-break termini: capping {n_term} atom(s) for OpenMM")
+        fixer.addMissingAtoms()
+        buf = _io.StringIO()
+        OmmPDBFile.writeFile(fixer.topology, fixer.positions, buf, keepIds=True)
+        buf.seek(0)
+        pdb = omm_app.PDBFile(buf)
+    else:
+        pdb = omm_app.PDBFile(str(omm_input))
+
+    ff_obj = omm_app.ForceField('amber14-all.xml')
+    modeller = omm_app.Modeller(pdb.topology, pdb.positions)
+    modeller.addHydrogens(ff_obj, pH=ph)
+    system = ff_obj.createSystem(modeller.topology, nonbondedMethod=omm_app.NoCutoff)
+
+    # ── Frozen ligand wall forces ────────────────────────────────────────────
+    if hetatm_heavy:
+        n_walls = _add_ligand_wall_forces(system, modeller.topology, hetatm_heavy)
+        _info(f"Ligand wall forces added: {n_walls}")
+
+    # ── Positional restraints on protein heavy atoms ─────────────────────────
+    restraint = openmm.CustomExternalForce(
+        '0.5 * k * ((x - x0)^2 + (y - y0)^2 + (z - z0)^2)'
+    )
+    restraint.addGlobalParameter('k', restraint_k)
+    restraint.addPerParticleParameter('x0')
+    restraint.addPerParticleParameter('y0')
+    restraint.addPerParticleParameter('z0')
+
+    positions = modeller.positions
+    n_restrained = 0
+    for atom in modeller.topology.atoms():
+        if atom.element is None or atom.element.symbol == 'H':
+            continue
+        if restrain_sidechains or atom.name in _BACKBONE_ATOMS:
+            pos = positions[atom.index].value_in_unit(unit.nanometers)
+            restraint.addParticle(atom.index, pos)
+            n_restrained += 1
+    system.addForce(restraint)
+    restrain_label = ("all heavy atoms" if restrain_sidechains
+                      else "backbone atoms (N,CA,C,O)")
+    _info(f"{restrain_label} restrained: {n_restrained}  "
+          f"(k = {restraint_k:.0f} kJ/mol/nm²)")
+
+    integrator = openmm.LangevinMiddleIntegrator(
+        300 * unit.kelvin, 1 / unit.picosecond, 0.004 * unit.picoseconds
+    )
+    sim = omm_app.Simulation(modeller.topology, system, integrator)
+    sim.context.setPositions(positions)
+
+    e_before = (sim.context.getState(getEnergy=True)
+                    .getPotentialEnergy()
+                    .value_in_unit(unit.kilocalories_per_mole))
+    _info(f"Energy before: {e_before:>12.1f} kcal/mol")
+
+    sim.minimizeEnergy(maxIterations=max_iter)
+
+    state = sim.context.getState(getPositions=True, getEnergy=True)
+    e_after = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
+    _info(f"Energy after:  {e_after:>12.1f} kcal/mol  (Δ = {e_after - e_before:+.1f})")
+
+    # ── Write output: minimised protein + original HETATM ───────────────────
+    buf = _io.StringIO()
+    omm_app.PDBFile.writeFile(sim.topology, state.getPositions(), buf, keepIds=True)
+    text = buf.getvalue()
+    if hetatm_lines:
+        # Remove trailing END record so we can append HETATM before it
+        end_pos = text.rfind('\nEND')
+        if end_pos >= 0:
+            text = text[:end_pos + 1]
+        text += ''.join(hetatm_lines)
+        if not text.endswith('\n'):
+            text += '\n'
+        text += 'END\n'
+    output_pdb.write_text(text)
+    return True
+
+
+# ─── Final report (PPW-style) ────────────────────────────────────────────────
+
+def _print_summary(stats: dict, args, prepared_pdb: Path,
+                   minimized_pdb: Optional[Path], elapsed: float):
+    _print()
+    if _RICH:
+        console.rule("[bold green]Preparation Complete[/bold green]")
+    else:
+        _rule("Preparation Complete")
+
+    info = stats.get('info', {})
+    fix  = stats.get('fix',  {})
+    prot = stats.get('prot', '?')
+    prot_labels = {
+        'pdb2pqr+propka':    'PDB2PQR + PROPKA',
+        'pdbfixer':          'PDBFixer',
+        'pdbfixer_fallback': 'PDBFixer (PDB2PQR failed)',
+    }
+
+    if _RICH:
+        tbl = Table(box=box.SIMPLE_HEAD, show_header=False,
+                    show_edge=True, padding=(0, 1), style="dim")
+        tbl.add_column("Key",   style="bold", no_wrap=True, width=28)
+        tbl.add_column("Value", style="white")
+
+        def row(k, v): tbl.add_row(k, str(v))
+
+        row("Input file",            args.input)
+        row("Chains processed",
+            ', '.join(info.get('chains', ['?'])) if not args.chain
+            else ', '.join(args.chain))
+        row("Standard residues",     info.get('n_std', '?'))
+        row("Waters removed",        info.get('n_water', '?'))
+
+        kept_het  = [h.upper() for h in (args.keep_het or [])]
+        removed_h = [h for h in info.get('het_groups', {})
+                     if h.upper() not in kept_het]
+        if removed_h:
+            row("HETATM removed",  ', '.join(removed_h))
+        if kept_het:
+            row("HETATM kept",     ', '.join(kept_het))
+
+        if info.get('n_altloc'):
+            row("Altloc atoms resolved", info['n_altloc'])
+        if info.get('ssbonds'):
+            row("Disulfide bonds",
+                ', '.join(f"{c1}{r1}–{c2}{r2}" for c1,r1,c2,r2 in info['ssbonds']))
+        if fix.get('nonstandard'):
+            row("Non-std res converted",
+                ', '.join(f"{a}→{b}" for a,b in fix['nonstandard']))
+
+        row("Missing residues added",  fix.get('n_missing_res',   0))
+        row("Missing atoms added",     fix.get('n_missing_atoms',  0))
+        row("Protonation method",      prot_labels.get(prot, prot))
+        row("pH",                      args.ph)
+
+        clashes = stats.get('clashes_before', -1)
+        clashes_after = stats.get('clashes_after', -1)
+        if clashes >= 0:
+            row("Clashes (before min.)", clashes)
+        if clashes_after >= 0:
+            row("Clashes (after min.)",  clashes_after)
+
+        row("Output (prepared)",       str(prepared_pdb))
+        if minimized_pdb and minimized_pdb.exists():
+            row("Output (minimized)",  str(minimized_pdb))
+        row("Elapsed",                 _fmt_time(elapsed))
+
+        console.print(tbl)
+    else:
+        _rule()
+        _print(f"  Input:                  {args.input}")
+        _print(f"  Chains:                 {', '.join(info.get('chains', ['?']))}")
+        _print(f"  Standard residues:      {info.get('n_std', '?')}")
+        _print(f"  Waters removed:         {info.get('n_water', '?')}")
+        _print(f"  Protonation:            {prot_labels.get(prot, prot)}  (pH {args.ph})")
+        _print(f"  Output:                 {prepared_pdb}")
+        if minimized_pdb and minimized_pdb.exists():
+            _print(f"  Minimized:              {minimized_pdb}")
+        _print(f"  Elapsed:                {_fmt_time(elapsed)}")
+        _rule()
+
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+
+def parse_args():
+    desc = """
+ProtPrep — Protein Preparation Pipeline
+Inspired by the Schrödinger Protein Preparation Wizard
+
+Steps:
+  1. Clean     — chain selection, altloc resolution, water/HETATM removal
+  2. Fix       — missing residues/atoms, non-standard residue conversion
+  3. Cap       — terminus capping for chain breaks (--cap)
+  4. Protonate — pH-aware hydrogen addition (PDB2PQR + PROPKA, or PDBFixer)
+  5. Minimize  — restrained vacuum energy minimization (OpenMM, --minimize)
+
+Examples:
+  %(prog)s -i protein.pdb
+  %(prog)s --fetch 4HHB --chain A --ph 7.4
+  %(prog)s -i complex.pdb --chain A --keep-het HEM ZN --minimize
+  %(prog)s -i apo.pdb --ph 6.5 --cap --minimize --max-iter 2000
+"""
+    p = argparse.ArgumentParser(
+        description=desc,
+        formatter_class=_HelpFmt,
+    )
+
+    io = p.add_argument_group('Input / Output')
+    io.add_argument('--fetch', metavar='PDBID',
+                    help='Download structure from RCSB (e.g. --fetch 4HHB). '
+                         'Sets --input to <PDBID>.pdb if not given.')
+    inp = io.add_argument('-i', '--input', metavar='PDB',
+                          help='Input PDB file (required unless --fetch is used)')
+    io.add_argument('-o', '--output', metavar='PDB',
+                    help='Output path for prepared structure '
+                         '(default: <input>_prepared.pdb)')
+    io.add_argument('--log', metavar='FILE',
+                    help='Save full preparation log to file '
+                         '(default: <input>_prep.log)')
+    if _ARGCOMPLETE:
+        inp.completer = FilesCompleter(allowednames=['.pdb', '.ent'])
+
+    struct = p.add_argument_group('Structure')
+    struct.add_argument('--chain', nargs='+', metavar='ID',
+                        help='Extract one or more chains, e.g. --chain A B '
+                             '(default: keep all chains)')
+    struct.add_argument('--keep-het', nargs='+', metavar='RESNAME', default=[],
+                        help='HETATM residue names to retain, e.g. HEM ZN MG '
+                             '(waters are always removed)')
+
+    prot = p.add_argument_group('Protonation')
+    prot.add_argument('--ph', type=float, default=7.4, metavar='FLOAT',
+                      help='Target pH for protonation (default: 7.4)')
+    prot.add_argument('--ff', default='AMBER',
+                      choices=['AMBER', 'CHARMM', 'PARSE', 'TYL06'],
+                      help='Force field for PDB2PQR atom naming (default: AMBER)')
+    prot.add_argument('--no-pdb2pqr', action='store_true',
+                      help='Skip PDB2PQR/PROPKA; use PDBFixer for H addition')
+
+    fix_grp = p.add_argument_group('Structure Repair')
+    fix_grp.add_argument('--skip-fix', action='store_true',
+                         help='Skip PDBFixer repair step')
+    fix_grp.add_argument('--cap', action='store_true',
+                         help='Cap chain termini with ACE/NME groups '
+                              '(recommended for MD simulations)')
+    fix_grp.add_argument('--keep-mse', action='store_true',
+                         help='Keep selenomethionine (MSE) as-is; '
+                              'default is to convert to MET')
+
+    mini = p.add_argument_group('Minimization')
+    mini.add_argument('--minimize', action='store_true',
+                      help='Run OpenMM vacuum minimization → <stem>_minimized.pdb')
+    mini.add_argument('--max-iter', type=int, default=1000, metavar='N',
+                      help='Maximum minimization iterations (default: 1000). '
+                           'Use 0 to run until convergence (may be slow).')
+    mini.add_argument('--restraint-k', type=float, default=1000.0, metavar='FLOAT',
+                      help='Positional restraint strength in kJ/mol/nm² '
+                           '(default: 1000). Higher = less movement allowed.')
+    mini.add_argument('--relax-sidechains', action='store_true',
+                      help='Only restrain backbone atoms (N,CA,C,O) during '
+                           'minimization, letting sidechains relax freely. '
+                           'Default is to restrain all heavy atoms, which '
+                           'keeps the structure close to the input coordinates.')
+
+    pipe = p.add_argument_group('Pipeline')
+    pipe.add_argument('--keep-intermediates', action='store_true',
+                      help='Save intermediate PDB files after each step')
+    pipe.add_argument('--clash-check', action='store_true',
+                      help='Count steric clashes before/after minimization '
+                           '(requires BioPython; may be slow for large structures)')
+
+    if _ARGCOMPLETE:
+        argcomplete.autocomplete(p)
+
+    return p.parse_args()
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    t0 = time.time()
+
+    if not args.input and not args.fetch:
+        _fatal("Provide --input <file> or --fetch <PDBID>")
+
+    if args.fetch and not args.input:
+        args.input = f'{args.fetch.upper()}.pdb'
+
+    input_pdb = Path(args.input).resolve()
+
+    # ── Banner ────────────────────────────────────────────────────────────────
+    _header("ProtPrep — Protein Preparation Pipeline",
+            "Inspired by Schrödinger Protein Preparation Wizard")
+
+    prot_method = 'PDBFixer' if args.no_pdb2pqr else 'PDB2PQR + PROPKA'
+    n_steps = 2 + int(bool(args.fetch)) + int(not args.skip_fix) + int(args.cap) + int(args.minimize)
+
+    _print()
+    _info(f"Input:         {input_pdb}")
+    _info(f"Chain(s):      {', '.join(args.chain) if args.chain else 'all'}")
+    _info(f"Keep HETATM:   {', '.join(args.keep_het) if args.keep_het else 'none'}")
+    _info(f"pH:            {args.ph}")
+    _info(f"Protonation:   {prot_method}")
+    _info(f"Fix missing:   {'no' if args.skip_fix else 'yes'}")
+    _info(f"Cap termini:   {'yes' if args.cap else 'no'}")
+    if args.minimize:
+        restrain_str = ("backbone only" if args.relax_sidechains else "all heavy")
+        _info(f"Minimize:      yes  (k = {args.restraint_k:.0f} kJ/mol/nm², "
+              f"max_iter = {args.max_iter}, restrain = {restrain_str})")
+    else:
+        _info("Minimize:      no")
+
+    # ── Paths ─────────────────────────────────────────────────────────────────
+    prepared_pdb = (Path(args.output).resolve() if args.output
+                    else input_pdb.with_name(input_pdb.stem + '_prepared.pdb'))
+    stem = prepared_pdb.stem.removesuffix('_prepared')
+    minimized_pdb = prepared_pdb.with_name(stem + '_minimized.pdb')
+    log_path = (Path(args.log).resolve() if args.log
+                else input_pdb.with_name(stem + '_prep.log'))
+
+    stats: dict = {}
+    step_n = [0]
+
+    def next_step(label):
+        step_n[0] += 1
+        _step(step_n[0], n_steps, label)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # ── Fetch ─────────────────────────────────────────────────────────────
+        if args.fetch:
+            next_step(f"Downloading {args.fetch.upper()} from RCSB PDB")
+            step_fetch(args.fetch, input_pdb)
+            _ok(f"Saved  →  {input_pdb.name}")
+        elif not input_pdb.exists():
+            _fatal(f"File not found: {input_pdb}")
+        else:
+            # Still count file existence as implicit step
+            pass
+
+        # ── Step: Clean ───────────────────────────────────────────────────────
+        next_step("Cleaning structure")
+        clean_pdb = tmp / 'clean.pdb'
+        info = step_clean(input_pdb, clean_pdb,
+                          chains=args.chain, keep_het=args.keep_het)
+        stats['info'] = info
+        if args.keep_intermediates:
+            dst = prepared_pdb.with_name(stem + '_s1_clean.pdb')
+            shutil.copy(clean_pdb, dst)
+            _info(f"Saved: {dst.name}")
+        _ok("Cleaning done")
+
+        # ── Step: Fix ─────────────────────────────────────────────────────────
+        if not args.skip_fix:
+            next_step("Repairing missing residues and atoms")
+            fixed_pdb = tmp / 'fixed.pdb'
+            fix_stats = step_fix(clean_pdb, fixed_pdb,
+                                 replace_nonstandard=not args.keep_mse)
+            stats['fix'] = fix_stats
+            if args.keep_intermediates:
+                dst = prepared_pdb.with_name(stem + '_s2_fixed.pdb')
+                shutil.copy(fixed_pdb, dst)
+                _info(f"Saved: {dst.name}")
+            _ok("Repair done")
+        else:
+            fixed_pdb = clean_pdb
+            _print()
+            _warn("Skipping PDBFixer repair (--skip-fix)")
+
+        # ── Step: Cap termini ─────────────────────────────────────────────────
+        if args.cap:
+            next_step("Capping chain termini")
+            capped_pdb = tmp / 'capped.pdb'
+            cap_stats = step_cap_termini(fixed_pdb, capped_pdb)
+            fixed_pdb = capped_pdb
+            stats['cap'] = cap_stats
+            n_c = cap_stats.get('n_caps', 0)
+            if n_c:
+                _ok(f"Capped {n_c} terminal atom(s)")
+            else:
+                _ok("No capping needed (termini already complete)")
+
+        # ── Gap marking: insert TER at sequence breaks ────────────────────────
+        # Must happen before protonation and minimization so that pdb2pqr and
+        # OpenMM/PDBFixer do not form peptide bonds across structural gaps.
+        gap_pdb = tmp / 'gap_marked.pdb'
+        n_gaps = _insert_ter_at_gaps(fixed_pdb, gap_pdb)
+        if n_gaps:
+            _info(f"Sequence gaps: {n_gaps} TER record(s) inserted at chain break(s)")
+        fixed_pdb = gap_pdb
+
+        # ── Step: Protonate ───────────────────────────────────────────────────
+        next_step(f"Protonation at pH {args.ph}")
+        prot_pdb = tmp / 'protonated.pdb'
+
+        if args.no_pdb2pqr:
+            step_protonate_pdbfixer(fixed_pdb, prot_pdb, args.ph)
+            stats['prot'] = 'pdbfixer'
+        else:
+            ok, propka_info = step_protonate_pdb2pqr(fixed_pdb, prot_pdb,
+                                                      args.ph, args.ff)
+            if ok:
+                stats['prot'] = 'pdb2pqr+propka'
+                if propka_info:
+                    _report_protonation(propka_info, args.ph)
+            else:
+                _warn("Falling back to PDBFixer hydrogen addition")
+                step_protonate_pdbfixer(fixed_pdb, prot_pdb, args.ph)
+                stats['prot'] = 'pdbfixer_fallback'
+
+        shutil.copy(prot_pdb, prepared_pdb)
+        _ok(f"Protonation done  →  {prepared_pdb.name}")
+
+        # Clash check (optional)
+        if args.clash_check:
+            n_clashes = _count_clashes(prepared_pdb)
+            stats['clashes_before'] = n_clashes
+            if n_clashes < 0:
+                _warn("Clash detection unavailable")
+            elif n_clashes == 0:
+                _ok("No severe steric clashes detected")
+            else:
+                _warn(f"Steric clashes detected: {n_clashes}  "
+                      "(consider --minimize to resolve)")
+
+        # ── Step: Minimize ────────────────────────────────────────────────────
+        if args.minimize:
+            next_step("Energy minimization (OpenMM, ff14SB, vacuum)")
+            ok = step_minimize(fixed_pdb, minimized_pdb, ph=args.ph,
+                               max_iter=args.max_iter, restraint_k=args.restraint_k,
+                               restrain_sidechains=not args.relax_sidechains)
+            if ok:
+                _ok(f"Minimization done  →  {minimized_pdb.name}")
+                if args.clash_check:
+                    n_after = _count_clashes(minimized_pdb)
+                    stats['clashes_after'] = n_after
+                    if n_after >= 0:
+                        _info(f"Clashes after minimization: {n_after}")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    elapsed = time.time() - t0
+    _print_summary(stats, args, prepared_pdb,
+                   minimized_pdb if args.minimize else None, elapsed)
+
+    # ── Write log ─────────────────────────────────────────────────────────────
+    log_path.write_text('\n'.join(_log_lines) + '\n')
+    _info(f"Log written  →  {log_path}")
+
+
+if __name__ == '__main__':
+    main()

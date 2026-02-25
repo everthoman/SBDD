@@ -19,7 +19,7 @@ Outputs:
 
 Dependencies:
   Required:     biopython, pdbfixer, openmm
-  Protonation:  pdb2pqr  (pip install pdb2pqr)  — falls back to PDBFixer if absent
+  Protonation:  pdb2pqr  (conda install -c conda-forge pdb2pqr)  — falls back to PDBFixer if absent
   UI:           rich_argparse, argcomplete        — optional, enhances CLI output
 
 Written by Claude Sonnet 4.6, 2026-02-24
@@ -135,6 +135,43 @@ def _inspect(pdb_path):
                              if r.get_id()[0] not in (' ', 'W')}),
         'n_altloc':  sum(1 for a in atoms if a.get_altloc() not in (' ', 'A')),
     }
+
+
+# ─── Gap handling ─────────────────────────────────────────────────────────────
+
+def _insert_ter_at_gaps(pdb_in, pdb_out, gap_threshold=2):
+    """Insert TER records where residue numbers jump within the same chain.
+
+    Without TER records at sequence gaps, protonation tools (pdb2pqr) and
+    force-field setup treat structurally disconnected segments as covalently
+    bonded across the gap, which is wrong.
+    """
+    lines = Path(pdb_in).read_text().splitlines(keepends=True)
+    out_lines = []
+    prev_chain = None
+    prev_resseq = None
+    n_inserted = 0
+
+    for line in lines:
+        record = line[:6].strip()
+        if record in ('ATOM', 'HETATM'):
+            chain = line[21]
+            try:
+                resseq = int(line[22:26])
+            except ValueError:
+                out_lines.append(line)
+                continue
+            if (prev_chain is not None
+                    and chain == prev_chain
+                    and resseq - prev_resseq >= gap_threshold):
+                out_lines.append('TER\n')
+                n_inserted += 1
+            prev_chain = chain
+            prev_resseq = resseq
+        out_lines.append(line)
+
+    Path(pdb_out).write_text(''.join(out_lines))
+    return n_inserted
 
 
 # ─── Pipeline steps ───────────────────────────────────────────────────────────
@@ -257,7 +294,27 @@ def step_minimize(fixed_pdb, output_pdb, ph, ff_xml='amber14-all.xml',
         print("            Install: conda install -c conda-forge openmm")
         return False
 
-    pdb = omm_app.PDBFile(str(fixed_pdb))
+    # Use PDBFixer to cap any chain breaks with terminal atoms before OpenMM
+    # sees the structure.  Missing *residues* are intentionally left out so we
+    # don't fill sequence gaps; we only add OXT/H atoms at artificial termini
+    # created by chain breaks.  This is necessary when --skip-fix was used.
+    if _PDBFIXER:
+        import io
+        fixer = PDBFixer(filename=str(fixed_pdb))
+        fixer.findMissingResidues()
+        fixer.findMissingAtoms()            # must run BEFORE clearing missingResidues
+        fixer.missingResidues = {}          # don't insert gap residues
+        n_term = sum(len(v) for v in fixer.missingTerminals.values())
+        if n_term:
+            print(f"  Chain-break termini:  capping {n_term} terminal atom(s) for OpenMM")
+        fixer.addMissingAtoms()
+        buf = io.StringIO()
+        PDBFile.writeFile(fixer.topology, fixer.positions, buf)
+        buf.seek(0)
+        pdb = omm_app.PDBFile(buf)
+    else:
+        pdb = omm_app.PDBFile(str(fixed_pdb))
+
     ff  = omm_app.ForceField(ff_xml)
 
     modeller = omm_app.Modeller(pdb.topology, pdb.positions)
@@ -472,6 +529,15 @@ def main():
         else:
             fixed_pdb = clean_pdb
             print(f"\n[STEP 2/{n_steps}] Skipping repair (--skip-fix).")
+
+        # ── Gap marking: insert TER at sequence breaks ───────────────────────
+        # Must happen before protonation so that pdb2pqr / PDBFixer do not
+        # form peptide bonds across structural gaps.
+        gap_pdb = tmp / 'gap_marked.pdb'
+        n_gaps = _insert_ter_at_gaps(fixed_pdb, gap_pdb)
+        if n_gaps:
+            print(f"  Sequence gaps:        {n_gaps} TER record(s) inserted at chain break(s)")
+        fixed_pdb = gap_pdb
 
         # ── Step 3: Protonate ────────────────────────────────────────────────
         print(f"\n[STEP 3/{n_steps}] Protonating at pH {args.ph}...")
