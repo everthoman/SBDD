@@ -1744,7 +1744,7 @@ def main():
                    minimized_pdb if args.minimize else None, elapsed)
 
     # ── Write log ─────────────────────────────────────────────────────────────
-    log_path.write_text('\n'.join(_log_lines) + '\n')
+    log_path.write_text('\n'.join(_log_lines) + '\n', encoding='utf-8')
     _info(f"Log written  →  {log_path}")
 
 
