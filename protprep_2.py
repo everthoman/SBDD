@@ -1012,8 +1012,12 @@ def step_flip_rotamers(
     model = structure[0]
 
     # ── Collect protonated ligand atom positions for scoring ──────────────────
-    lig_heavy_pos: List[np.ndarray] = []
-    lig_h_pos:     List[np.ndarray] = []
+    # Classify ligand atoms using the same H-bond chemistry as protein atoms:
+    #   acceptors: O, N, S heavy atoms only  (not C, halogens, metals)
+    #   donors:    H bonded to O/N/S         (polar H, not non-polar C-H)
+    # Non-polar C-H protons and carbon/halogen heavy atoms are excluded.
+    _HB_ACC_ELEMS = frozenset({'O', 'N', 'S'})
+    _lig_all: List[Tuple[np.ndarray, str]] = []
     if hetatm_lines:
         for line in hetatm_lines:
             if line[:6].strip() != 'HETATM':
@@ -1026,14 +1030,20 @@ def step_flip_rotamers(
                 if not raw_elem:
                     raw_elem = ''.join(c for c in line[12:16].strip()
                                        if c.isalpha())[:2]
-                elem = raw_elem.upper()
-                pos = np.array([x, y, z])
-                if elem.startswith('H') or elem == 'D':
-                    lig_h_pos.append(pos)
-                else:
-                    lig_heavy_pos.append(pos)
+                _lig_all.append((np.array([x, y, z]), raw_elem.upper()))
             except (ValueError, IndexError):
                 pass
+
+    # Acceptors: O/N/S ligand atoms
+    lig_acc_pos: List[np.ndarray] = [p for p, e in _lig_all if e in _HB_ACC_ELEMS]
+    # Donors: polar H — H/D within 1.3 Å of a ligand O/N/S (O-H ~0.96 Å, N-H ~1.01 Å)
+    _lig_acc_arr = np.array([p for p, e in _lig_all if e in _HB_ACC_ELEMS]) \
+                   if lig_acc_pos else np.zeros((0, 3))
+    lig_don_pos: List[np.ndarray] = []
+    for pos, elem in _lig_all:
+        if elem.startswith('H') or elem == 'D':
+            if len(_lig_acc_arr) and np.linalg.norm(_lig_acc_arr - pos, axis=1).min() < 1.3:
+                lig_don_pos.append(pos)
 
     # ── Neighbour search over all protein atoms ───────────────────────────────
     all_atoms = list(model.get_atoms())
@@ -1056,10 +1066,10 @@ def step_flip_rotamers(
                     don.append(apos)
                 elif elem in ('O', 'N', 'S'):
                     acc.append(apos)
-        for pos in lig_heavy_pos:
+        for pos in lig_acc_pos:
             if any(np.linalg.norm(pos - cp) < cutoff for cp in center_positions):
                 acc.append(pos.copy())
-        for pos in lig_h_pos:
+        for pos in lig_don_pos:
             if any(np.linalg.norm(pos - cp) < cutoff for cp in center_positions):
                 don.append(pos.copy())
         A = np.array(acc) if acc else np.zeros((0, 3))
