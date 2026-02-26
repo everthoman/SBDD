@@ -180,6 +180,8 @@ Examples:
   %(prog)s -i molecules.smi -o prepared.sdf --id-col "Compound_ID"
   %(prog)s -i molecules.sdf -o prepared.sdf -n 8 --no-enumerate-stereo
   %(prog)s -i molecules.sdf -o prepared.sdf --max-isomers 16
+  %(prog)s -i compounds.csv -o prepared.sdf --smiles-col smiles --id-col name
+  %(prog)s -i compounds.csv -o prepared.sdf --smiles-col 2
         """
     )
     
@@ -229,6 +231,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--smiles-col",
+        default=None,
+        metavar="COL",
+        help="SMILES column name or 0-based index in delimited files (default: auto-detect)"
+    )
+
+    parser.add_argument(
         "--failed-log",
         default=None,
         metavar="FILE",
@@ -262,23 +271,70 @@ def main():
         mols = [mol for mol in suppl if mol is not None]
     else:
         with open(input_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                sep = '\t' if '\t' in line else ','
-                parts = line.split(sep)
-                if len(parts) == 0:
-                    continue
-                smi = parts[0].strip()
-                name = parts[1].strip() if len(parts) > 1 else None
-                mol = Chem.MolFromSmiles(smi)
-                if mol:
-                    if name:
-                        mol.SetProp(id_col, name)
-                    mols.append(mol)
+            lines = [l.strip() for l in f if l.strip()]
+
+        if not lines:
+            print("ERROR: Input file is empty.")
+            return
+
+        sep = '\t' if '\t' in lines[0] else ','
+        header = [c.strip() for c in lines[0].split(sep)]
+
+        # Detect header by trying to parse the first cell as SMILES
+        smi_col_idx = 0
+        id_col_idx = 1 if len(header) > 1 else None
+        is_header = Chem.MolFromSmiles(header[0]) is None
+
+        if is_header:
+            smiles_names = {"smiles", "smi", "canonical_smiles", "smiles_string"}
+            for i, col in enumerate(header):
+                if col.lower() in smiles_names:
+                    smi_col_idx = i
+                    break
+            id_names = {id_col.lower(), "name", "id", "compound_id", "molecule_name"}
+            id_col_idx = None
+            for i, col in enumerate(header):
+                if i != smi_col_idx and col.lower() in id_names:
+                    id_col_idx = i
+                    break
+            data_lines = lines[1:]
+        else:
+            data_lines = lines
+
+        # Apply --smiles-col override (name or 0-based index)
+        if args.smiles_col is not None:
+            sc = args.smiles_col
+            if sc.isdigit():
+                smi_col_idx = int(sc)
+            elif is_header:
+                col_lower = [c.lower() for c in header]
+                if sc.lower() in col_lower:
+                    smi_col_idx = col_lower.index(sc.lower())
                 else:
-                    print(f"SMILES parse error for line: {line}")
+                    print(f"ERROR: --smiles-col '{sc}' not found in header: {header}")
+                    return
+            else:
+                print(f"ERROR: --smiles-col '{sc}' is not a valid index and file has no header row.")
+                return
+
+        smi_label = header[smi_col_idx] if is_header else str(smi_col_idx)
+        id_label = header[id_col_idx] if (is_header and id_col_idx is not None) else str(id_col_idx) if id_col_idx is not None else "none"
+        if is_header or args.smiles_col is not None:
+            print(f"[INFO] SMILES col: '{smi_label}', ID col: '{id_label}'")
+
+        for line in data_lines:
+            parts = [p.strip() for p in line.split(sep)]
+            if smi_col_idx >= len(parts):
+                continue
+            smi = parts[smi_col_idx]
+            name = parts[id_col_idx] if id_col_idx is not None and id_col_idx < len(parts) else None
+            mol = Chem.MolFromSmiles(smi)
+            if mol:
+                if name:
+                    mol.SetProp(id_col, name)
+                mols.append(mol)
+            else:
+                print(f"SMILES parse error for line: {line}")
 
     print(f"Processing {len(mols)} molecules using {n_cpus} CPU(s)...")
     if enumerate_stereo:
