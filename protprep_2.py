@@ -404,16 +404,63 @@ def _insert_ter_at_gaps(pdb_in: Path, pdb_out: Path, gap_threshold: int = 2) -> 
 
 # ─── Pipeline steps ───────────────────────────────────────────────────────────
 
-def step_fetch(pdb_id: str, output_path: Path):
+def step_fetch(pdb_id: str, output_path: Path, assembly: Optional[int] = None):
+    """Download a PDB entry from RCSB.
+
+    When *assembly* is given (e.g. 1), the biological assembly PDB is fetched.
+    RCSB provides assemblies in PDB format for most entries; for those that are
+    CIF-only the mmCIF file is downloaded and converted to PDB via BioPython.
+    """
     pdb_id = pdb_id.upper()
-    url = f'https://files.rcsb.org/download/{pdb_id}.pdb'
-    _info(f"URL: {url}")
-    try:
-        urllib.request.urlretrieve(url, str(output_path))
-    except urllib.error.HTTPError as e:
-        _fatal(f"Failed to fetch {pdb_id}: HTTP {e.code}")
-    except urllib.error.URLError as e:
-        _fatal(f"Network error: {e.reason}")
+
+    if assembly:
+        pdb_url = (f'https://files.rcsb.org/download/'
+                   f'{pdb_id}-assembly{assembly}.pdb')
+        cif_url = (f'https://files.rcsb.org/download/'
+                   f'{pdb_id}-assembly{assembly}.cif')
+        _info(f"Biological assembly: {assembly}")
+        _info(f"URL (PDB): {pdb_url}")
+        try:
+            urllib.request.urlretrieve(pdb_url, str(output_path))
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                _fatal(f"Failed to fetch {pdb_id} assembly {assembly}: "
+                       f"HTTP {e.code}")
+            _info("PDB format unavailable for this assembly — trying mmCIF …")
+
+        # Fallback: download mmCIF and convert to PDB with BioPython
+        _info(f"URL (mmCIF): {cif_url}")
+        cif_tmp = output_path.with_suffix('.cif')
+        try:
+            urllib.request.urlretrieve(cif_url, str(cif_tmp))
+        except urllib.error.HTTPError as e:
+            _fatal(f"Failed to fetch {pdb_id} assembly {assembly}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            _fatal(f"Network error: {e.reason}")
+
+        if not _BIOPYTHON:
+            _fatal("BioPython is required to convert mmCIF → PDB. "
+                   "pip install biopython")
+        try:
+            from Bio.PDB import MMCIFParser as _CIFParser
+            cif_struct = _CIFParser(QUIET=True).get_structure(pdb_id, str(cif_tmp))
+            bio_io = PDBIO()
+            bio_io.set_structure(cif_struct)
+            bio_io.save(str(output_path))
+            cif_tmp.unlink(missing_ok=True)
+            _info("mmCIF → PDB conversion done")
+        except Exception as ex:
+            _fatal(f"mmCIF → PDB conversion failed: {ex}")
+    else:
+        url = f'https://files.rcsb.org/download/{pdb_id}.pdb'
+        _info(f"URL: {url}")
+        try:
+            urllib.request.urlretrieve(url, str(output_path))
+        except urllib.error.HTTPError as e:
+            _fatal(f"Failed to fetch {pdb_id}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            _fatal(f"Network error: {e.reason}")
 
 
 def step_clean(input_pdb: Path, output_pdb: Path,
@@ -1460,6 +1507,11 @@ Examples:
     io.add_argument('--fetch', metavar='PDBID',
                     help='Download structure from RCSB (e.g. --fetch 4HHB). '
                          'Sets --input to <PDBID>.pdb if not given.')
+    io.add_argument('--assembly', type=int, default=None, metavar='N',
+                    help='Biological assembly number to fetch with --fetch '
+                         '(e.g. --assembly 1). Default: asymmetric unit. '
+                         'PDB format is tried first; mmCIF is downloaded and '
+                         'converted if PDB is unavailable.')
     inp = io.add_argument('-i', '--input', metavar='PDB',
                           help='Input PDB file (required unless --fetch is used)')
     io.add_argument('-o', '--output', metavar='PDB',
@@ -1540,7 +1592,10 @@ def main():
         _fatal("Provide --input <file> or --fetch <PDBID>")
 
     if args.fetch and not args.input:
-        args.input = f'{args.fetch.upper()}.pdb'
+        if args.assembly:
+            args.input = f'{args.fetch.upper()}-assembly{args.assembly}.pdb'
+        else:
+            args.input = f'{args.fetch.upper()}.pdb'
 
     input_pdb = Path(args.input).resolve()
 
@@ -1554,6 +1609,8 @@ def main():
 
     _print()
     _info(f"Input:         {input_pdb}")
+    if args.assembly:
+        _info(f"Assembly:      {args.assembly} (biological)")
     _info(f"Chain(s):      {', '.join(args.chain) if args.chain else 'all'}")
     _info(f"Keep HETATM:   {', '.join(args.keep_het) if args.keep_het else 'none'}")
     _info(f"pH:            {args.ph}")
@@ -1588,8 +1645,12 @@ def main():
 
         # ── Fetch ─────────────────────────────────────────────────────────────
         if args.fetch:
-            next_step(f"Downloading {args.fetch.upper()} from RCSB PDB")
-            step_fetch(args.fetch, input_pdb)
+            label = f"Downloading {args.fetch.upper()}"
+            if args.assembly:
+                label += f" assembly {args.assembly}"
+            label += " from RCSB PDB"
+            next_step(label)
+            step_fetch(args.fetch, input_pdb, assembly=args.assembly)
             _ok(f"Saved  →  {input_pdb.name}")
         elif not input_pdb.exists():
             _fatal(f"File not found: {input_pdb}")
