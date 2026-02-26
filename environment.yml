@@ -9,6 +9,9 @@ dependencies:
   - biopython
   - pdbfixer
   - openmm
+  - openmmforcefields
+  - openff-toolkit
+  - ambertools
   - oddt
   - pdb2pqr
 
