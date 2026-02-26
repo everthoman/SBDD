@@ -692,6 +692,73 @@ def step_protonate_pdbfixer(input_pdb: Path, output_pdb: Path, ph: float):
         OmmPDBFile.writeFile(fixer.topology, fixer.positions, fh, keepIds=True)
 
 
+def _normalize_his_names(model) -> int:
+    """Rename HIS-family residues to the correct HID/HIE/HIP variant.
+
+    Inspects which imidazole ring hydrogen atoms are actually present:
+      HD1 present, HE2 absent  →  HID  (neutral, δ-protonated)
+      HE2 present, HD1 absent  →  HIE  (neutral, ε-protonated)
+      both present             →  HIP  (protonated cation, +1)
+      neither present          →  HIE  (default neutral; warns — may indicate
+                                         a failed protonation step)
+
+    Also handles CHARMM naming (HSD/HSE/HSP).  Returns the number of
+    residues whose name was changed.
+    """
+    _charmm_his = frozenset({'HSD', 'HSE', 'HSP'})
+    _his_variants = frozenset({'HIS', 'HID', 'HIE', 'HIP', 'HSD', 'HSE', 'HSP'})
+    n_renamed = 0
+    for chain in model:
+        for res in chain:
+            rn = res.get_resname().strip().upper()
+            if rn not in _his_variants:
+                continue
+            use_charmm = rn in _charmm_his
+            hd1 = 'HD1' in res
+            he2 = 'HE2' in res
+            if hd1 and he2:
+                correct = 'HSP' if use_charmm else 'HIP'
+            elif hd1:
+                correct = 'HSD' if use_charmm else 'HID'
+            elif he2:
+                correct = 'HSE' if use_charmm else 'HIE'
+            else:
+                # No imidazole H found.  A bare HIS (no HD1, no HE2) causes
+                # force fields and viewers to apply an ambiguous charge model,
+                # producing the characteristic "+N / −N" appearance on the ring.
+                # Default to HIE (ε-tautomer — statistically the more common
+                # neutral form) and warn so the user can inspect manually.
+                correct = 'HSE' if use_charmm else 'HIE'
+                rid = res.get_id()
+                _warn(f"HIS {chain.id}{rid[1]}: no imidazole H found after "
+                      f"protonation — defaulting to {correct}. "
+                      f"Inspect manually (metal coordination? unusual environment?).")
+            if res.get_resname().strip() != correct:
+                res.resname = correct
+                n_renamed += 1
+    return n_renamed
+
+
+def step_normalize_his(input_pdb: Path, output_pdb: Path) -> int:
+    """Read a protonated PDB, normalise HIS residue names, write back.
+
+    Runs _normalize_his_names unconditionally so the correct HID/HIE/HIP
+    naming is applied even when rotamer flipping is disabled (--no-flip).
+    Returns the number of renamed residues, or 0 if BioPython is unavailable.
+    """
+    if not _BIOPYTHON:
+        shutil.copy(input_pdb, output_pdb)
+        return 0
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('p', str(input_pdb))
+    model = structure[0]
+    n = _normalize_his_names(model)
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(str(output_pdb))
+    return n
+
+
 def _count_clashes(pdb_path: Path, cutoff: float = 1.5) -> int:
     """Count severe steric clashes (heavy-atom pairs closer than cutoff Å)."""
     if not _BIOPYTHON:
@@ -1133,36 +1200,11 @@ def step_flip_rotamers(
                 n_his += 1
 
     # ── Normalise HIS residue names to match H atom assignments ──────────────
-    # pdb2pqr may output generic 'HIS' for some residues.  Regardless of
-    # whether a flip was performed, ensure the residue name reflects the H
-    # atom that is actually present on the imidazole ring:
-    #   HD1 present, HE2 absent  →  HID (AMBER) / HSD (CHARMM)
-    #   HE2 present, HD1 absent  →  HIE (AMBER) / HSE (CHARMM)
-    #   both present             →  HIP (AMBER) / HSP (CHARMM)
-    _charmm_his = frozenset({'HSD', 'HSE', 'HSP'})
-    _his_variants = frozenset({'HIS', 'HID', 'HIE', 'HIP', 'HSD', 'HSE', 'HSP'})
-    n_renamed = 0
-    for chain in model:
-        for res in chain:
-            rn = res.get_resname().strip().upper()
-            if rn not in _his_variants:
-                continue
-            use_charmm = rn in _charmm_his
-            hd1 = 'HD1' in res
-            he2 = 'HE2' in res
-            if hd1 and he2:
-                correct = 'HSP' if use_charmm else 'HIP'
-            elif hd1:
-                correct = 'HSD' if use_charmm else 'HID'
-            elif he2:
-                correct = 'HSE' if use_charmm else 'HIE'
-            else:
-                continue  # no imidazole H — leave name as-is
-            if res.get_resname().strip() != correct:
-                res.resname = correct
-                n_renamed += 1
+    # Re-run after any tautomer swaps to keep the residue name consistent
+    # with whichever imidazole H is now present.
+    n_renamed = _normalize_his_names(model)
     if n_renamed:
-        _info(f"HIS residue names normalised: {n_renamed}")
+        _info(f"HIS residue names normalised after flip: {n_renamed}")
 
     # ── Write output ──────────────────────────────────────────────────────────
     io = PDBIO()
@@ -1626,6 +1668,18 @@ def main():
                 stats['prot'] = 'pdbfixer_fallback'
 
         _ok("Protein protonation done  (protein only)")
+
+        # ── Normalise HIS residue names (always, before rotamer flipping) ──────
+        # pdb2pqr may leave some residues named 'HIS' (generic), and PDBFixer
+        # may not rename either.  A bare HIS with no imidazole H causes force
+        # fields and viewers to apply an ambiguous charge model, producing the
+        # characteristic "+N / −N" appearance on the ring.  Run unconditionally
+        # so the fix applies even when --no-flip is passed.
+        norm_pdb = tmp / 'his_normalised.pdb'
+        n_his_norm = step_normalize_his(prot_pdb, norm_pdb)
+        prot_pdb = norm_pdb
+        if n_his_norm:
+            _info(f"HIS residue names normalised: {n_his_norm} → HID/HIE/HIP")
 
         # ── Protonate ligand with OpenBabel; write SDF for GNINA ──────────────
         hetatm_heavy_for_walls: List[dict] = []
