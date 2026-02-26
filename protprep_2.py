@@ -1732,6 +1732,13 @@ def main():
                                has_hydrogens=True)
             if ok:
                 _ok(f"Minimization done  →  {minimized_pdb.name}")
+                # OpenMM's PDBFile.writeFile renames HID/HIE/HIP → HIS.
+                # Re-normalise so the minimized output has correct variant names.
+                _min_norm = tmp / 'minimized_his_norm.pdb'
+                n_min_norm = step_normalize_his(minimized_pdb, _min_norm)
+                shutil.copy(_min_norm, minimized_pdb)
+                if n_min_norm:
+                    _info(f"HIS names re-normalised in minimized structure: {n_min_norm}")
                 if args.clash_check:
                     n_after = _count_clashes(minimized_pdb)
                     stats['clashes_after'] = n_after
