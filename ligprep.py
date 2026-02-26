@@ -9,7 +9,7 @@ This script takes molecules as input from either an SDF or a SMILES file and pre
 - Protonating molecules at pH 7.4 using OpenBabel
 - Adding explicit hydrogens
 - Generating 3D conformations
-- Minimizing geometry using the UFF force field
+- Minimizing geometry using the MMFF94s force field
 - Preserving specified molecule identifier properties throughout processing
 - Writing the processed molecules to an output SDF file
 
@@ -27,39 +27,60 @@ import argparse
 from rich_argparse import RawDescriptionRichHelpFormatter
 import concurrent.futures
 import os
+import shutil
+import subprocess
+import sys
 import time
 from tqdm import tqdm
 
 import argcomplete
 from argcomplete.completers import FilesCompleter
 
+# Prefer the system (apt) obabel 3.1.1+ over the conda 3.1.0 build.
+# The conda 3.1.0 phmodel.txt tetrazole TRANSFORM produces an invalid mol
+# block (explicit H retained alongside N⁻ formal charge) that RDKit cannot
+# parse, causing a silent fallback to the neutral protonation state.
+# The apt 3.1.1 correctly removes the H and sets the formal charge.
+_OBABEL_CANDIDATES = ['/usr/local/bin/obabel', '/usr/bin/obabel', shutil.which('obabel')]
+_OBABEL = next((p for p in _OBABEL_CANDIDATES if p and os.path.isfile(p)), 'obabel')
+
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
 from rdkit.Chem.rdmolfiles import SDWriter
-from openbabel import openbabel
 
 
-def rdkit_to_openbabel(rdkit_mol):
-    obConversion = openbabel.OBConversion()
-    obConversion.SetInAndOutFormats("smi", "smi")
-    smi = Chem.MolToSmiles(rdkit_mol)
-    obmol = openbabel.OBMol()
-    obConversion.ReadString(obmol, smi)
-    return obmol, obConversion
+def obabel_protonate(mol, ph=7.4):
+    """Protonate a molecule at the given pH using the obabel CLI.
 
+    Passes the molecule as SMILES via stdin and reads back an SDF.  Using the
+    CLI avoids the Python-API bug where CorrectForPH produces invalid mol blocks
+    for tetrazolates and similar N-N aromatic systems.
 
-def openbabel_protonate(obmol, obConversion, pH=7.4):
-    obmol.CorrectForPH(pH)
-    # Write as SMILES so formal charges (e.g. tetrazolate [N-]) are preserved
-    smi = obConversion.WriteString(obmol).strip()
-    return smi.split()[0] if smi else ""
-
-
-def openbabel_to_rdkit(smi):
-    if not smi:
+    Returns the protonated RDKit molecule, or None on failure.
+    """
+    smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
+    try:
+        result = subprocess.run(
+            [_OBABEL, '-ismi', '-osdf', f'-p{ph}'],
+            input=smiles + '\n',
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
-    return Chem.MolFromSmiles(smi)
+
+    if not result.stdout.strip():
+        return None
+
+    logger = RDLogger.logger()
+    logger.setLevel(RDLogger.CRITICAL)
+    supplier = Chem.SDMolSupplier()
+    supplier.SetData(result.stdout, removeHs=False)
+    protonated = next(iter(supplier), None)
+    logger.setLevel(RDLogger.WARNING)
+    return protonated
 
 
 def strip_salts_keep_largest(mol):
@@ -135,24 +156,27 @@ def prepare_molecule_worker(args):
         for k, v in props.items():
             isomer.SetProp(k, v)
         
-        # Protonate using OpenBabel
-        obmol, obConversion = rdkit_to_openbabel(isomer)
-        protonated_mol_block = openbabel_protonate(obmol, obConversion, pH=ph)
-        protonated_mol = openbabel_to_rdkit(protonated_mol_block)
-        
-        if protonated_mol is None:
-            continue
+        # Protonate using obabel CLI (avoids Python-API bug with tetrazolates)
+        protonated_mol = obabel_protonate(isomer, ph=ph)
 
-        # Restore properties after protonation
+        if protonated_mol is None:
+            print(f"  [WARNING] obabel protonation failed for {cached_id or '(unknown)'}; "
+                  "using input protonation state",
+                  file=sys.stderr)
+            protonated_mol = isomer
+
+        # Restore properties after protonation (obabel drops SD tags)
         for k, v in props.items():
             protonated_mol.SetProp(k, v)
 
+        # Strip any flat coords from obabel and re-embed properly in 3D
+        protonated_mol = Chem.RemoveHs(protonated_mol)
         protonated_mol = Chem.AddHs(protonated_mol)
-        
+
         if AllChem.EmbedMolecule(protonated_mol, randomSeed=0xf00d) != 0:
             continue
 
-        AllChem.UFFOptimizeMolecule(protonated_mol)
+        AllChem.MMFFOptimizeMolecule(protonated_mol, mmffVariant='MMFF94s')
         
         # Add stereochemistry info to name if multiple isomers
         if len(isomers) > 1 and cached_id:
@@ -343,6 +367,7 @@ def main():
             else:
                 print(f"SMILES parse error for line: {line}")
 
+    print(f"[INFO] obabel binary: {_OBABEL}")
     print(f"Processing {len(mols)} molecules using {n_cpus} CPU(s)...")
     if enumerate_stereo:
         print(f"Stereoisomer enumeration enabled (max {max_isomers} isomers per molecule)")
