@@ -33,7 +33,7 @@ from tqdm import tqdm
 import argcomplete
 from argcomplete.completers import FilesCompleter
 
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
 from rdkit.Chem.rdmolfiles import SDWriter
@@ -42,20 +42,24 @@ from openbabel import openbabel
 
 def rdkit_to_openbabel(rdkit_mol):
     obConversion = openbabel.OBConversion()
-    obConversion.SetInAndOutFormats("mol", "mol")
-    mol_block = Chem.MolToMolBlock(rdkit_mol)
+    obConversion.SetInAndOutFormats("smi", "smi")
+    smi = Chem.MolToSmiles(rdkit_mol)
     obmol = openbabel.OBMol()
-    obConversion.ReadString(obmol, mol_block)
+    obConversion.ReadString(obmol, smi)
     return obmol, obConversion
 
 
 def openbabel_protonate(obmol, obConversion, pH=7.4):
     obmol.CorrectForPH(pH)
-    return obConversion.WriteString(obmol)
+    # Write as SMILES so formal charges (e.g. tetrazolate [N-]) are preserved
+    smi = obConversion.WriteString(obmol).strip()
+    return smi.split()[0] if smi else ""
 
 
-def openbabel_to_rdkit(mol_block):
-    return Chem.MolFromMolBlock(mol_block, sanitize=True, removeHs=False)
+def openbabel_to_rdkit(smi):
+    if not smi:
+        return None
+    return Chem.MolFromSmiles(smi)
 
 
 def strip_salts_keep_largest(mol):
@@ -283,7 +287,10 @@ def main():
         # Detect header by trying to parse the first cell as SMILES
         smi_col_idx = 0
         id_col_idx = 1 if len(header) > 1 else None
+        _rdlog = RDLogger.logger()
+        _rdlog.setLevel(RDLogger.CRITICAL)
         is_header = Chem.MolFromSmiles(header[0]) is None
+        _rdlog.setLevel(RDLogger.WARNING)
 
         if is_header:
             smiles_names = {"smiles", "smi", "canonical_smiles", "smiles_string"}
