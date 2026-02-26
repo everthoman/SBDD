@@ -866,7 +866,7 @@ def _add_ligand_wall_forces(system, topology, hetatm_heavy: List[dict]) -> int:
     protein_heavy_indices = [
         atom.index for atom in topology.atoms()
         if atom.element is not None
-        and atom.element.symbol not in ('H',) | _POLAR
+        and atom.element.symbol not in {'H'} | _POLAR
     ]
     for lig in hetatm_heavy:
         x0, y0, z0 = lig['pos']
