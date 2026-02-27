@@ -368,17 +368,26 @@ def _inspect(pdb_path: Path) -> dict:
 
 # ─── Gap handling ─────────────────────────────────────────────────────────────
 
-def _insert_ter_at_gaps(pdb_in: Path, pdb_out: Path, gap_threshold: int = 2) -> int:
+def _insert_ter_at_gaps(pdb_in: Path, pdb_out: Path, gap_threshold: int = 2,
+                        rename_nterm_h: bool = False) -> int:
     """Insert TER records where residue numbers jump within the same chain.
 
     Without TER records at sequence gaps, pdb2pqr and OpenMM/PDBFixer treat
     structurally disconnected segments as covalently bonded across the gap.
+
+    When *rename_nterm_h* is True the backbone H atom of the first residue
+    immediately after each gap is renamed to H1.  pdb2pqr protonates gap
+    N-terminal residues as mid-chain (outputting 'H' instead of 'H1/H2/H3');
+    renaming H→H1 lets OpenMM's addHydrogens() recognise the residue as
+    N-terminal and supply the missing H2/H3 with idealized geometry.
     """
     lines = pdb_in.read_text().splitlines(keepends=True)
     out_lines = []
     prev_chain: Optional[str] = None
     prev_resseq: Optional[int] = None
     n_inserted = 0
+    _nterm_chain: Optional[str] = None   # chain of gap-N-terminal residue
+    _nterm_resseq: Optional[int] = None  # resseq of gap-N-terminal residue
 
     for line in lines:
         record = line[:6].strip()
@@ -394,6 +403,17 @@ def _insert_ter_at_gaps(pdb_in: Path, pdb_out: Path, gap_threshold: int = 2) -> 
                     and resseq - prev_resseq >= gap_threshold):
                 out_lines.append('TER\n')
                 n_inserted += 1
+                if rename_nterm_h:
+                    _nterm_chain = chain
+                    _nterm_resseq = resseq
+            # Rename backbone H → H1 on the first residue after a gap
+            if (rename_nterm_h
+                    and chain == _nterm_chain
+                    and resseq == _nterm_resseq
+                    and record == 'ATOM'
+                    and line[12:16].strip() == 'H'):
+                line = line[:12] + ' H1 ' + line[16:]
+                _nterm_chain = _nterm_resseq = None  # one rename per gap
             prev_chain = chain
             prev_resseq = resseq
         out_lines.append(line)
@@ -445,6 +465,33 @@ def step_fetch(pdb_id: str, output_path: Path, assembly: Optional[int] = None):
         try:
             from Bio.PDB import MMCIFParser as _CIFParser
             cif_struct = _CIFParser(QUIET=True).get_structure(pdb_id, str(cif_tmp))
+
+            # PDB format allows only single-character chain IDs.  Biological
+            # assemblies often have multi-char IDs like 'A-2'; remap them.
+            _CHAIN_CHARS = (
+                'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                'abcdefghijklmnopqrstuvwxyz'
+                '0123456789'
+            )
+            chain_map: dict = {}
+            for model in cif_struct:
+                # Collect IDs already valid (single-char) — reserved.
+                used = {ch.id for ch in model if len(ch.id) == 1}
+                available = [c for c in _CHAIN_CHARS if c not in used]
+                avail_iter = iter(available)
+                for chain in model:
+                    cid = chain.id
+                    if len(cid) > 1:
+                        if cid not in chain_map:
+                            try:
+                                chain_map[cid] = next(avail_iter)
+                            except StopIteration:
+                                _fatal("Too many chains to remap to single-char PDB IDs")
+                        chain.id = chain_map[cid]
+            if chain_map:
+                _info(f"Remapped {len(chain_map)} long chain ID(s) to single chars: "
+                      + ', '.join(f'{k}→{v}' for k, v in chain_map.items()))
+
             bio_io = PDBIO()
             bio_io.set_structure(cif_struct)
             bio_io.save(str(output_path))
@@ -804,6 +851,31 @@ def step_normalize_his(input_pdb: Path, output_pdb: Path) -> int:
     io.set_structure(structure)
     io.save(str(output_pdb))
     return n
+
+
+_HIS_VAR_RE = re.compile(
+    r'^((?:ATOM  |HETATM).{11})(HID|HIE|HIP)( )(.)(.{4})',
+    re.MULTILINE,
+)
+
+
+def _rename_his_to_his(pdb_path: Path) -> int:
+    """Rename HID/HIE/HIP → HIS in a PDB file for viewer compatibility.
+
+    The protonation state is preserved in hydrogen atom positions regardless
+    of the residue name.  Returns the number of unique HIS residues renamed.
+    """
+    text = pdb_path.read_text()
+    seen: set = set()
+
+    def _sub(m: re.Match) -> str:
+        seen.add((m.group(4), m.group(5).strip()))   # (chain, resseq)
+        return m.group(1) + 'HIS' + m.group(3) + m.group(4) + m.group(5)
+
+    new_text = _HIS_VAR_RE.sub(_sub, text)
+    if new_text != text:
+        pdb_path.write_text(new_text)
+    return len(seen)
 
 
 def _count_clashes(pdb_path: Path, cutoff: float = 1.5) -> int:
@@ -1296,9 +1368,22 @@ def step_minimize(protein_pdb: Path, output_pdb: Path, ph: float,
     if hetatm_heavy:
         _info(f"HETATM heavy atoms (frozen walls): {len(hetatm_heavy)}")
 
+    # ── Re-mark sequence gaps with TER before OpenMM sees the structure ──────
+    # pdb2pqr (and other upstream tools) may not re-emit mid-chain TER records
+    # for same-chain segments.  Without them, PDBFixer/OpenMM creates a phantom
+    # peptide bond across the gap, producing catastrophic forces during
+    # minimization.  Re-running _insert_ter_at_gaps here is safe even when TER
+    # records are already present (it only adds them, never removes).
+    _gap_tmp = Path(tempfile.mktemp(suffix='_gapped.pdb'))
+    _n_gap = _insert_ter_at_gaps(protein_pdb, _gap_tmp,
+                                  rename_nterm_h=has_hydrogens)
+    if _n_gap:
+        _info(f"Re-marked {_n_gap} sequence gap(s) with TER before OpenMM")
+    _pdb_for_fixer = _gap_tmp
+
     # ── Cap chain breaks before OpenMM sees the structure ────────────────────
     if _PDBFIXER:
-        fixer = PDBFixer(filename=str(protein_pdb))
+        fixer = PDBFixer(filename=str(_pdb_for_fixer))
         fixer.findMissingResidues()
         fixer.missingResidues = {}
         fixer.findMissingAtoms()
@@ -1309,17 +1394,26 @@ def step_minimize(protein_pdb: Path, output_pdb: Path, ph: float,
         if n_term:
             _info(f"Chain-break termini: capping {n_term} atom(s) for OpenMM")
         fixer.addMissingAtoms()
-        buf = _io.StringIO()
-        OmmPDBFile.writeFile(fixer.topology, fixer.positions, buf, keepIds=True)
-        buf.seek(0)
-        pdb = omm_app.PDBFile(buf)
+        # Use PDBFixer's topology and positions directly — writing then re-reading
+        # the PDB would merge same-chain-ID gap segments (separated by TER) back
+        # into one chain, causing OXT + phantom peptide bond → "bonds are different".
+        _mm_topology = fixer.topology
+        _mm_positions = fixer.positions
     else:
-        pdb = omm_app.PDBFile(str(protein_pdb))
+        _pdb_obj = omm_app.PDBFile(str(_pdb_for_fixer))
+        _mm_topology = _pdb_obj.topology
+        _mm_positions = _pdb_obj.positions
+
+    _gap_tmp.unlink(missing_ok=True)
 
     ff_obj = omm_app.ForceField('amber14-all.xml')
-    modeller = omm_app.Modeller(pdb.topology, pdb.positions)
-    if not has_hydrogens:
-        modeller.addHydrogens(ff_obj, pH=ph)
+    modeller = omm_app.Modeller(_mm_topology, _mm_positions)
+    # addHydrogens is always called: when has_hydrogens=True it only adds the
+    # H2/H3 atoms that pdb2pqr omitted from gap N-terminal residues (it named
+    # the backbone H as 'H' rather than 'H1', so _insert_ter_at_gaps renamed
+    # H→H1 above, and now addHydrogens supplies the two missing terminal H).
+    # For fully-protonated non-gap residues it is a no-op.
+    modeller.addHydrogens(ff_obj, pH=ph)
 
     try:
         system = ff_obj.createSystem(modeller.topology,
@@ -1543,6 +1637,11 @@ Examples:
                       help='Skip ASN/GLN/HIS rotamer optimisation (flips amide '
                            'groups and HIS tautomers to maximise H-bond contacts '
                            'with the environment and any kept ligand)')
+    prot.add_argument('--amber-his', action='store_true',
+                      help='Keep AMBER-style HID/HIE/HIP residue names in the '
+                           'output PDB (default: rename back to HIS for viewer '
+                           'compatibility; protonation state is preserved in '
+                           'hydrogen atom positions)')
 
     fix_grp = p.add_argument_group('Structure Repair')
     fix_grp.add_argument('--skip-fix', action='store_true',
@@ -1624,6 +1723,7 @@ def main():
     else:
         _info("Minimize:      no")
     _info(f"Flip rotamers: {'no' if args.no_flip else 'yes  (ASN/GLN/HIS, 5 Å cutoff)'}")
+    _info(f"HIS naming:    {'HID/HIE/HIP (AMBER)' if args.amber_his else 'HIS (viewer-compatible)'}")
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     prepared_pdb = (Path(args.output).resolve() if args.output
@@ -1779,6 +1879,8 @@ def main():
             _ok(f"Rotamer flips: {n_asn_gln} ASN/GLN,  {n_his} HIS")
 
         shutil.copy(prot_pdb, prepared_pdb)
+        if not args.amber_his:
+            _rename_his_to_his(prepared_pdb)
         _ok(f"Prepared protein  →  {prepared_pdb.name}")
 
         # Clash check (optional)
@@ -1803,13 +1905,16 @@ def main():
                                has_hydrogens=True)
             if ok:
                 _ok(f"Minimization done  →  {minimized_pdb.name}")
-                # OpenMM's PDBFile.writeFile renames HID/HIE/HIP → HIS.
-                # Re-normalise so the minimized output has correct variant names.
-                _min_norm = tmp / 'minimized_his_norm.pdb'
-                n_min_norm = step_normalize_his(minimized_pdb, _min_norm)
-                shutil.copy(_min_norm, minimized_pdb)
-                if n_min_norm:
-                    _info(f"HIS names re-normalised in minimized structure: {n_min_norm}")
+                if args.amber_his:
+                    # Re-normalise HIS → HID/HIE/HIP for AMBER-compatible output.
+                    # OpenMM's PDBFile.writeFile writes HIS for all variants;
+                    # re-normalise based on H-atom positions to restore the
+                    # correct HID/HIE/HIP name.
+                    _min_norm = tmp / 'minimized_his_norm.pdb'
+                    n_min_norm = step_normalize_his(minimized_pdb, _min_norm)
+                    shutil.copy(_min_norm, minimized_pdb)
+                    if n_min_norm:
+                        _info(f"HIS names re-normalised in minimized structure: {n_min_norm}")
                 if args.clash_check:
                     n_after = _count_clashes(minimized_pdb)
                     stats['clashes_after'] = n_after
