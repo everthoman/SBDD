@@ -58,7 +58,7 @@ except ImportError:
 
 try:
     from rdkit import Chem, RDLogger
-    from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen
+    from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen, QED
     _RDKIT = True
 except ImportError:
     _RDKIT = False
@@ -417,9 +417,25 @@ def _make_ro3_filter():
     return _filt
 
 
+def _make_qed_filter(lo: Optional[float], hi: Optional[float]):
+    """Return a QED (Quantitative Estimate of Drug-likeness) filter.
+
+    QED ranges from 0 (least drug-like) to 1 (most drug-like).
+    Typical drug-like threshold: QED ≥ 0.5.
+    """
+    def _filt(mol, _args):
+        score = QED.qed(mol)
+        if lo is not None and score < lo:
+            return f"QED {score:.3f} < {lo}"
+        if hi is not None and score > hi:
+            return f"QED {score:.3f} > {hi}"
+        return None
+    return _filt
+
+
 def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
                            custom_rules=None, mw_range=None, logp_range=None,
-                           lipinski=False, ro3=False) -> list:
+                           lipinski=False, ro3=False, qed_range=None) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -436,6 +452,8 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
         pipeline.append(('Lipinski', _make_lipinski_filter()))
     if ro3:
         pipeline.append(('Ro3',      _make_ro3_filter()))
+    if qed_range is not None:
+        pipeline.append(('QED',      _make_qed_filter(*qed_range)))
     return pipeline
 
 
@@ -503,6 +521,11 @@ def main():
     prop.add_argument('--lipinski-strict', action='store_true',
                       help='Require all four Lipinski rules to pass '
                            '(zero violations allowed; implies --lipinski)')
+    prop.add_argument('--qed', metavar='RANGE', default=None,
+                      help='Quantitative Estimate of Drug-likeness (0–1, '
+                           'higher = more drug-like).  '
+                           'Format: MIN:MAX, MIN:, :MAX, or exact value.  '
+                           'E.g. --qed 0.5:  --qed 0.4:0.9')
     prop.add_argument('--ro3', action='store_true',
                       help='Astex Rule of Three for fragment screening: '
                            'MW≤300, logP≤3, HBD≤3, HBA≤3, RotBonds≤3 '
@@ -535,6 +558,7 @@ def main():
     _info(f"Deduplicate:   {'yes' if args.unique else 'no'}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
+    _info(f"QED range:     {args.qed if args.qed else 'any'}")
     lip_mode = ('strict' if args.lipinski_strict else 'on (1 violation allowed)') if (args.lipinski or args.lipinski_strict) else 'off'
     _info(f"Lipinski Ro5:  {lip_mode}")
     _info(f"Rule of Three: {'on' if args.ro3 else 'off'}")
@@ -568,6 +592,7 @@ def main():
 
     mw_range   = _parse_range(args.mw,   'mw')   if args.mw   else None
     logp_range = _parse_range(args.logp, 'logp') if args.logp else None
+    qed_range  = _parse_range(args.qed,  'qed')  if args.qed  else None
 
     pipeline = _build_filter_pipeline(args,
                                       pains_patterns=pains_patterns,
@@ -576,7 +601,8 @@ def main():
                                       mw_range=mw_range,
                                       logp_range=logp_range,
                                       lipinski=args.lipinski or args.lipinski_strict,
-                                      ro3=args.ro3)
+                                      ro3=args.ro3,
+                                      qed_range=qed_range)
     if not pipeline and not args.strip and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
