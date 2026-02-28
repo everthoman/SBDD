@@ -101,6 +101,7 @@ def format_time(seconds: float) -> str:
 def _iter_smiles(path: Path) -> Iterator[Tuple[Chem.Mol, str]]:
     """Yield (mol, name) from a SMILES file (comma- or tab-separated)."""
     RDLogger.DisableLog('rdApp.*')
+    first_data_line = True
     with path.open(encoding='utf-8', errors='replace') as fh:
         for lineno, raw in enumerate(fh, 1):
             line = raw.strip()
@@ -111,8 +112,13 @@ def _iter_smiles(path: Path) -> Iterator[Tuple[Chem.Mol, str]]:
             name = parts[1].strip() if len(parts) > 1 else f"mol_{lineno}"
             mol = Chem.MolFromSmiles(smi)
             if mol is None:
-                _warn(f"Line {lineno}: could not parse SMILES — skipped")
+                if first_data_line:
+                    _info(f"Line {lineno}: skipping header row ({smi!r})")
+                else:
+                    _warn(f"Line {lineno}: could not parse SMILES — skipped")
+                first_data_line = False
                 continue
+            first_data_line = False
             mol.SetProp('_Name', name)
             yield mol, name
 
