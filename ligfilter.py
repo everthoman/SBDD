@@ -389,9 +389,37 @@ def _make_lipinski_filter():
     return _filt
 
 
+def _make_ro3_filter():
+    """Return an Astex Rule-of-Three filter for fragment screening.
+
+    Rejects molecules that violate any of:
+      MW       ≤ 300
+      logP     ≤ 3
+      HBD      ≤ 3  (H-bond donors)
+      HBA      ≤ 3  (H-bond acceptors)
+      RotBonds ≤ 3  (rotatable bonds)
+    """
+    def _filt(mol, _args):
+        violations = []
+        mw   = Descriptors.MolWt(mol)
+        lp   = Crippen.MolLogP(mol)
+        hbd  = rdMolDescriptors.CalcNumHBD(mol)
+        hba  = rdMolDescriptors.CalcNumHBA(mol)
+        rotb = rdMolDescriptors.CalcNumRotatableBonds(mol)
+        if mw   > 300: violations.append(f"MW {mw:.1f}>300")
+        if lp   > 3:   violations.append(f"logP {lp:.2f}>3")
+        if hbd  > 3:   violations.append(f"HBD {hbd}>3")
+        if hba  > 3:   violations.append(f"HBA {hba}>3")
+        if rotb > 3:   violations.append(f"RotBonds {rotb}>3")
+        if violations:
+            return "Ro3: " + ", ".join(violations)
+        return None
+    return _filt
+
+
 def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
                            custom_rules=None, mw_range=None, logp_range=None,
-                           lipinski=False) -> list:
+                           lipinski=False, ro3=False) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -406,6 +434,8 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
         pipeline.append(('LogP',    _make_logp_filter(*logp_range)))
     if lipinski:
         pipeline.append(('Lipinski', _make_lipinski_filter()))
+    if ro3:
+        pipeline.append(('Ro3',      _make_ro3_filter()))
     return pipeline
 
 
@@ -473,6 +503,10 @@ def main():
     prop.add_argument('--lipinski-strict', action='store_true',
                       help='Require all four Lipinski rules to pass '
                            '(zero violations allowed; implies --lipinski)')
+    prop.add_argument('--ro3', action='store_true',
+                      help='Astex Rule of Three for fragment screening: '
+                           'MW≤300, logP≤3, HBD≤3, HBA≤3, RotBonds≤3 '
+                           '(all rules must pass)')
 
     if _ARGCOMPLETE:
         argcomplete.autocomplete(p)
@@ -503,6 +537,7 @@ def main():
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
     lip_mode = ('strict' if args.lipinski_strict else 'on (1 violation allowed)') if (args.lipinski or args.lipinski_strict) else 'off'
     _info(f"Lipinski Ro5:  {lip_mode}")
+    _info(f"Rule of Three: {'on' if args.ro3 else 'off'}")
     print(bar)
 
     # ── Load filter data ──────────────────────────────────────────────────────
@@ -540,7 +575,8 @@ def main():
                                       custom_rules=custom_rules,
                                       mw_range=mw_range,
                                       logp_range=logp_range,
-                                      lipinski=args.lipinski or args.lipinski_strict)
+                                      lipinski=args.lipinski or args.lipinski_strict,
+                                      ro3=args.ro3)
     if not pipeline and not args.strip and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
