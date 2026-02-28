@@ -41,9 +41,12 @@ Written by Claude Sonnet 4.6, 2026-02-27
 """
 
 import argparse
+import math
+import os
 import statistics
 import sys
 import time
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -399,7 +402,7 @@ def _make_logp_filter(lo: Optional[float], hi: Optional[float]):
     return _filt
 
 
-def _make_lipinski_filter():
+def _make_lipinski_filter(strict: bool = False):
     """Return a Lipinski Rule-of-Five filter.
 
     Rejects molecules that violate more than one of:
@@ -408,11 +411,11 @@ def _make_lipinski_filter():
       HBA ≤ 10  (H-bond acceptors, N + O)
       logP ≤ 5
 
-    One violation is permitted (the classic Ro5 definition allows one
-    exception for molecules that are substrates of active transporters).
-    Pass --lipinski-strict to require all four rules.
+    strict=False (default): one violation is permitted.
+    strict=True: all four rules must pass.
     """
-    def _filt(mol, args):
+    limit = 0 if strict else 1
+    def _filt(mol, _args):
         violations = []
         mw  = Descriptors.MolWt(mol)
         hbd = rdMolDescriptors.CalcNumHBD(mol)
@@ -422,7 +425,6 @@ def _make_lipinski_filter():
         if hbd > 5:   violations.append(f"HBD {hbd}>5")
         if hba > 10:  violations.append(f"HBA {hba}>10")
         if lp  > 5:   violations.append(f"logP {lp:.2f}>5")
-        limit = 0 if getattr(args, 'lipinski_strict', False) else 1
         if len(violations) > limit:
             return "Lipinski: " + ", ".join(violations)
         return None
@@ -547,11 +549,36 @@ def _mol_props(mol: Chem.Mol) -> dict:
     }
 
 
-def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
+# Shared pipeline inherited by worker processes via fork (Linux default).
+# Set in main() before the Pool is created.
+_shared_pipeline: list = []
+
+
+def _pool_worker(batch_binary: list) -> list:
+    """Multiprocessing worker. Inherits _shared_pipeline via fork — no pickling.
+
+    batch_binary : list of (mol_bytes, name)
+    Returns      : list of (mol_bytes_or_None, name, reason_or_None, props)
+    """
+    results = []
+    for mol_b, name in batch_binary:
+        mol = Chem.Mol(mol_b)
+        reason = None
+        for _label, filt_fn in _shared_pipeline:
+            reason = filt_fn(mol, None)
+            if reason:
+                break
+        props = _mol_props(mol)
+        results.append((mol.ToBinary() if reason is None else None, name, reason, props))
+    return results
+
+
+def _build_filter_pipeline(pains_patterns=None, reos_rules=None,
                            custom_rules=None, mw_range=None, logp_range=None,
-                           lipinski=False, ro3=False, qed_range=None,
-                           hba_range=None, hbd_range=None, rb_range=None,
-                           tpsa_range=None, chiral_range=None) -> list:
+                           lipinski=False, lipinski_strict=False, ro3=False,
+                           qed_range=None, hba_range=None, hbd_range=None,
+                           rb_range=None, tpsa_range=None,
+                           chiral_range=None) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -565,7 +592,7 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
     if logp_range is not None:
         pipeline.append(('LogP',    _make_logp_filter(*logp_range)))
     if lipinski:
-        pipeline.append(('Lipinski', _make_lipinski_filter()))
+        pipeline.append(('Lipinski', _make_lipinski_filter(strict=lipinski_strict)))
     if ro3:
         pipeline.append(('Ro3',      _make_ro3_filter()))
     if qed_range is not None:
@@ -600,6 +627,11 @@ def main():
                     help='Input SMILES (.smi/.csv/.tsv) or SDF file')
     io.add_argument('-o', '--output', metavar='FILE',
                     help='Output file (default: <input>_filtered.<ext>)')
+    io.add_argument('-j', '--jobs', metavar='N', type=int,
+                    default=os.cpu_count(),
+                    help=f'Worker threads for filtering and property calculation '
+                         f'(default: {os.cpu_count()} — all available CPUs). '
+                         f'Use --jobs 1 to disable parallelism.')
 
     pre = p.add_argument_group('Preprocessing')
     pre.add_argument('--strip', dest='strip', action='store_true', default=True,
@@ -709,6 +741,7 @@ def main():
     _info(f"Neutralize:    {'yes' if args.neutralize else 'no (disabled)'}")
     _info(f"Deduplicate:   {'yes' if args.unique else 'no (disabled)'}")
     _info(f"Output format: {out_path.suffix.lower()[1:].upper()}")
+    _info(f"Workers:       {args.jobs}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
     _info(f"QED range:     {args.qed if args.qed else 'any'}")
@@ -757,13 +790,13 @@ def main():
     tpsa_range   = _parse_range(args.tpsa,   'tpsa')   if args.tpsa   else None
     chiral_range = _parse_range(args.chiral, 'chiral') if args.chiral else None
 
-    pipeline = _build_filter_pipeline(args,
-                                      pains_patterns=pains_patterns,
+    pipeline = _build_filter_pipeline(pains_patterns=pains_patterns,
                                       reos_rules=reos_rules,
                                       custom_rules=custom_rules,
                                       mw_range=mw_range,
                                       logp_range=logp_range,
                                       lipinski=args.lipinski or args.lipinski_strict,
+                                      lipinski_strict=args.lipinski_strict,
                                       ro3=args.ro3,
                                       qed_range=qed_range,
                                       hba_range=hba_range,
@@ -792,25 +825,38 @@ def main():
     prop_lists:      Dict[str, list] = {}
     rej_prop_lists:  Dict[str, list] = {}
 
+    # Share pipeline with workers via fork-inherited global (no pickling needed)
+    global _shared_pipeline
+    _shared_pipeline = pipeline
+
+    # Serialise mols as bytes for inter-process transfer
+    n_jobs = max(1, min(args.jobs, len(molecules)))
+    batch_size = math.ceil(len(molecules) / n_jobs) if molecules else 1
+    batches_binary = [
+        [(mol.ToBinary(), name) for mol, name in molecules[i:i + batch_size]]
+        for i in range(0, len(molecules), batch_size)
+    ]
+
     write_mol, close_out = _make_writer(out_path)
 
-    for mol, name in molecules:
-        reason = None
-        for _label, filt_fn in pipeline:
-            reason = filt_fn(mol, args)
-            if reason:
+    if n_jobs > 1:
+        with Pool(processes=n_jobs) as pool:
+            all_results = pool.map(_pool_worker, batches_binary)
+    else:
+        all_results = [_pool_worker(bb) for bb in batches_binary]
+
+    for batch_results in all_results:
+        for mol_b, name, reason, props in batch_results:
+            if reason is None:
+                write_mol(Chem.Mol(mol_b), name)
+                n_pass += 1
+                for prop, val in props.items():
+                    prop_lists.setdefault(prop, []).append(val)
+            else:
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-                break
-        props = _mol_props(mol)
-        if reason is None:
-            write_mol(mol, name)
-            n_pass += 1
-            for prop, val in props.items():
-                prop_lists.setdefault(prop, []).append(val)
-        else:
-            n_fail += 1
-            for prop, val in props.items():
-                rej_prop_lists.setdefault(prop, []).append(val)
+                n_fail += 1
+                for prop, val in props.items():
+                    rej_prop_lists.setdefault(prop, []).append(val)
 
     close_out()
 
