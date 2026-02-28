@@ -21,6 +21,7 @@ The file can be comma-separated or tab-separated.
 
 Written by Perplexity 4.0.0, 2025-08-19
 Updated by Claude, 2026-01-24: Added argparse and stereoisomer enumeration
+Updated by Claude, 2026-02-28: Batch obabel calls, per-isomer task batching, streaming writer, default ncpus=all
 """
 
 import argparse
@@ -44,43 +45,65 @@ from argcomplete.completers import FilesCompleter
 _OBABEL_CANDIDATES = ['/usr/local/bin/obabel', '/usr/bin/obabel', shutil.which('obabel')]
 _OBABEL = next((p for p in _OBABEL_CANDIDATES if p and os.path.isfile(p)), 'obabel')
 
+# Number of isomers per batch submitted to the process pool.
+# Embed+minimize dominates, so equal-sized batches give good load balance.
+_BATCH_SIZE = 50
+
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
 from rdkit.Chem.rdmolfiles import SDWriter
 
 
-def obabel_protonate(mol, ph=7.4):
-    """Protonate a molecule at the given pH using the obabel CLI.
+def obabel_protonate_batch(smiles_list, ph=7.4):
+    """Batch-protonate SMILES at the given pH using a single obabel subprocess.
 
-    Passes the molecule as SMILES via stdin and reads back an SDF.  Using the
-    CLI avoids the Python-API bug where CorrectForPH produces invalid mol blocks
-    for tetrazolates and similar N-N aromatic systems.
+    Each SMILES is tagged with a synthetic name ``__idx_N`` so the parsed SDF
+    records can be mapped back to their original positions.
 
-    Returns the protonated RDKit molecule, or None on failure.
+    Returns list[Mol | None] in the same order as smiles_list.
+    None entries indicate protonation failures for those positions.
+    On subprocess failure (missing binary, timeout) returns all-None list.
     """
-    smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
+    if not smiles_list:
+        return []
+
+    stdin_data = "".join(f"{smi}\t__idx_{i}\n" for i, smi in enumerate(smiles_list))
+    timeout = 30 + 5 * len(smiles_list)
+
     try:
         result = subprocess.run(
             [_OBABEL, '-ismi', '-osdf', f'-p{ph}'],
-            input=smiles + '\n',
+            input=stdin_data,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+        return [None] * len(smiles_list)
 
     if not result.stdout.strip():
-        return None
+        return [None] * len(smiles_list)
 
     logger = RDLogger.logger()
     logger.setLevel(RDLogger.CRITICAL)
     supplier = Chem.SDMolSupplier()
     supplier.SetData(result.stdout, removeHs=False)
-    protonated = next(iter(supplier), None)
     logger.setLevel(RDLogger.WARNING)
-    return protonated
+
+    output = [None] * len(smiles_list)
+    for mol in supplier:
+        if mol is None:
+            continue
+        name = mol.GetProp('_Name') if mol.HasProp('_Name') else ''
+        if name.startswith('__idx_'):
+            try:
+                idx = int(name[6:])
+                if 0 <= idx < len(output):
+                    output[idx] = mol
+            except ValueError:
+                pass
+    return output
 
 
 def strip_salts_keep_largest(mol):
@@ -89,18 +112,17 @@ def strip_salts_keep_largest(mol):
     frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=True)
     if not frags:
         return None
-    largest_frag = max(frags, key=lambda m: m.GetNumAtoms())
-    return largest_frag
+    return max(frags, key=lambda m: m.GetNumAtoms())
 
 
 def enumerate_stereoisomers(mol, max_isomers=32):
     """
     Enumerate all stereoisomers for unspecified chiral centers.
-    
+
     Args:
         mol: RDKit molecule with potentially unspecified stereocenters
         max_isomers: Maximum number of isomers to generate (default 32)
-        
+
     Returns:
         List of RDKit molecules representing all unique stereoisomers
     """
@@ -110,82 +132,79 @@ def enumerate_stereoisomers(mol, max_isomers=32):
         onlyUnassigned=True,
         maxIsomers=max_isomers
     )
-    
     isomers = list(EnumerateStereoisomers(mol, options=opts))
-    
-    # If no unspecified stereocenters, return the original molecule
-    if len(isomers) == 0:
-        return [mol]
-    
-    return isomers
+    return isomers if isomers else [mol]
 
 
 def get_stereo_suffix(mol, index):
     """Generate a suffix indicating stereochemistry (e.g., '_R,S' or '_isomer_1')."""
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-    stereo_labels = []
-    for atom in mol.GetAtoms():
-        if atom.HasProp('_CIPCode'):
-            stereo_labels.append(atom.GetProp('_CIPCode'))
-    
-    if stereo_labels:
-        return f"_{''.join(stereo_labels)}"
-    else:
-        return f"_isomer_{index}"
+    stereo_labels = [
+        atom.GetProp('_CIPCode')
+        for atom in mol.GetAtoms()
+        if atom.HasProp('_CIPCode')
+    ]
+    return f"_{''.join(stereo_labels)}" if stereo_labels else f"_isomer_{index}"
 
 
-def prepare_molecule_worker(args):
-    mol, id_col, cached_id, enumerate_stereo, max_isomers, ph = args
-    
-    mol = strip_salts_keep_largest(mol)
-    if mol is None:
-        return [], cached_id
+def _prepare_isomer_batch(batch):
+    """Worker: prepare a batch of isomers with one shared obabel call.
 
-    props = {prop: mol.GetProp(prop) for prop in mol.GetPropNames()}
+    Args:
+        batch: list of (mol_binary, base_name, assigned_name, props_dict, ph, id_col)
 
-    # Enumerate stereoisomers if requested
-    if enumerate_stereo:
-        isomers = enumerate_stereoisomers(mol, max_isomers)
-    else:
-        isomers = [mol]
-    
-    prepared_mols = []
-    
-    for idx, isomer in enumerate(isomers):
-        # Restore properties to isomer
-        for k, v in props.items():
-            isomer.SetProp(k, v)
-        
-        # Protonate using obabel CLI (avoids Python-API bug with tetrazolates)
-        protonated_mol = obabel_protonate(isomer, ph=ph)
+    Returns:
+        list of (mol_binary_or_None, base_name, assigned_name)
+        mol_binary is None when 3D embedding failed.
+    """
+    if not batch:
+        return []
 
-        if protonated_mol is None:
-            print(f"  [WARNING] obabel protonation failed for {cached_id or '(unknown)'}; "
-                  "using input protonation state",
-                  file=sys.stderr)
-            protonated_mol = isomer
+    ph = batch[0][4]
 
-        # Restore properties after protonation (obabel drops SD tags)
-        for k, v in props.items():
-            protonated_mol.SetProp(k, v)
+    # Step 1: deserialise all mols and build SMILES list
+    mols_in = [Chem.Mol(item[0]) for item in batch]
+    smiles_list = [Chem.MolToSmiles(m, isomericSmiles=True) for m in mols_in]
 
-        # Strip any flat coords from obabel and re-embed properly in 3D
-        protonated_mol = Chem.RemoveHs(protonated_mol)
-        protonated_mol = Chem.AddHs(protonated_mol)
+    # Step 2: single obabel subprocess for the whole batch
+    protonated = obabel_protonate_batch(smiles_list, ph)
 
-        if AllChem.EmbedMolecule(protonated_mol, randomSeed=0xf00d) != 0:
+    # Step 3: embed and minimize each isomer
+    results = []
+    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col) in enumerate(batch):
+        if protonated[i] is None:
+            print(
+                f"  [WARNING] obabel protonation failed for {assigned_name or '(unknown)'}; "
+                "using input protonation state",
+                file=sys.stderr,
+            )
+            prot = mols_in[i]
+        else:
+            prot = protonated[i]
+
+        # Restore SD properties (obabel drops them)
+        for k, v in props_dict.items():
+            prot.SetProp(k, v)
+
+        # Set name properties
+        prot.SetProp('_Name', assigned_name)
+        if base_name:
+            prot.SetProp(id_col, base_name)
+            if assigned_name != base_name:
+                prot.SetProp(f"{id_col}_stereo", assigned_name)
+
+        # Strip flat obabel coords, re-embed in 3D
+        prot = Chem.RemoveHs(prot)
+        prot = Chem.AddHs(prot)
+
+        if AllChem.EmbedMolecule(prot, randomSeed=0xf00d) != 0:
+            results.append((None, base_name, assigned_name))
             continue
 
-        AllChem.MMFFOptimizeMolecule(protonated_mol, mmffVariant='MMFF94s')
-        
-        # Add stereochemistry info to name if multiple isomers
-        if len(isomers) > 1 and cached_id:
-            stereo_suffix = get_stereo_suffix(isomer, idx + 1)
-            protonated_mol.SetProp(f"{id_col}_stereo", f"{cached_id}{stereo_suffix}")
-        
-        prepared_mols.append(protonated_mol)
-    
-    return prepared_mols, cached_id
+        AllChem.MMFFOptimizeMolecule(prot, mmffVariant='MMFF94s')
+        results.append((prot.ToBinary(), base_name, assigned_name))
+
+    return results
 
 
 def format_time(seconds):
@@ -212,7 +231,7 @@ Examples:
   %(prog)s -i compounds.csv -o prepared.sdf --smiles-col 2
         """
     )
-    
+
     parser.add_argument(
         "-i", "--input",
         required=True,
@@ -224,26 +243,26 @@ Examples:
         required=True,
         help="Output SDF file path"
     ).completer = FilesCompleter(allowednames=(".sdf",))
-    
+
     parser.add_argument(
         "--id-col",
         default="Structure ID",
         help="Identifier property name to preserve (default: 'Structure ID')"
     )
-    
+
     parser.add_argument(
         "-n", "--ncpus",
         type=int,
-        default=1,
-        help="Number of CPUs for parallel processing (default: 1)"
+        default=os.cpu_count(),
+        help=f"Number of CPUs for parallel processing (default: {os.cpu_count()} — all available CPUs)"
     )
-    
+
     parser.add_argument(
         "--no-enumerate-stereo",
         action="store_true",
         help="Disable stereoisomer enumeration for unspecified chiral centers (enumeration is ON by default)"
     )
-    
+
     parser.add_argument(
         "--max-isomers",
         type=int,
@@ -278,7 +297,7 @@ Examples:
 
 def main():
     args = parse_args()
-    
+
     input_path = args.input
     output_path = args.output
     id_col = args.id_col
@@ -292,11 +311,13 @@ def main():
         return
 
     ext = os.path.splitext(input_path)[1].lower()
-    mols = []
-    
+
+    # Build a lazy mol iterator — SDF supplier is already lazy.
+    # For SMILES/CSV, column detection is done eagerly on the header line,
+    # then molecules are yielded one at a time via a nested generator.
     if ext == '.sdf':
         suppl = Chem.SDMolSupplier(input_path, removeHs=False)
-        mols = [mol for mol in suppl if mol is not None]
+        mol_iter = (mol for mol in suppl if mol is not None)
     else:
         with open(input_path, 'r') as f:
             lines = [l.strip() for l in f if l.strip()]
@@ -353,70 +374,87 @@ def main():
         if is_header or args.smiles_col is not None:
             print(f"[INFO] SMILES col: '{smi_label}', ID col: '{id_label}'")
 
-        for line in data_lines:
-            parts = [p.strip() for p in line.split(sep)]
-            if smi_col_idx >= len(parts):
-                continue
-            smi = parts[smi_col_idx]
-            name = parts[id_col_idx] if id_col_idx is not None and id_col_idx < len(parts) else None
-            mol = Chem.MolFromSmiles(smi)
-            if mol:
-                if name:
-                    mol.SetProp(id_col, name)
-                mols.append(mol)
-            else:
-                print(f"SMILES parse error for line: {line}")
+        def _smi_mol_iter():
+            for line in data_lines:
+                parts = [p.strip() for p in line.split(sep)]
+                if smi_col_idx >= len(parts):
+                    continue
+                smi = parts[smi_col_idx]
+                name = parts[id_col_idx] if id_col_idx is not None and id_col_idx < len(parts) else None
+                mol = Chem.MolFromSmiles(smi)
+                if mol:
+                    if name:
+                        mol.SetProp(id_col, name)
+                    yield mol
+                else:
+                    print(f"SMILES parse error for line: {line}")
+
+        mol_iter = _smi_mol_iter()
 
     print(f"[INFO] obabel binary: {_OBABEL}")
-    print(f"Processing {len(mols)} molecules using {n_cpus} CPU(s)...")
     if enumerate_stereo:
         print(f"Stereoisomer enumeration enabled (max {max_isomers} isomers per molecule)")
 
-    worker_args = [
-        (mol, id_col, mol.GetProp(id_col) if mol.HasProp(id_col) else "", enumerate_stereo, max_isomers, ph)
-        for mol in mols
-    ]
+    # ── Phase 1: salt strip + stereo enumerate → flat isomer task list ────────
+    # Done in main so all workers get equal-sized, independent tasks.
+    isomer_tasks = []
+    input_count = 0
+    for mol in mol_iter:
+        input_count += 1
+        mol = strip_salts_keep_largest(mol)
+        if mol is None:
+            continue
+        base_name = mol.GetProp(id_col) if mol.HasProp(id_col) else ""
+        props = {p: mol.GetProp(p) for p in mol.GetPropNames()}
+        isomers = enumerate_stereoisomers(mol, max_isomers) if enumerate_stereo else [mol]
+        for idx, isomer in enumerate(isomers):
+            if len(isomers) > 1 and base_name:
+                assigned_name = f"{base_name}{get_stereo_suffix(isomer, idx + 1)}"
+            else:
+                assigned_name = base_name
+            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col))
+
+    total_isomers = len(isomer_tasks)
+    print(f"Processing {input_count} molecules → {total_isomers} isomers using {n_cpus} CPU(s)...")
+
+    # ── Phase 2: chunk → submit → stream results to writer ───────────────────
+    batches = [isomer_tasks[i:i + _BATCH_SIZE] for i in range(0, total_isomers, _BATCH_SIZE)]
+    del isomer_tasks  # free binary mol data before spawning workers
 
     start_time = time.time()
-
-    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as executor:
-        results = list(tqdm(executor.map(prepare_molecule_worker, worker_args),
-                            total=len(worker_args), desc="Preparing molecules", unit="mol"))
-
-    elapsed_time = time.time() - start_time
-
-    writer = SDWriter(output_path)
     total_output = 0
     failed_count = 0
+    failed_names = []
 
-    for prepared_list, cached_id in results:
-        if prepared_list:
-            for prepared in prepared_list:
-                if cached_id:
-                    prepared.SetProp(id_col, cached_id)
-                writer.write(prepared)
-                total_output += 1
-        else:
-            failed_count += 1
-            print(f"Warning: Could not prepare molecule {cached_id or '(unknown)'}")
+    writer = SDWriter(output_path)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as executor:
+        futures = [executor.submit(_prepare_isomer_batch, b) for b in batches]
+        del batches
+
+        for future in tqdm(futures, desc="Preparing molecules", unit="batch"):
+            for mol_b, base_name, assigned_name in future.result():
+                if mol_b:
+                    writer.write(Chem.Mol(mol_b))
+                    total_output += 1
+                else:
+                    failed_count += 1
+                    failed_names.append(assigned_name)
 
     writer.close()
+    elapsed_time = time.time() - start_time
 
-    if args.failed_log and failed_count > 0:
+    if args.failed_log and failed_names:
         with open(args.failed_log, 'w') as f:
-            for prepared_list, cached_id in results:
-                if not prepared_list:
-                    f.write(f"{cached_id or '(unknown)'}\n")
+            for name in failed_names:
+                f.write(f"{name or '(unknown)'}\n")
         print(f"Failed molecule IDs written to {args.failed_log}")
 
     print(f"\nFinished writing {total_output} prepared molecules to {output_path}")
-    if enumerate_stereo:
-        print(f"  (from {len(mols)} input molecules, {failed_count} failed)")
+    print(f"  (from {input_count} input molecules, {failed_count} failed)")
     print(f"Total processing time: {format_time(elapsed_time)}")
 
-    if len(mols) > 0:
-        time_per_structure = elapsed_time / len(mols)
-        print(f"Average processing time per input structure: {time_per_structure:.3f} seconds")
+    if input_count > 0:
+        print(f"Average processing time per input structure: {elapsed_time / input_count:.3f} seconds")
 
 
 if __name__ == "__main__":
