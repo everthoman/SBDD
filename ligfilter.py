@@ -433,6 +433,18 @@ def _make_qed_filter(lo: Optional[float], hi: Optional[float]):
     return _filt
 
 
+def _make_chiral_filter(lo: Optional[float], hi: Optional[float]):
+    """Return a chiral-centre count filter (specified + unspecified stereocenters)."""
+    def _filt(mol, _args):
+        n = rdMolDescriptors.CalcNumAtomStereoCenters(mol)
+        if lo is not None and n < lo:
+            return f"Chiral {n} < {int(lo)}"
+        if hi is not None and n > hi:
+            return f"Chiral {n} > {int(hi)}"
+        return None
+    return _filt
+
+
 def _make_tpsa_filter(lo: Optional[float], hi: Optional[float]):
     """Return a topological polar surface area filter (Å²)."""
     def _filt(mol, _args):
@@ -485,7 +497,7 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
                            custom_rules=None, mw_range=None, logp_range=None,
                            lipinski=False, ro3=False, qed_range=None,
                            hba_range=None, hbd_range=None, rb_range=None,
-                           tpsa_range=None) -> list:
+                           tpsa_range=None, chiral_range=None) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -512,6 +524,8 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
         pipeline.append(('RotBonds', _make_rb_filter(*rb_range)))
     if tpsa_range is not None:
         pipeline.append(('TPSA',     _make_tpsa_filter(*tpsa_range)))
+    if chiral_range is not None:
+        pipeline.append(('Chiral',   _make_chiral_filter(*chiral_range)))
     return pipeline
 
 
@@ -584,6 +598,9 @@ def main():
                            'higher = more drug-like).  '
                            'Format: MIN:MAX, MIN:, :MAX, or exact value.  '
                            'E.g. --qed 0.5:  --qed 0.4:0.9')
+    prop.add_argument('--chiral', metavar='RANGE', default=None,
+                      help='Chiral centre count range (specified + unspecified).  '
+                           'E.g. --chiral :3  --chiral 0:2')
     prop.add_argument('--tpsa', metavar='RANGE', default=None,
                       help='Topological polar surface area range (Å²).  '
                            'E.g. --tpsa :140  --tpsa 40:130')
@@ -632,7 +649,8 @@ def main():
     _info(f"HBA range:     {args.hba if args.hba else 'any'}")
     _info(f"HBD range:     {args.hbd if args.hbd else 'any'}")
     _info(f"RotBonds range:{args.rb   if args.rb   else 'any'}")
-    _info(f"TPSA range:    {args.tpsa if args.tpsa else 'any'}")
+    _info(f"TPSA range:    {args.tpsa   if args.tpsa   else 'any'}")
+    _info(f"Chiral range:  {args.chiral if args.chiral else 'any'}")
     lip_mode = ('strict' if args.lipinski_strict else 'on (1 violation allowed)') if (args.lipinski or args.lipinski_strict) else 'off'
     _info(f"Lipinski Ro5:  {lip_mode}")
     _info(f"Rule of Three: {'on' if args.ro3 else 'off'}")
@@ -670,7 +688,8 @@ def main():
     hba_range  = _parse_range(args.hba,  'hba')  if args.hba  else None
     hbd_range  = _parse_range(args.hbd,  'hbd')  if args.hbd  else None
     rb_range   = _parse_range(args.rb,   'rb')   if args.rb   else None
-    tpsa_range = _parse_range(args.tpsa, 'tpsa') if args.tpsa else None
+    tpsa_range   = _parse_range(args.tpsa,   'tpsa')   if args.tpsa   else None
+    chiral_range = _parse_range(args.chiral, 'chiral') if args.chiral else None
 
     pipeline = _build_filter_pipeline(args,
                                       pains_patterns=pains_patterns,
@@ -684,7 +703,8 @@ def main():
                                       hba_range=hba_range,
                                       hbd_range=hbd_range,
                                       rb_range=rb_range,
-                                      tpsa_range=tpsa_range)
+                                      tpsa_range=tpsa_range,
+                                      chiral_range=chiral_range)
     if not pipeline and not args.strip and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
