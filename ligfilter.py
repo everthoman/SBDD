@@ -154,7 +154,8 @@ def _make_writer(out_path: Path):
     if out_path.suffix.lower() == '.sdf':
         w = Chem.SDWriter(str(out_path))
         def _write(mol, name):
-            AllChem.Compute2DCoords(mol)
+            if mol.GetNumConformers() == 0:
+                AllChem.Compute2DCoords(mol)
             w.write(mol)
         def _close(): w.close()
     else:
