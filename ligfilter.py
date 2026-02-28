@@ -17,6 +17,8 @@ Workflow
                 ammonium → amine) using RDKit MolStandardize Uncharger
    --unique     deduplicate on canonical SMILES; for duplicates keep the entry
                 with the lexicographically smallest identifier
+   --gen2d      generate a clean 2D layout for every molecule using RDKit
+                Compute2DCoords; applied last so it does not affect identity
 3. Apply each enabled filter in order; the first failure short-circuits
 4. Write passing molecules to output; log reason for each rejection
 
@@ -60,7 +62,7 @@ except ImportError:
 
 try:
     from rdkit import Chem, RDLogger
-    from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen, QED
+    from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen, QED, AllChem
     from rdkit.Chem.MolStandardize import rdMolStandardize
     _RDKIT = True
 except ImportError:
@@ -589,6 +591,10 @@ def main():
                      help='Deduplicate on canonical SMILES; for duplicates '
                           'keep the entry with the lexicographically smallest '
                           'identifier')
+    pre.add_argument('--gen2d', action='store_true',
+                     help='Generate a clean 2D layout for every molecule '
+                          '(RDKit Compute2DCoords).  Applied after all other '
+                          'preprocessing steps.  Useful before writing SDF output.')
 
     filt = p.add_argument_group('Filters')
     filt.add_argument('--pains', action='store_true',
@@ -678,6 +684,7 @@ def main():
     _info(f"Strip salts:   {'yes' if args.strip else 'no'}")
     _info(f"Neutralize:    {'yes' if args.neutralize else 'no'}")
     _info(f"Deduplicate:   {'yes' if args.unique else 'no'}")
+    _info(f"Gen 2D coords: {'yes' if args.gen2d else 'no'}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
     _info(f"QED range:     {args.qed if args.qed else 'any'}")
@@ -740,7 +747,7 @@ def main():
                                       rb_range=rb_range,
                                       tpsa_range=tpsa_range,
                                       chiral_range=chiral_range)
-    if not pipeline and not args.strip and not args.neutralize and not args.unique:
+    if not pipeline and not args.strip and not args.neutralize and not args.unique and not args.gen2d:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
         _info(f"Active filters ({len(pipeline)}): "
@@ -759,6 +766,10 @@ def main():
         molecules = list(raw_stream)
         n_read = len(molecules)
         n_stripped = n_neutralized = n_duplicates = 0
+
+    if args.gen2d:
+        for mol, _name in molecules:
+            AllChem.Compute2DCoords(mol)
 
     # ── Filter ────────────────────────────────────────────────────────────────
     n_pass = n_fail = 0
