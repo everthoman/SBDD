@@ -1,0 +1,46 @@
+# Custom structural filters for ligfilter.py
+#
+# Format: SMARTS<TAB>max_count<TAB>description
+#   max_count = 0  → reject if any match found
+#   max_count = N  → reject if more than N matches found
+#
+# Lines starting with '#' and blank lines are ignored.
+
+# ── Charged structures ────────────────────────────────────────────────────────
+# Rejects any molecule containing a formally charged atom.
+# Note: zwitterions (e.g. amino acids) are also caught, as they contain
+# both [+] and [-] atoms even though the net charge is zero.
+[+]	0	positively charged atom
+[-]	0	negatively charged atom
+
+# ── Isotopes ──────────────────────────────────────────────────────────────────
+# RDKit SMARTS has no general "any isotope label" query, so each isotope
+# must be listed individually.  The entries below cover all isotopes commonly
+# encountered in medicinal-chemistry libraries, radiolabelling, and NMR studies.
+#
+# Hydrogen
+[2H]	0	deuterium (2H)
+[3H]	0	tritium (3H)
+#
+# Carbon
+[11C]	0	carbon-11 (PET tracer)
+[13C]	0	carbon-13 (NMR label)
+[14C]	0	carbon-14 (radiolabel)
+#
+# Nitrogen
+[15N]	0	nitrogen-15 (NMR label)
+#
+# Oxygen
+[17O]	0	oxygen-17 (NMR label)
+[18O]	0	oxygen-18 (isotope label)
+#
+# Fluorine
+[18F]	0	fluorine-18 (PET tracer)
+#
+# Phosphorus
+[32P]	0	phosphorus-32 (radiolabel)
+[33P]	0	phosphorus-33 (radiolabel)
+#
+# Sulfur
+[33S]	0	sulfur-33 (isotope label)
+[35S]	0	sulfur-35 (radiolabel)
