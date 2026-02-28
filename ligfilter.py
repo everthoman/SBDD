@@ -58,7 +58,7 @@ except ImportError:
 
 try:
     from rdkit import Chem, RDLogger
-    from rdkit.Chem import rdMolDescriptors
+    from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen
     _RDKIT = True
 except ImportError:
     _RDKIT = False
@@ -208,6 +208,32 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
     return result, n_stripped, n_duplicates
 
 
+# ─── Range parsing ────────────────────────────────────────────────────────────
+
+def _parse_range(s: str, name: str) -> Tuple[Optional[float], Optional[float]]:
+    """Parse a range string into (lo, hi), either of which may be None (unbounded).
+
+    Accepted formats:
+      '200:500'  →  200 ≤ x ≤ 500
+      '200:'     →  x ≥ 200
+      ':500'     →  x ≤ 500
+      '300'      →  x == 300  (exact value, lo == hi)
+    """
+    if ':' in s:
+        lo_s, hi_s = s.split(':', 1)
+        try:
+            lo = float(lo_s) if lo_s.strip() else None
+            hi = float(hi_s) if hi_s.strip() else None
+        except ValueError:
+            _fatal(f"--{name}: could not parse range '{s}' — expected format MIN:MAX")
+    else:
+        try:
+            lo = hi = float(s)
+        except ValueError:
+            _fatal(f"--{name}: could not parse value '{s}'")
+    return lo, hi
+
+
 # ─── Filter loaders ───────────────────────────────────────────────────────────
 
 def _load_pains(path: Path) -> List[Tuple[str, Chem.Mol]]:
@@ -309,8 +335,32 @@ def _make_custom_filter(rules: List[Tuple[str, int, str, Chem.Mol]]):
     return _filt
 
 
+def _make_mw_filter(lo: Optional[float], hi: Optional[float]):
+    """Return a molecular-weight filter (average MW via RDKit Descriptors)."""
+    def _filt(mol, _args):
+        mw = Descriptors.MolWt(mol)
+        if lo is not None and mw < lo:
+            return f"MW {mw:.1f} < {lo}"
+        if hi is not None and mw > hi:
+            return f"MW {mw:.1f} > {hi}"
+        return None
+    return _filt
+
+
+def _make_logp_filter(lo: Optional[float], hi: Optional[float]):
+    """Return a Wildman-Crippen logP filter."""
+    def _filt(mol, _args):
+        lp = Crippen.MolLogP(mol)
+        if lo is not None and lp < lo:
+            return f"LogP {lp:.2f} < {lo}"
+        if hi is not None and lp > hi:
+            return f"LogP {lp:.2f} > {hi}"
+        return None
+    return _filt
+
+
 def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
-                           custom_rules=None) -> list:
+                           custom_rules=None, mw_range=None, logp_range=None) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -319,6 +369,10 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
         pipeline.append(('REOS',    _make_reos_filter(reos_rules)))
     if custom_rules is not None:
         pipeline.append(('Custom',  _make_custom_filter(custom_rules)))
+    if mw_range is not None:
+        pipeline.append(('MW',      _make_mw_filter(*mw_range)))
+    if logp_range is not None:
+        pipeline.append(('LogP',    _make_logp_filter(*logp_range)))
     return pipeline
 
 
@@ -370,6 +424,16 @@ def main():
                       help='Custom filter file (implies --custom; '
                            'format: SMARTS<TAB>max_count<TAB>description)')
 
+    prop = p.add_argument_group('Property ranges')
+    prop.add_argument('--mw', metavar='RANGE', default=None,
+                      help='Molecular weight range (average MW).  '
+                           'Format: MIN:MAX, MIN:, :MAX, or exact value.  '
+                           'E.g. --mw 150:500  --mw :600  --mw 250:')
+    prop.add_argument('--logp', metavar='RANGE', default=None,
+                      help='Wildman-Crippen logP range.  '
+                           'Format: MIN:MAX, MIN:, :MAX, or exact value.  '
+                           'E.g. --logp -2:5  --logp :4.5')
+
     if _ARGCOMPLETE:
         argcomplete.autocomplete(p)
 
@@ -395,6 +459,8 @@ def main():
     _info(f"Output:        {out_path.name}")
     _info(f"Strip salts:   {'yes' if args.strip else 'no'}")
     _info(f"Deduplicate:   {'yes' if args.unique else 'no'}")
+    _info(f"MW range:      {args.mw if args.mw else 'any'}")
+    _info(f"LogP range:    {args.logp if args.logp else 'any'}")
     print(bar)
 
     # ── Load filter data ──────────────────────────────────────────────────────
@@ -423,10 +489,15 @@ def main():
         custom_rules = _load_reos(custom_path)   # same format as REOS
         _ok(f"Custom: {len(custom_rules)} rules loaded  ({custom_path.name})")
 
+    mw_range   = _parse_range(args.mw,   'mw')   if args.mw   else None
+    logp_range = _parse_range(args.logp, 'logp') if args.logp else None
+
     pipeline = _build_filter_pipeline(args,
                                       pains_patterns=pains_patterns,
                                       reos_rules=reos_rules,
-                                      custom_rules=custom_rules)
+                                      custom_rules=custom_rules,
+                                      mw_range=mw_range,
+                                      logp_range=logp_range)
     if not pipeline and not args.strip and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
