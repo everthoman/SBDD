@@ -682,13 +682,13 @@ def main():
                       help='Wildman-Crippen logP range.  '
                            'Format: MIN:MAX, MIN:, :MAX, or exact value.  '
                            'E.g. --logp -2:5  --logp :4.5')
-    prop.add_argument('--lipinski', action='store_true',
+    prop.add_argument('--ro5', action='store_true',
                       help='Reject molecules that violate more than one '
                            'Lipinski Rule of Five (MW≤500, HBD≤5, HBA≤10, '
                            'logP≤5).  One violation is permitted by default.')
-    prop.add_argument('--lipinski-strict', action='store_true',
+    prop.add_argument('--ro5-strict', action='store_true',
                       help='Require all four Lipinski rules to pass '
-                           '(zero violations allowed; implies --lipinski)')
+                           '(zero violations allowed; implies --ro5)')
     prop.add_argument('--qed', metavar='RANGE', default=None,
                       help='Quantitative Estimate of Drug-likeness (0–1, '
                            'higher = more drug-like).  '
@@ -750,7 +750,7 @@ def main():
     _info(f"RotBonds range:{args.rb   if args.rb   else 'any'}")
     _info(f"TPSA range:    {args.tpsa   if args.tpsa   else 'any'}")
     _info(f"Chiral range:  {args.chiral if args.chiral else 'any'}")
-    lip_mode = ('strict' if args.lipinski_strict else 'on (1 violation allowed)') if (args.lipinski or args.lipinski_strict) else 'off'
+    lip_mode = ('strict' if args.ro5_strict else 'on (1 violation allowed)') if (args.ro5 or args.ro5_strict) else 'off'
     _info(f"Lipinski Ro5:  {lip_mode}")
     _info(f"Rule of Three: {'on' if args.ro3 else 'off'}")
     print(bar)
@@ -795,8 +795,8 @@ def main():
                                       custom_rules=custom_rules,
                                       mw_range=mw_range,
                                       logp_range=logp_range,
-                                      lipinski=args.lipinski or args.lipinski_strict,
-                                      lipinski_strict=args.lipinski_strict,
+                                      lipinski=args.ro5 or args.ro5_strict,
+                                      lipinski_strict=args.ro5_strict,
                                       ro3=args.ro3,
                                       qed_range=qed_range,
                                       hba_range=hba_range,
