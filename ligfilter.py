@@ -839,6 +839,13 @@ def main():
 
     write_mol, close_out = _make_writer(out_path)
 
+    import multiprocessing
+    _fork_available = multiprocessing.get_start_method(allow_none=True) in (None, 'fork')
+    if n_jobs > 1 and not _fork_available:
+        _warn(f"Multiprocessing requires 'fork' start method (not available on this platform). "
+              f"Falling back to --jobs 1.")
+        n_jobs = 1
+
     if n_jobs > 1:
         with Pool(processes=n_jobs) as pool:
             all_results = pool.map(_pool_worker, batches_binary)
