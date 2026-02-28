@@ -41,6 +41,7 @@ Written by Claude Sonnet 4.6, 2026-02-27
 """
 
 import argparse
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -531,6 +532,20 @@ def _make_rb_filter(lo: Optional[float], hi: Optional[float]):
     return _filt
 
 
+def _mol_props(mol: Chem.Mol) -> dict:
+    """Return a dict of calculated properties for a molecule."""
+    return {
+        'MW':     Descriptors.MolWt(mol),
+        'LogP':   Crippen.MolLogP(mol),
+        'HBA':    rdMolDescriptors.CalcNumHBA(mol),
+        'HBD':    rdMolDescriptors.CalcNumHBD(mol),
+        'RB':     rdMolDescriptors.CalcNumRotatableBonds(mol),
+        'TPSA':   rdMolDescriptors.CalcTPSA(mol),
+        'QED':    QED.qed(mol),
+        'Chiral': rdMolDescriptors.CalcNumAtomStereoCenters(mol),
+    }
+
+
 def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
                            custom_rules=None, mw_range=None, logp_range=None,
                            lipinski=False, ro3=False, qed_range=None,
@@ -773,6 +788,7 @@ def main():
     # ── Filter ────────────────────────────────────────────────────────────────
     n_pass = n_fail = 0
     rejection_counts: dict = {}
+    prop_lists: Dict[str, list] = {}
 
     write_mol, close_out = _make_writer(out_path)
 
@@ -786,6 +802,8 @@ def main():
         if reason is None:
             write_mol(mol, name)
             n_pass += 1
+            for prop, val in _mol_props(mol).items():
+                prop_lists.setdefault(prop, []).append(val)
         else:
             n_fail += 1
 
@@ -806,6 +824,31 @@ def main():
         for reason, count in sorted(rejection_counts.items(),
                                     key=lambda x: -x[1]):
             _info(f"  {count:>6}  {reason}")
+    if prop_lists:
+        print(bar)
+        print("  [PROPERTY STATISTICS — passing molecules]")
+        _info(f"  {'Property':<10} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8}")
+        _info(f"  {'-'*10} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+        fmt = {
+            'MW':     '{:8.1f}',
+            'LogP':   '{:8.2f}',
+            'HBA':    '{:8.1f}',
+            'HBD':    '{:8.1f}',
+            'RB':     '{:8.1f}',
+            'TPSA':   '{:8.1f}',
+            'QED':    '{:8.3f}',
+            'Chiral': '{:8.1f}',
+        }
+        for prop, vals in prop_lists.items():
+            mean = statistics.mean(vals)
+            std  = statistics.stdev(vals) if len(vals) > 1 else 0.0
+            f    = fmt[prop]
+            row  = (f"  {prop:<10} " +
+                    f.format(mean) + ' ' +
+                    f.format(std)  + ' ' +
+                    f.format(min(vals)) + ' ' +
+                    f.format(max(vals)))
+            _info(row)
     _info(f"Time:              {format_time(elapsed)}")
     print(bar)
 
