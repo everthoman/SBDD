@@ -11,10 +11,12 @@ explicit extension (.smi or .sdf).
 Workflow
 --------
 1. Read input molecules (SMILES or SDF)
-2. Preprocessing (optional, applied before filtering):
-   --strip   strip salts / small fragments, keep the largest fragment
-   --unique  deduplicate on canonical SMILES; for duplicates keep the entry
-             with the lexicographically smallest identifier
+2. Preprocessing (optional, applied in order before filtering):
+   --strip      strip salts / small fragments, keep the largest fragment
+   --neutralize neutralize formal charges (e.g. carboxylate → acid,
+                ammonium → amine) using RDKit MolStandardize Uncharger
+   --unique     deduplicate on canonical SMILES; for duplicates keep the entry
+                with the lexicographically smallest identifier
 3. Apply each enabled filter in order; the first failure short-circuits
 4. Write passing molecules to output; log reason for each rejection
 
@@ -59,6 +61,7 @@ except ImportError:
 try:
     from rdkit import Chem, RDLogger
     from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen, QED
+    from rdkit.Chem.MolStandardize import rdMolStandardize
     _RDKIT = True
 except ImportError:
     _RDKIT = False
@@ -165,17 +168,36 @@ def _largest_fragment(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
     return largest, True
 
 
+_uncharger = None  # lazy-initialised so it's only created when --neutralize is used
+
+def _neutralize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
+    """Neutralize formal charges using RDKit's Uncharger.
+
+    Returns (neutralized_mol, was_changed).  Quaternary nitrogens and other
+    centres that cannot be neutralized without removing atoms are left intact.
+    """
+    global _uncharger
+    if _uncharger is None:
+        _uncharger = rdMolStandardize.Uncharger()
+    uncharged = _uncharger.uncharge(mol)
+    changed = Chem.MolToSmiles(uncharged) != Chem.MolToSmiles(mol)
+    return uncharged, changed
+
+
 def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
                 do_strip: bool,
+                do_neutralize: bool,
                 do_unique: bool,
-                ) -> Tuple[List[Tuple[Chem.Mol, str]], int, int]:
-    """Apply salt stripping and/or deduplication.
+                ) -> Tuple[List[Tuple[Chem.Mol, str]], int, int, int]:
+    """Apply salt stripping, neutralization, and/or deduplication (in that order).
 
-    Returns (processed_list, n_stripped, n_duplicates).
-    n_stripped   = molecules where at least one fragment was removed
-    n_duplicates = extra entries removed during deduplication
+    Returns (processed_list, n_stripped, n_neutralized, n_duplicates).
+    n_stripped    = molecules where at least one fragment was removed
+    n_neutralized = molecules where at least one formal charge was neutralized
+    n_duplicates  = extra entries removed during deduplication
     """
     n_stripped = 0
+    n_neutralized = 0
     n_duplicates = 0
 
     # seen maps canonical SMILES → (mol, name) for the representative entry
@@ -183,11 +205,17 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
     result: List[Tuple[Chem.Mol, str]] = []
 
     for mol, name in molecules:
-        # Salt stripping
+        # 1. Salt stripping
         if do_strip:
             mol, stripped = _largest_fragment(mol)
             if stripped:
                 n_stripped += 1
+
+        # 2. Neutralization
+        if do_neutralize:
+            mol, changed = _neutralize_mol(mol)
+            if changed:
+                n_neutralized += 1
 
         if do_unique:
             canon = Chem.MolToSmiles(mol, isomericSmiles=True)
@@ -205,7 +233,7 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
     if do_unique:
         result = list(seen.values())
 
-    return result, n_stripped, n_duplicates
+    return result, n_stripped, n_neutralized, n_duplicates
 
 
 # ─── Range parsing ────────────────────────────────────────────────────────────
@@ -551,6 +579,12 @@ def main():
     pre.add_argument('--strip', action='store_true',
                      help='Strip salts and small fragments; keep the largest '
                           'fragment by heavy-atom count')
+    pre.add_argument('--neutralize', action='store_true',
+                     help='Neutralize formal charges where possible '
+                          '(e.g. carboxylate → carboxylic acid, ammonium → amine) '
+                          'using RDKit MolStandardize.  Applied after --strip, '
+                          'before --unique.  Quaternary N and other centres that '
+                          'cannot be neutralized without atom removal are left intact.')
     pre.add_argument('--unique', action='store_true',
                      help='Deduplicate on canonical SMILES; for duplicates '
                           'keep the entry with the lexicographically smallest '
@@ -642,6 +676,7 @@ def main():
     _info(f"Input:         {in_path.name}")
     _info(f"Output:        {out_path.name}")
     _info(f"Strip salts:   {'yes' if args.strip else 'no'}")
+    _info(f"Neutralize:    {'yes' if args.neutralize else 'no'}")
     _info(f"Deduplicate:   {'yes' if args.unique else 'no'}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
@@ -705,7 +740,7 @@ def main():
                                       rb_range=rb_range,
                                       tpsa_range=tpsa_range,
                                       chiral_range=chiral_range)
-    if not pipeline and not args.strip and not args.unique:
+    if not pipeline and not args.strip and not args.neutralize and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
         _info(f"Active filters ({len(pipeline)}): "
@@ -715,14 +750,15 @@ def main():
     # ── Read & preprocess ─────────────────────────────────────────────────────
     raw_stream = _iter_molecules(in_path)
 
-    if args.strip or args.unique:
-        molecules, n_stripped, n_duplicates = _preprocess(
-            raw_stream, do_strip=args.strip, do_unique=args.unique)
+    if args.strip or args.neutralize or args.unique:
+        molecules, n_stripped, n_neutralized, n_duplicates = _preprocess(
+            raw_stream, do_strip=args.strip, do_neutralize=args.neutralize,
+            do_unique=args.unique)
         n_read = len(molecules) + n_duplicates
     else:
         molecules = list(raw_stream)
         n_read = len(molecules)
-        n_stripped = n_duplicates = 0
+        n_stripped = n_neutralized = n_duplicates = 0
 
     # ── Filter ────────────────────────────────────────────────────────────────
     n_pass = n_fail = 0
@@ -752,6 +788,8 @@ def main():
     _info(f"Molecules read:    {n_read}")
     if args.strip:
         _info(f"Salts stripped:    {n_stripped}")
+    if args.neutralize:
+        _info(f"Neutralized:       {n_neutralized}")
     if args.unique:
         _info(f"Duplicates removed:{n_duplicates}")
     _info(f"Passed filters:    {n_pass}")
