@@ -11,12 +11,12 @@ explicit extension (.smi or .sdf).
 Workflow
 --------
 1. Read input molecules (SMILES or SDF)
-2. Preprocessing (optional, applied in order before filtering):
-   --strip      strip salts / small fragments, keep the largest fragment
-   --neutralize neutralize formal charges (e.g. carboxylate → acid,
-                ammonium → amine) using RDKit MolStandardize Uncharger
-   --unique     deduplicate on canonical SMILES; for duplicates keep the entry
-                with the lexicographically smallest identifier
+2. Preprocessing (applied in order before filtering; all three are ON by default):
+   --strip / --no-strip         strip salts / small fragments, keep the largest fragment
+   --neutralize / --no-neutralize  neutralize formal charges (e.g. carboxylate → acid,
+                                ammonium → amine) using RDKit MolStandardize Uncharger
+   --unique / --no-unique       deduplicate on canonical SMILES; for duplicates keep the
+                                entry with the lexicographically smallest identifier
 3. Apply each enabled filter in order; the first failure short-circuits
 4. Write passing molecules to output; log reason for each rejection
 
@@ -586,19 +586,24 @@ def main():
                     help='Output file (default: <input>_filtered.<ext>)')
 
     pre = p.add_argument_group('Preprocessing')
-    pre.add_argument('--strip', action='store_true',
+    pre.add_argument('--strip', dest='strip', action='store_true', default=True,
                      help='Strip salts and small fragments; keep the largest '
-                          'fragment by heavy-atom count')
-    pre.add_argument('--neutralize', action='store_true',
+                          'fragment by heavy-atom count (default: on)')
+    pre.add_argument('--no-strip', dest='strip', action='store_false',
+                     help='Disable salt stripping')
+    pre.add_argument('--neutralize', dest='neutralize', action='store_true', default=True,
                      help='Neutralize formal charges where possible '
-                          '(e.g. carboxylate → carboxylic acid, ammonium → amine) '
-                          'using RDKit MolStandardize.  Applied after --strip, '
-                          'before --unique.  Quaternary N and other centres that '
-                          'cannot be neutralized without atom removal are left intact.')
-    pre.add_argument('--unique', action='store_true',
+                          '(e.g. carboxylate → carboxylic acid, ammonium → amine). '
+                          'Quaternary N and other centres that cannot be neutralized '
+                          'without atom removal are left intact (default: on)')
+    pre.add_argument('--no-neutralize', dest='neutralize', action='store_false',
+                     help='Disable neutralization')
+    pre.add_argument('--unique', dest='unique', action='store_true', default=True,
                      help='Deduplicate on canonical SMILES; for duplicates '
                           'keep the entry with the lexicographically smallest '
-                          'identifier')
+                          'identifier (default: on)')
+    pre.add_argument('--no-unique', dest='unique', action='store_false',
+                     help='Disable deduplication')
     filt = p.add_argument_group('Filters')
     filt.add_argument('--pains', action='store_true',
                       help=f'Reject PAINS (Pan-Assay INterference compoundS); '
@@ -684,9 +689,9 @@ def main():
     print(bar)
     _info(f"Input:         {in_path.name}")
     _info(f"Output:        {out_path.name}")
-    _info(f"Strip salts:   {'yes' if args.strip else 'no'}")
-    _info(f"Neutralize:    {'yes' if args.neutralize else 'no'}")
-    _info(f"Deduplicate:   {'yes' if args.unique else 'no'}")
+    _info(f"Strip salts:   {'yes' if args.strip else 'no (disabled)'}")
+    _info(f"Neutralize:    {'yes' if args.neutralize else 'no (disabled)'}")
+    _info(f"Deduplicate:   {'yes' if args.unique else 'no (disabled)'}")
     _info(f"Output format: {out_path.suffix.lower()[1:].upper()}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
@@ -750,7 +755,7 @@ def main():
                                       rb_range=rb_range,
                                       tpsa_range=tpsa_range,
                                       chiral_range=chiral_range)
-    if not pipeline and not args.strip and not args.neutralize and not args.unique:
+    if not pipeline:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
         _info(f"Active filters ({len(pipeline)}): "
@@ -760,15 +765,10 @@ def main():
     # ── Read & preprocess ─────────────────────────────────────────────────────
     raw_stream = _iter_molecules(in_path)
 
-    if args.strip or args.neutralize or args.unique:
-        molecules, n_stripped, n_neutralized, n_duplicates = _preprocess(
-            raw_stream, do_strip=args.strip, do_neutralize=args.neutralize,
-            do_unique=args.unique)
-        n_read = len(molecules) + n_duplicates
-    else:
-        molecules = list(raw_stream)
-        n_read = len(molecules)
-        n_stripped = n_neutralized = n_duplicates = 0
+    molecules, n_stripped, n_neutralized, n_duplicates = _preprocess(
+        raw_stream, do_strip=args.strip, do_neutralize=args.neutralize,
+        do_unique=args.unique)
+    n_read = len(molecules) + n_duplicates
 
     # ── Filter ────────────────────────────────────────────────────────────────
     n_pass = n_fail = 0
@@ -796,12 +796,9 @@ def main():
     print(bar)
     print("  [SUMMARY]")
     _info(f"Molecules read:    {n_read}")
-    if args.strip:
-        _info(f"Salts stripped:    {n_stripped}")
-    if args.neutralize:
-        _info(f"Neutralized:       {n_neutralized}")
-    if args.unique:
-        _info(f"Duplicates removed:{n_duplicates}")
+    _info(f"Salts stripped:    {n_stripped}")
+    _info(f"Neutralized:       {n_neutralized}")
+    _info(f"Duplicates removed:{n_duplicates}")
     _info(f"Passed filters:    {n_pass}")
     _info(f"Rejected:          {n_fail}")
     if rejection_counts:
