@@ -433,9 +433,46 @@ def _make_qed_filter(lo: Optional[float], hi: Optional[float]):
     return _filt
 
 
+def _make_hba_filter(lo: Optional[float], hi: Optional[float]):
+    """Return an H-bond acceptor count filter."""
+    def _filt(mol, _args):
+        n = rdMolDescriptors.CalcNumHBA(mol)
+        if lo is not None and n < lo:
+            return f"HBA {n} < {int(lo)}"
+        if hi is not None and n > hi:
+            return f"HBA {n} > {int(hi)}"
+        return None
+    return _filt
+
+
+def _make_hbd_filter(lo: Optional[float], hi: Optional[float]):
+    """Return an H-bond donor count filter."""
+    def _filt(mol, _args):
+        n = rdMolDescriptors.CalcNumHBD(mol)
+        if lo is not None and n < lo:
+            return f"HBD {n} < {int(lo)}"
+        if hi is not None and n > hi:
+            return f"HBD {n} > {int(hi)}"
+        return None
+    return _filt
+
+
+def _make_rb_filter(lo: Optional[float], hi: Optional[float]):
+    """Return a rotatable bond count filter."""
+    def _filt(mol, _args):
+        n = rdMolDescriptors.CalcNumRotatableBonds(mol)
+        if lo is not None and n < lo:
+            return f"RotBonds {n} < {int(lo)}"
+        if hi is not None and n > hi:
+            return f"RotBonds {n} > {int(hi)}"
+        return None
+    return _filt
+
+
 def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
                            custom_rules=None, mw_range=None, logp_range=None,
-                           lipinski=False, ro3=False, qed_range=None) -> list:
+                           lipinski=False, ro3=False, qed_range=None,
+                           hba_range=None, hbd_range=None, rb_range=None) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -454,6 +491,12 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
         pipeline.append(('Ro3',      _make_ro3_filter()))
     if qed_range is not None:
         pipeline.append(('QED',      _make_qed_filter(*qed_range)))
+    if hba_range is not None:
+        pipeline.append(('HBA',      _make_hba_filter(*hba_range)))
+    if hbd_range is not None:
+        pipeline.append(('HBD',      _make_hbd_filter(*hbd_range)))
+    if rb_range is not None:
+        pipeline.append(('RotBonds', _make_rb_filter(*rb_range)))
     return pipeline
 
 
@@ -526,6 +569,15 @@ def main():
                            'higher = more drug-like).  '
                            'Format: MIN:MAX, MIN:, :MAX, or exact value.  '
                            'E.g. --qed 0.5:  --qed 0.4:0.9')
+    prop.add_argument('--hba', metavar='RANGE', default=None,
+                      help='H-bond acceptor count range.  '
+                           'E.g. --hba :10  --hba 1:8')
+    prop.add_argument('--hbd', metavar='RANGE', default=None,
+                      help='H-bond donor count range.  '
+                           'E.g. --hbd :5  --hbd 1:3')
+    prop.add_argument('--rb', metavar='RANGE', default=None,
+                      help='Rotatable bond count range.  '
+                           'E.g. --rb :10  --rb 2:8')
     prop.add_argument('--ro3', action='store_true',
                       help='Astex Rule of Three for fragment screening: '
                            'MW≤300, logP≤3, HBD≤3, HBA≤3, RotBonds≤3 '
@@ -559,6 +611,9 @@ def main():
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
     _info(f"QED range:     {args.qed if args.qed else 'any'}")
+    _info(f"HBA range:     {args.hba if args.hba else 'any'}")
+    _info(f"HBD range:     {args.hbd if args.hbd else 'any'}")
+    _info(f"RotBonds range:{args.rb  if args.rb  else 'any'}")
     lip_mode = ('strict' if args.lipinski_strict else 'on (1 violation allowed)') if (args.lipinski or args.lipinski_strict) else 'off'
     _info(f"Lipinski Ro5:  {lip_mode}")
     _info(f"Rule of Three: {'on' if args.ro3 else 'off'}")
@@ -593,6 +648,9 @@ def main():
     mw_range   = _parse_range(args.mw,   'mw')   if args.mw   else None
     logp_range = _parse_range(args.logp, 'logp') if args.logp else None
     qed_range  = _parse_range(args.qed,  'qed')  if args.qed  else None
+    hba_range  = _parse_range(args.hba,  'hba')  if args.hba  else None
+    hbd_range  = _parse_range(args.hbd,  'hbd')  if args.hbd  else None
+    rb_range   = _parse_range(args.rb,   'rb')   if args.rb   else None
 
     pipeline = _build_filter_pipeline(args,
                                       pains_patterns=pains_patterns,
@@ -602,7 +660,10 @@ def main():
                                       logp_range=logp_range,
                                       lipinski=args.lipinski or args.lipinski_strict,
                                       ro3=args.ro3,
-                                      qed_range=qed_range)
+                                      qed_range=qed_range,
+                                      hba_range=hba_range,
+                                      hbd_range=hbd_range,
+                                      rb_range=rb_range)
     if not pipeline and not args.strip and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
