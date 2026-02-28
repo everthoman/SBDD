@@ -788,7 +788,8 @@ def main():
     # ── Filter ────────────────────────────────────────────────────────────────
     n_pass = n_fail = 0
     rejection_counts: dict = {}
-    prop_lists: Dict[str, list] = {}
+    prop_lists:      Dict[str, list] = {}
+    rej_prop_lists:  Dict[str, list] = {}
 
     write_mol, close_out = _make_writer(out_path)
 
@@ -799,13 +800,16 @@ def main():
             if reason:
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                 break
+        props = _mol_props(mol)
         if reason is None:
             write_mol(mol, name)
             n_pass += 1
-            for prop, val in _mol_props(mol).items():
+            for prop, val in props.items():
                 prop_lists.setdefault(prop, []).append(val)
         else:
             n_fail += 1
+            for prop, val in props.items():
+                rej_prop_lists.setdefault(prop, []).append(val)
 
     close_out()
 
@@ -824,31 +828,38 @@ def main():
         for reason, count in sorted(rejection_counts.items(),
                                     key=lambda x: -x[1]):
             _info(f"  {count:>6}  {reason}")
-    if prop_lists:
+    fmt = {
+        'MW':     '{:8.1f}',
+        'LogP':   '{:8.2f}',
+        'HBA':    '{:8.1f}',
+        'HBD':    '{:8.1f}',
+        'RB':     '{:8.1f}',
+        'TPSA':   '{:8.1f}',
+        'QED':    '{:8.3f}',
+        'Chiral': '{:8.1f}',
+    }
+
+    def _print_prop_table(label: str, pl: Dict[str, list]):
         print(bar)
-        print("  [PROPERTY STATISTICS — passing molecules]")
-        _info(f"  {'Property':<10} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8}")
-        _info(f"  {'-'*10} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
-        fmt = {
-            'MW':     '{:8.1f}',
-            'LogP':   '{:8.2f}',
-            'HBA':    '{:8.1f}',
-            'HBD':    '{:8.1f}',
-            'RB':     '{:8.1f}',
-            'TPSA':   '{:8.1f}',
-            'QED':    '{:8.3f}',
-            'Chiral': '{:8.1f}',
-        }
-        for prop, vals in prop_lists.items():
-            mean = statistics.mean(vals)
-            std  = statistics.stdev(vals) if len(vals) > 1 else 0.0
-            f    = fmt[prop]
-            row  = (f"  {prop:<10} " +
-                    f.format(mean) + ' ' +
-                    f.format(std)  + ' ' +
-                    f.format(min(vals)) + ' ' +
-                    f.format(max(vals)))
-            _info(row)
+        print(f"  [PROPERTY STATISTICS — {label}]")
+        _info(f"  {'Property':<10} {'Mean':>8} {'Median':>8} {'Std':>8} {'Min':>8} {'Max':>8}")
+        _info(f"  {'-'*10} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+        for prop, vals in pl.items():
+            mean   = statistics.mean(vals)
+            median = statistics.median(vals)
+            std    = statistics.stdev(vals) if len(vals) > 1 else 0.0
+            f      = fmt[prop]
+            _info(f"  {prop:<10} " +
+                  f.format(mean)       + ' ' +
+                  f.format(median)     + ' ' +
+                  f.format(std)        + ' ' +
+                  f.format(min(vals))  + ' ' +
+                  f.format(max(vals)))
+
+    if prop_lists:
+        _print_prop_table('passing molecules', prop_lists)
+    if rej_prop_lists:
+        _print_prop_table('rejected molecules', rej_prop_lists)
     _info(f"Time:              {format_time(elapsed)}")
     print(bar)
 
