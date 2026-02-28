@@ -17,8 +17,6 @@ Workflow
                 ammonium → amine) using RDKit MolStandardize Uncharger
    --unique     deduplicate on canonical SMILES; for duplicates keep the entry
                 with the lexicographically smallest identifier
-   --gen2d      generate a clean 2D layout for every molecule using RDKit
-                Compute2DCoords; applied last so it does not affect identity
 3. Apply each enabled filter in order; the first failure short-circuits
 4. Write passing molecules to output; log reason for each rejection
 
@@ -31,6 +29,8 @@ Inputs
 Outputs
 -------
   Filtered SMILES / SDF file (same format as input by default)
+    SMILES output : canonical isomeric SMILES (tab-separated name)
+    SDF output    : clean 2D coordinates generated automatically
   Summary printed to stdout
 
 Dependencies
@@ -146,8 +146,10 @@ def _make_writer(out_path: Path):
     """Return (writer_fn, close_fn) for the given output path."""
     if out_path.suffix.lower() == '.sdf':
         w = Chem.SDWriter(str(out_path))
-        def _write(mol, name): w.write(mol)
-        def _close():          w.close()
+        def _write(mol, name):
+            AllChem.Compute2DCoords(mol)
+            w.write(mol)
+        def _close(): w.close()
     else:
         fh = out_path.open('w', encoding='utf-8')
         def _write(mol, name): _write_smiles(mol, name, fh)
@@ -591,11 +593,6 @@ def main():
                      help='Deduplicate on canonical SMILES; for duplicates '
                           'keep the entry with the lexicographically smallest '
                           'identifier')
-    pre.add_argument('--gen2d', action='store_true',
-                     help='Generate a clean 2D layout for every molecule '
-                          '(RDKit Compute2DCoords).  Applied after all other '
-                          'preprocessing steps.  Useful before writing SDF output.')
-
     filt = p.add_argument_group('Filters')
     filt.add_argument('--pains', action='store_true',
                       help=f'Reject PAINS (Pan-Assay INterference compoundS); '
@@ -684,7 +681,7 @@ def main():
     _info(f"Strip salts:   {'yes' if args.strip else 'no'}")
     _info(f"Neutralize:    {'yes' if args.neutralize else 'no'}")
     _info(f"Deduplicate:   {'yes' if args.unique else 'no'}")
-    _info(f"Gen 2D coords: {'yes' if args.gen2d else 'no'}")
+    _info(f"Output format: {out_path.suffix.lower()[1:].upper()}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
     _info(f"QED range:     {args.qed if args.qed else 'any'}")
@@ -747,7 +744,7 @@ def main():
                                       rb_range=rb_range,
                                       tpsa_range=tpsa_range,
                                       chiral_range=chiral_range)
-    if not pipeline and not args.strip and not args.neutralize and not args.unique and not args.gen2d:
+    if not pipeline and not args.strip and not args.neutralize and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
         _info(f"Active filters ({len(pipeline)}): "
@@ -766,10 +763,6 @@ def main():
         molecules = list(raw_stream)
         n_read = len(molecules)
         n_stripped = n_neutralized = n_duplicates = 0
-
-    if args.gen2d:
-        for mol, _name in molecules:
-            AllChem.Compute2DCoords(mol)
 
     # ── Filter ────────────────────────────────────────────────────────────────
     n_pass = n_fail = 0
