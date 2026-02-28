@@ -359,8 +359,39 @@ def _make_logp_filter(lo: Optional[float], hi: Optional[float]):
     return _filt
 
 
+def _make_lipinski_filter():
+    """Return a Lipinski Rule-of-Five filter.
+
+    Rejects molecules that violate more than one of:
+      MW  ≤ 500
+      HBD ≤ 5   (H-bond donors,    NH + OH)
+      HBA ≤ 10  (H-bond acceptors, N + O)
+      logP ≤ 5
+
+    One violation is permitted (the classic Ro5 definition allows one
+    exception for molecules that are substrates of active transporters).
+    Pass --lipinski-strict to require all four rules.
+    """
+    def _filt(mol, args):
+        violations = []
+        mw  = Descriptors.MolWt(mol)
+        hbd = rdMolDescriptors.CalcNumHBD(mol)
+        hba = rdMolDescriptors.CalcNumHBA(mol)
+        lp  = Crippen.MolLogP(mol)
+        if mw  > 500: violations.append(f"MW {mw:.1f}>500")
+        if hbd > 5:   violations.append(f"HBD {hbd}>5")
+        if hba > 10:  violations.append(f"HBA {hba}>10")
+        if lp  > 5:   violations.append(f"logP {lp:.2f}>5")
+        limit = 0 if getattr(args, 'lipinski_strict', False) else 1
+        if len(violations) > limit:
+            return "Lipinski: " + ", ".join(violations)
+        return None
+    return _filt
+
+
 def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
-                           custom_rules=None, mw_range=None, logp_range=None) -> list:
+                           custom_rules=None, mw_range=None, logp_range=None,
+                           lipinski=False) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -373,6 +404,8 @@ def _build_filter_pipeline(args, pains_patterns=None, reos_rules=None,
         pipeline.append(('MW',      _make_mw_filter(*mw_range)))
     if logp_range is not None:
         pipeline.append(('LogP',    _make_logp_filter(*logp_range)))
+    if lipinski:
+        pipeline.append(('Lipinski', _make_lipinski_filter()))
     return pipeline
 
 
@@ -433,6 +466,13 @@ def main():
                       help='Wildman-Crippen logP range.  '
                            'Format: MIN:MAX, MIN:, :MAX, or exact value.  '
                            'E.g. --logp -2:5  --logp :4.5')
+    prop.add_argument('--lipinski', action='store_true',
+                      help='Reject molecules that violate more than one '
+                           'Lipinski Rule of Five (MW≤500, HBD≤5, HBA≤10, '
+                           'logP≤5).  One violation is permitted by default.')
+    prop.add_argument('--lipinski-strict', action='store_true',
+                      help='Require all four Lipinski rules to pass '
+                           '(zero violations allowed; implies --lipinski)')
 
     if _ARGCOMPLETE:
         argcomplete.autocomplete(p)
@@ -461,6 +501,8 @@ def main():
     _info(f"Deduplicate:   {'yes' if args.unique else 'no'}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
+    lip_mode = ('strict' if args.lipinski_strict else 'on (1 violation allowed)') if (args.lipinski or args.lipinski_strict) else 'off'
+    _info(f"Lipinski Ro5:  {lip_mode}")
     print(bar)
 
     # ── Load filter data ──────────────────────────────────────────────────────
@@ -497,7 +539,8 @@ def main():
                                       reos_rules=reos_rules,
                                       custom_rules=custom_rules,
                                       mw_range=mw_range,
-                                      logp_range=logp_range)
+                                      logp_range=logp_range,
+                                      lipinski=args.lipinski or args.lipinski_strict)
     if not pipeline and not args.strip and not args.unique:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
     elif pipeline:
