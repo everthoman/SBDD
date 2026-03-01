@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from tqdm import tqdm
 
@@ -44,6 +45,8 @@ from argcomplete.completers import FilesCompleter
 # The apt 3.1.1 correctly removes the H and sets the formal charge.
 _OBABEL_CANDIDATES = ['/usr/local/bin/obabel', '/usr/bin/obabel', shutil.which('obabel')]
 _OBABEL = next((p for p in _OBABEL_CANDIDATES if p and os.path.isfile(p)), 'obabel')
+
+_XTBBIN = shutil.which('xtb')
 
 # Number of isomers per batch submitted to the process pool.
 # Embed+minimize dominates, so equal-sized batches give good load balance.
@@ -147,11 +150,63 @@ def get_stereo_suffix(mol, index):
     return f"_{''.join(stereo_labels)}" if stereo_labels else f"_isomer_{index}"
 
 
+def _xtb_refine(mol, xtb_level, env):
+    """Run xTB geometry optimisation on mol (with explicit Hs) in implicit water.
+
+    The single conformer's coordinates are updated in-place on success.
+    On any failure (missing binary, crash, atom-count mismatch) the MMFF94s
+    geometry is silently kept.
+
+    Args:
+        mol:       RDKit mol with explicit Hs and exactly one conformer.
+        xtb_level: 'gfnff', 'gfn1', or 'gfn2'.
+        env:       subprocess environment dict (should have OMP_NUM_THREADS=1).
+    """
+    chrg = sum(a.GetFormalCharge() for a in mol.GetAtoms())
+    level_args = ['--gfnff'] if xtb_level == 'gfnff' else ['--gfn', xtb_level[3:]]
+
+    with tempfile.TemporaryDirectory() as td:
+        sdf_in = os.path.join(td, 'mol.sdf')
+        w = Chem.SDWriter(sdf_in)
+        w.write(mol)
+        w.close()
+
+        try:
+            subprocess.run(
+                [_XTBBIN, 'mol.sdf', '--opt', '--alpb', 'water']
+                + level_args + ['--chrg', str(chrg)],
+                cwd=td, capture_output=True, text=True, timeout=300, env=env,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return
+
+        opt_sdf = os.path.join(td, 'xtbopt.sdf')
+        if not os.path.exists(opt_sdf):
+            return
+
+        logger = RDLogger.logger()
+        logger.setLevel(RDLogger.CRITICAL)
+        suppl = Chem.SDMolSupplier(opt_sdf, removeHs=False)
+        opt_mol = next(iter(suppl), None)
+        logger.setLevel(RDLogger.WARNING)
+
+        if opt_mol is None or opt_mol.GetNumAtoms() != mol.GetNumAtoms():
+            return
+
+        # Update conformer coordinates in-place; all mol properties are kept.
+        conf = mol.GetConformer()
+        opt_conf = opt_mol.GetConformer()
+        for j in range(mol.GetNumAtoms()):
+            conf.SetAtomPosition(j, opt_conf.GetAtomPosition(j))
+
+
 def _prepare_isomer_batch(batch):
     """Worker: prepare a batch of isomers with one shared obabel call.
 
     Args:
-        batch: list of (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs)
+        batch: list of (mol_binary, base_name, assigned_name, props_dict,
+                        ph, id_col, num_confs, xtb_level)
+               xtb_level is None to skip xTB, or 'gfnff'/'gfn1'/'gfn2'.
 
     Returns:
         list of (mol_binary_or_None, base_name, assigned_name)
@@ -162,6 +217,11 @@ def _prepare_isomer_batch(batch):
 
     ph        = batch[0][4]
     num_confs = batch[0][6]
+    xtb_level = batch[0][7]
+
+    xtb_env = None
+    if xtb_level:
+        xtb_env = {**os.environ, 'OMP_NUM_THREADS': '1'}
 
     # Step 1: deserialise all mols and build SMILES list
     mols_in = [Chem.Mol(item[0]) for item in batch]
@@ -184,7 +244,7 @@ def _prepare_isomer_batch(batch):
 
     # Step 3: embed and minimize each isomer
     results = []
-    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs) in enumerate(batch):
+    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs, _xtb_level) in enumerate(batch):
         obabel_failed = protonated[i] is None
         if obabel_failed:
             print(
@@ -245,6 +305,10 @@ def _prepare_isomer_batch(batch):
         for cid in cids:
             if cid != best_cid:
                 prot.RemoveConformer(cid)
+
+        # Optional xTB post-minimisation in implicit water
+        if xtb_level and xtb_env:
+            _xtb_refine(prot, xtb_level, xtb_env)
 
         results.append((prot.ToBinary(_PICKLE_PROPS), base_name, assigned_name))
 
@@ -337,6 +401,21 @@ Examples:
     )
 
     parser.add_argument(
+        "--xtb",
+        action="store_true",
+        help="Post-minimise each molecule with xTB in implicit water (ALPB) after MMFF94s. "
+             "Requires xTB to be installed and on PATH."
+    )
+
+    parser.add_argument(
+        "--xtb-level",
+        default="gfnff",
+        choices=["gfnff", "gfn1", "gfn2"],
+        help="xTB method for post-minimisation (default: gfnff). "
+             "gfnff is fastest (~0.1 s/mol); gfn2 is most accurate but slower (~10 s/mol)."
+    )
+
+    parser.add_argument(
         "--failed-log",
         default=None,
         metavar="FILE",
@@ -358,6 +437,12 @@ def main():
     max_isomers = args.max_isomers
     num_confs = max(1, args.num_confs)
     ph = args.ph
+    xtb_level = args.xtb_level if args.xtb else None
+
+    if xtb_level and not _XTBBIN:
+        print("ERROR: --xtb requested but 'xtb' binary not found on PATH. "
+              "Install via: conda install -c conda-forge xtb", file=sys.stderr)
+        return
 
     if not os.path.isfile(input_path):
         print(f"ERROR: Input file '{input_path}' does not exist.")
@@ -445,6 +530,8 @@ def main():
         mol_iter = _smi_mol_iter()
 
     print(f"[INFO] obabel binary: {_OBABEL}")
+    if xtb_level:
+        print(f"[INFO] xTB post-minimisation enabled ({xtb_level}, ALPB water) using {_XTBBIN}")
     if enumerate_stereo:
         print(f"Stereoisomer enumeration enabled (max {max_isomers} isomers per molecule)")
 
@@ -465,7 +552,7 @@ def main():
                 assigned_name = f"{base_name}{get_stereo_suffix(isomer, idx + 1)}"
             else:
                 assigned_name = base_name
-            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col, num_confs))
+            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col, num_confs, xtb_level))
 
     total_isomers = len(isomer_tasks)
     print(f"Processing {input_count} molecules → {total_isomers} isomers using {n_cpus} CPU(s), {num_confs} conformer(s) each...")
