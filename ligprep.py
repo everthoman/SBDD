@@ -61,8 +61,11 @@ from rdkit.Chem.rdmolfiles import SDWriter
 def obabel_protonate_batch(smiles_list, ph=7.4):
     """Batch-protonate SMILES at the given pH using a single obabel subprocess.
 
-    Each SMILES is tagged with a synthetic name ``__idx_N`` so the parsed SDF
-    records can be mapped back to their original positions.
+    Uses SMILES output (-osmi) so that stereochemistry is preserved directly
+    in the SMILES string — no 0D mol block, no atom-index re-attachment needed.
+
+    Each SMILES is tagged with a synthetic name ``__idx_N`` so the output
+    lines can be mapped back to their original positions.
 
     Returns list[Mol | None] in the same order as smiles_list.
     None entries indicate protonation failures for those positions.
@@ -76,7 +79,7 @@ def obabel_protonate_batch(smiles_list, ph=7.4):
 
     try:
         result = subprocess.run(
-            [_OBABEL, '-ismi', '-osdf', f'-p{ph}'],
+            [_OBABEL, '-ismi', '-osmi', f'-p{ph}'],
             input=stdin_data,
             capture_output=True,
             text=True,
@@ -90,22 +93,24 @@ def obabel_protonate_batch(smiles_list, ph=7.4):
 
     logger = RDLogger.logger()
     logger.setLevel(RDLogger.CRITICAL)
-    supplier = Chem.SDMolSupplier()
-    supplier.SetData(result.stdout, removeHs=False)
-    logger.setLevel(RDLogger.WARNING)
-
     output = [None] * len(smiles_list)
-    for mol in supplier:
-        if mol is None:
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
             continue
-        name = mol.GetProp('_Name') if mol.HasProp('_Name') else ''
-        if name.startswith('__idx_'):
-            try:
-                idx = int(name[6:])
-                if 0 <= idx < len(output):
-                    output[idx] = mol
-            except ValueError:
-                pass
+        smi, name = parts[0], parts[1]
+        if not name.startswith('__idx_'):
+            continue
+        try:
+            idx = int(name[6:])
+        except ValueError:
+            continue
+        if not (0 <= idx < len(output)):
+            continue
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            output[idx] = mol
+    logger.setLevel(RDLogger.WARNING)
     return output
 
 
@@ -256,27 +261,6 @@ def _prepare_isomer_batch(batch):
         else:
             prot = protonated[i]
 
-        # Strip flat obabel coords (all-zero 0D block) before re-embedding.
-        prot = Chem.RemoveHs(prot)
-
-        # obabel outputs a 0D mol block (all coords 0,0,0).  The stereo parity
-        # bits ARE written to the atom table but RDKit cannot reconstruct chiral
-        # tags from them without real coordinates, so they are silently dropped.
-        # Re-attach the tags from the canonical SMILES we sent to obabel; obabel
-        # preserves atom ordering from SMILES input, so index-based copy is safe.
-        # Skip when obabel failed and we fell back to the original mol (stereo OK).
-        if not obabel_failed:
-            mol_canon = Chem.MolFromSmiles(smiles_list[i])
-            if mol_canon is not None:
-                rw = Chem.RWMol(prot)
-                for atom in mol_canon.GetAtoms():
-                    ct = atom.GetChiralTag()
-                    if ct != Chem.ChiralType.CHI_UNSPECIFIED:
-                        idx = atom.GetIdx()
-                        if idx < rw.GetNumAtoms():
-                            rw.GetAtomWithIdx(idx).SetChiralTag(ct)
-                prot = rw.GetMol()
-
         # Restore SD properties and set name tags after all mol-object surgery.
         for k, v in props_dict.items():
             prot.SetProp(k, v)
@@ -310,6 +294,22 @@ def _prepare_isomer_batch(batch):
                 cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg_rc)
             except RuntimeError:
                 cids = []
+
+        if not cids:
+            # Final fallback: strip all stereo constraints and embed without them.
+            # Catches enumerated isomers whose stereo configuration is geometrically
+            # impossible (e.g. bridgehead stereocenters, strained ring fusions).
+            prot_ns = Chem.RWMol(prot)
+            for atom in prot_ns.GetAtoms():
+                atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+            for bond in prot_ns.GetBonds():
+                bond.SetStereo(Chem.BondStereo.STEREONONE)
+            try:
+                cids = AllChem.EmbedMultipleConfs(prot_ns, numConfs=num_confs, params=_etkdg)
+            except RuntimeError:
+                cids = []
+            if cids:
+                prot = prot_ns.GetMol()
 
         if not cids:
             label = assigned_name or smiles_list[i]
