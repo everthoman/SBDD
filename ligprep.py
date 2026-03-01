@@ -320,11 +320,19 @@ def _prepare_isomer_batch(batch):
             results.append((None, base_name, label))
             continue
 
-        try:
-            ff_results = AllChem.MMFFOptimizeMoleculeConfs(prot, mmffVariant='MMFF94s')
-        except RuntimeError:
-            # BFGS linearSearch failure on a specific conformer; keep unminimised best
-            ff_results = [(0, 0.0)] * len(cids)
+        # Use MMFF94s for fully-parametrised molecules (better accuracy for organics).
+        # Fall back to UFF when MMFF lacks parameters — most commonly boron, silicon,
+        # and other heteroatoms common in fragment/boron-based drug libraries.
+        if AllChem.MMFFHasAllMoleculeParams(prot):
+            try:
+                ff_results = AllChem.MMFFOptimizeMoleculeConfs(prot, mmffVariant='MMFF94s')
+            except RuntimeError:
+                ff_results = [(0, 0.0)] * len(cids)
+        else:
+            try:
+                ff_results = AllChem.UFFOptimizeMoleculeConfs(prot)
+            except RuntimeError:
+                ff_results = [(0, 0.0)] * len(cids)
 
         # ff_results: list of (not_converged, energy) in conformer order
         energies = [e for _, e in ff_results]
