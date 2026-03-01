@@ -305,7 +305,7 @@ def _prepare_isomer_batch(batch):
             _etkdg_rc = AllChem.ETKDGv3()
             _etkdg_rc.randomSeed = 0xf00d
             _etkdg_rc.useSmallRingTorsions = True
-            _etkdg_rc.randomCoords = True
+            _etkdg_rc.useRandomCoords = True
             try:
                 cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg_rc)
             except RuntimeError:
