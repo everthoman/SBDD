@@ -169,10 +169,16 @@ def _prepare_isomer_batch(batch):
     # Step 2: single obabel subprocess for the whole batch
     protonated = obabel_protonate_batch(smiles_list, ph)
 
+    # Pickle flags that preserve mol-level and private (e.g. _Name) properties.
+    # ToBinary() defaults to NoProps, which silently strips all SD tags.
+    _PICKLE_PROPS = (Chem.PropertyPickleOptions.MolProps |
+                     Chem.PropertyPickleOptions.PrivateProps)
+
     # Step 3: embed and minimize each isomer
     results = []
     for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col) in enumerate(batch):
-        if protonated[i] is None:
+        obabel_failed = protonated[i] is None
+        if obabel_failed:
             print(
                 f"  [WARNING] obabel protonation failed for {assigned_name or '(unknown)'}; "
                 "using input protonation state",
@@ -182,19 +188,36 @@ def _prepare_isomer_batch(batch):
         else:
             prot = protonated[i]
 
-        # Restore SD properties (obabel drops them)
+        # Strip flat obabel coords (all-zero 0D block) before re-embedding.
+        prot = Chem.RemoveHs(prot)
+
+        # obabel outputs a 0D mol block (all coords 0,0,0).  The stereo parity
+        # bits ARE written to the atom table but RDKit cannot reconstruct chiral
+        # tags from them without real coordinates, so they are silently dropped.
+        # Re-attach the tags from the canonical SMILES we sent to obabel; obabel
+        # preserves atom ordering from SMILES input, so index-based copy is safe.
+        # Skip when obabel failed and we fell back to the original mol (stereo OK).
+        if not obabel_failed:
+            mol_canon = Chem.MolFromSmiles(smiles_list[i])
+            if mol_canon is not None:
+                rw = Chem.RWMol(prot)
+                for atom in mol_canon.GetAtoms():
+                    ct = atom.GetChiralTag()
+                    if ct != Chem.ChiralType.CHI_UNSPECIFIED:
+                        idx = atom.GetIdx()
+                        if idx < rw.GetNumAtoms():
+                            rw.GetAtomWithIdx(idx).SetChiralTag(ct)
+                prot = rw.GetMol()
+
+        # Restore SD properties and set name tags after all mol-object surgery.
         for k, v in props_dict.items():
             prot.SetProp(k, v)
-
-        # Set name properties
         prot.SetProp('_Name', assigned_name)
         if base_name:
             prot.SetProp(id_col, base_name)
             if assigned_name != base_name:
                 prot.SetProp(f"{id_col}_stereo", assigned_name)
 
-        # Strip flat obabel coords, re-embed in 3D
-        prot = Chem.RemoveHs(prot)
         prot = Chem.AddHs(prot)
 
         if AllChem.EmbedMolecule(prot, randomSeed=0xf00d) != 0:
@@ -202,7 +225,7 @@ def _prepare_isomer_batch(batch):
             continue
 
         AllChem.MMFFOptimizeMolecule(prot, mmffVariant='MMFF94s')
-        results.append((prot.ToBinary(), base_name, assigned_name))
+        results.append((prot.ToBinary(_PICKLE_PROPS), base_name, assigned_name))
 
     return results
 
