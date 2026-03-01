@@ -151,7 +151,7 @@ def _prepare_isomer_batch(batch):
     """Worker: prepare a batch of isomers with one shared obabel call.
 
     Args:
-        batch: list of (mol_binary, base_name, assigned_name, props_dict, ph, id_col)
+        batch: list of (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs)
 
     Returns:
         list of (mol_binary_or_None, base_name, assigned_name)
@@ -160,7 +160,8 @@ def _prepare_isomer_batch(batch):
     if not batch:
         return []
 
-    ph = batch[0][4]
+    ph        = batch[0][4]
+    num_confs = batch[0][6]
 
     # Step 1: deserialise all mols and build SMILES list
     mols_in = [Chem.Mol(item[0]) for item in batch]
@@ -174,9 +175,16 @@ def _prepare_isomer_batch(batch):
     _PICKLE_PROPS = (Chem.PropertyPickleOptions.MolProps |
                      Chem.PropertyPickleOptions.PrivateProps)
 
+    # ETKDGv3 + useSmallRingTorsions — CSD-derived torsion prefs for 3-8-membered
+    # rings; this flag is False by default in ETKDGv3 but is critical for obtaining
+    # chair (rather than twisted-boat) conformations of piperazines and cyclohexanes.
+    _etkdg = AllChem.ETKDGv3()
+    _etkdg.randomSeed = 0xf00d
+    _etkdg.useSmallRingTorsions = True
+
     # Step 3: embed and minimize each isomer
     results = []
-    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col) in enumerate(batch):
+    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs) in enumerate(batch):
         obabel_failed = protonated[i] is None
         if obabel_failed:
             print(
@@ -220,11 +228,24 @@ def _prepare_isomer_batch(batch):
 
         prot = Chem.AddHs(prot)
 
-        if AllChem.EmbedMolecule(prot, randomSeed=0xf00d) != 0:
+        # Generate num_confs conformers with ETKDGv3, minimize all, keep the
+        # lowest-energy one.  Multi-conformer sampling avoids the twisted-boat
+        # ring minima that a single fixed-seed embedding can get trapped in.
+        cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg)
+        if not cids:
             results.append((None, base_name, assigned_name))
             continue
 
-        AllChem.MMFFOptimizeMolecule(prot, mmffVariant='MMFF94s')
+        ff_results = AllChem.MMFFOptimizeMoleculeConfs(prot, mmffVariant='MMFF94s')
+        # ff_results: list of (not_converged, energy) in conformer order
+        energies = [e for _, e in ff_results]
+        best_cid = cids[min(range(len(energies)), key=lambda k: energies[k])]
+
+        # Discard all but the lowest-energy conformer
+        for cid in cids:
+            if cid != best_cid:
+                prot.RemoveConformer(cid)
+
         results.append((prot.ToBinary(_PICKLE_PROPS), base_name, assigned_name))
 
     return results
@@ -294,6 +315,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--num-confs",
+        type=int,
+        default=1,
+        help="Number of ETKDGv3 conformers to generate per isomer; the lowest-energy one is kept (default: 1). "
+             "Increase to 3-10 for better ring-conformation sampling at the cost of proportionally more CPU time."
+    )
+
+    parser.add_argument(
         "--ph",
         type=float,
         default=7.4,
@@ -327,6 +356,7 @@ def main():
     n_cpus = max(1, args.ncpus)
     enumerate_stereo = not args.no_enumerate_stereo
     max_isomers = args.max_isomers
+    num_confs = max(1, args.num_confs)
     ph = args.ph
 
     if not os.path.isfile(input_path):
@@ -435,10 +465,10 @@ def main():
                 assigned_name = f"{base_name}{get_stereo_suffix(isomer, idx + 1)}"
             else:
                 assigned_name = base_name
-            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col))
+            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col, num_confs))
 
     total_isomers = len(isomer_tasks)
-    print(f"Processing {input_count} molecules → {total_isomers} isomers using {n_cpus} CPU(s)...")
+    print(f"Processing {input_count} molecules → {total_isomers} isomers using {n_cpus} CPU(s), {num_confs} conformer(s) each...")
 
     # ── Phase 2: chunk → submit → stream results to writer ───────────────────
     batches = [isomer_tasks[i:i + _BATCH_SIZE] for i in range(0, total_isomers, _BATCH_SIZE)]
