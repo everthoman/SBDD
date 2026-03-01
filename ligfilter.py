@@ -157,6 +157,7 @@ def _make_writer(out_path: Path):
     if out_path.suffix.lower() == '.sdf':
         w = Chem.SDWriter(str(out_path))
         def _write(mol, name):
+            mol.SetProp('_Name', name)
             if mol.GetNumConformers() == 0:
                 AllChem.Compute2DCoords(mol)
             w.write(mol)
@@ -180,6 +181,9 @@ def _largest_fragment(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
     if len(frags) == 1:
         return mol, False
     largest = max(frags, key=lambda f: f.GetNumHeavyAtoms())
+    # GetMolFrags strips SD properties — copy them from the original mol
+    for prop in mol.GetPropNames():
+        largest.SetProp(prop, mol.GetProp(prop))
     return largest, True
 
 
@@ -196,6 +200,10 @@ def _neutralize_mol(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
         _uncharger = rdMolStandardize.Uncharger()
     uncharged = _uncharger.uncharge(mol)
     changed = Chem.MolToSmiles(uncharged) != Chem.MolToSmiles(mol)
+    # Uncharger creates a new mol object — copy SD properties from the original
+    if changed:
+        for prop in mol.GetPropNames():
+            uncharged.SetProp(prop, mol.GetProp(prop))
     return uncharged, changed
 
 
@@ -569,7 +577,8 @@ def _pool_worker(batch_binary: list) -> list:
             if reason:
                 break
         props = _mol_props(mol)
-        results.append((mol.ToBinary() if reason is None else None, name, reason, props))
+        _pkl = Chem.PropertyPickleOptions.MolProps | Chem.PropertyPickleOptions.PrivateProps
+        results.append((mol.ToBinary(_pkl) if reason is None else None, name, reason, props))
     return results
 
 
@@ -832,8 +841,10 @@ def main():
     # Serialise mols as bytes for inter-process transfer
     n_jobs = max(1, min(args.jobs, len(molecules)))
     batch_size = math.ceil(len(molecules) / n_jobs) if molecules else 1
+    _PICKLE_PROPS = (Chem.PropertyPickleOptions.MolProps |
+                     Chem.PropertyPickleOptions.PrivateProps)
     batches_binary = [
-        [(mol.ToBinary(), name) for mol, name in molecules[i:i + batch_size]]
+        [(mol.ToBinary(_PICKLE_PROPS), name) for mol, name in molecules[i:i + batch_size]]
         for i in range(0, len(molecules), batch_size)
     ]
 

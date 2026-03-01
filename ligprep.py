@@ -312,11 +312,12 @@ def _prepare_isomer_batch(batch):
                 cids = []
 
         if not cids:
+            label = assigned_name or smiles_list[i]
             print(
-                f"  [WARNING] 3D embedding failed for {assigned_name or '(unknown)'}; skipping",
+                f"  [WARNING] 3D embedding failed for {label}; skipping",
                 file=sys.stderr,
             )
-            results.append((None, base_name, assigned_name))
+            results.append((None, base_name, label))
             continue
 
         try:
