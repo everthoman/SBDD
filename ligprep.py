@@ -381,9 +381,9 @@ Examples:
     parser.add_argument(
         "--num-confs",
         type=int,
-        default=1,
-        help="Number of ETKDGv3 conformers to generate per isomer; the lowest-energy one is kept (default: 1). "
-             "Increase to 3-10 for better ring-conformation sampling at the cost of proportionally more CPU time."
+        default=3,
+        help="Number of ETKDGv3 conformers to generate per isomer; the lowest-energy one is kept (default: 3). "
+             "Higher values improve ring-conformation sampling at the cost of proportionally more CPU time."
     )
 
     parser.add_argument(
