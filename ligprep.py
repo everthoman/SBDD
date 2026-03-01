@@ -291,12 +291,26 @@ def _prepare_isomer_batch(batch):
         # Generate num_confs conformers with ETKDGv3, minimize all, keep the
         # lowest-energy one.  Multi-conformer sampling avoids the twisted-boat
         # ring minima that a single fixed-seed embedding can get trapped in.
-        cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg)
+        try:
+            cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg)
+        except RuntimeError:
+            print(
+                f"  [WARNING] ETKDGv3 embedding failed for {assigned_name or '(unknown)'}; skipping",
+                file=sys.stderr,
+            )
+            results.append((None, base_name, assigned_name))
+            continue
+
         if not cids:
             results.append((None, base_name, assigned_name))
             continue
 
-        ff_results = AllChem.MMFFOptimizeMoleculeConfs(prot, mmffVariant='MMFF94s')
+        try:
+            ff_results = AllChem.MMFFOptimizeMoleculeConfs(prot, mmffVariant='MMFF94s')
+        except RuntimeError:
+            # BFGS linearSearch failure on a specific conformer; keep unminimised best
+            ff_results = [(0, 0.0)] * len(cids)
+
         # ff_results: list of (not_converged, energy) in conformer order
         energies = [e for _, e in ff_results]
         best_cid = cids[min(range(len(energies)), key=lambda k: energies[k])]
