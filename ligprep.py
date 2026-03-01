@@ -291,17 +291,31 @@ def _prepare_isomer_batch(batch):
         # Generate num_confs conformers with ETKDGv3, minimize all, keep the
         # lowest-energy one.  Multi-conformer sampling avoids the twisted-boat
         # ring minima that a single fixed-seed embedding can get trapped in.
+        #
+        # Fallback chain for complex ring systems (macrocycles, bridged polycyclics)
+        # where distance-geometry initialisation fails:
+        #   1. ETKDGv3 + useSmallRingTorsions  (normal path)
+        #   2. ETKDGv3 + randomCoords=True      (bypasses DG initialisation)
         try:
             cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg)
         except RuntimeError:
-            print(
-                f"  [WARNING] ETKDGv3 embedding failed for {assigned_name or '(unknown)'}; skipping",
-                file=sys.stderr,
-            )
-            results.append((None, base_name, assigned_name))
-            continue
+            cids = []
 
         if not cids:
+            _etkdg_rc = AllChem.ETKDGv3()
+            _etkdg_rc.randomSeed = 0xf00d
+            _etkdg_rc.useSmallRingTorsions = True
+            _etkdg_rc.randomCoords = True
+            try:
+                cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg_rc)
+            except RuntimeError:
+                cids = []
+
+        if not cids:
+            print(
+                f"  [WARNING] 3D embedding failed for {assigned_name or '(unknown)'}; skipping",
+                file=sys.stderr,
+            )
             results.append((None, base_name, assigned_name))
             continue
 
