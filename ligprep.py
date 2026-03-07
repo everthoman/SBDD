@@ -205,24 +205,51 @@ def _xtb_refine(mol, xtb_level, env):
             conf.SetAtomPosition(j, opt_conf.GetAtomPosition(j))
 
 
+def _prune_by_rmsd(mol, cids_by_energy, threshold):
+    """Greedy RMSD pruning: always keep the lowest-energy conformer, then each
+    subsequent one only if its RMSD from all already-kept conformers is >= threshold.
+
+    Args:
+        mol:             RDKit mol with multiple conformers.
+        cids_by_energy:  Conformer IDs sorted lowest-energy first.
+        threshold:       Minimum RMSD (Å) required to keep a conformer.
+
+    Returns:
+        List of kept conformer IDs (subset of cids_by_energy).
+    """
+    kept = [cids_by_energy[0]]
+    for cid in cids_by_energy[1:]:
+        if all(AllChem.GetConformerRMS(mol, k, cid, prealigned=False) >= threshold
+               for k in kept):
+            kept.append(cid)
+    return kept
+
+
 def _prepare_isomer_batch(batch):
     """Worker: prepare a batch of isomers with one shared obabel call.
 
     Args:
         batch: list of (mol_binary, base_name, assigned_name, props_dict,
-                        ph, id_col, num_confs, xtb_level)
+                        ph, id_col, num_confs, xtb_level,
+                        keep_confs, energy_window, rmsd_threshold)
+               keep_confs: 'best', 'all', or int N.
                xtb_level is None to skip xTB, or 'gfnff'/'gfn1'/'gfn2'.
 
     Returns:
         list of (mol_binary_or_None, base_name, assigned_name)
         mol_binary is None when 3D embedding failed.
+        In multi-conf mode (keep_confs != 'best') each isomer may produce
+        multiple entries, one per kept conformer.
     """
     if not batch:
         return []
 
-    ph        = batch[0][4]
-    num_confs = batch[0][6]
-    xtb_level = batch[0][7]
+    ph             = batch[0][4]
+    num_confs      = batch[0][6]
+    xtb_level      = batch[0][7]
+    keep_confs     = batch[0][8]
+    energy_window  = batch[0][9]
+    rmsd_threshold = batch[0][10]
 
     xtb_env = None
     if xtb_level:
@@ -249,7 +276,8 @@ def _prepare_isomer_batch(batch):
 
     # Step 3: embed and minimize each isomer
     results = []
-    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs, _xtb_level) in enumerate(batch):
+    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs, _xtb_level,
+            _keep_confs, _energy_window, _rmsd_threshold) in enumerate(batch):
         obabel_failed = protonated[i] is None
         if obabel_failed:
             print(
@@ -336,18 +364,43 @@ def _prepare_isomer_batch(batch):
 
         # ff_results: list of (not_converged, energy) in conformer order
         energies = [e for _, e in ff_results]
-        best_cid = cids[min(range(len(energies)), key=lambda k: energies[k])]
 
-        # Discard all but the lowest-energy conformer
-        for cid in cids:
-            if cid != best_cid:
-                prot.RemoveConformer(cid)
+        if keep_confs == 'best':
+            best_cid = cids[min(range(len(energies)), key=lambda k: energies[k])]
 
-        # Optional xTB post-minimisation in implicit water
-        if xtb_level and xtb_env:
-            _xtb_refine(prot, xtb_level, xtb_env)
+            # Discard all but the lowest-energy conformer
+            for cid in cids:
+                if cid != best_cid:
+                    prot.RemoveConformer(cid)
 
-        results.append((prot.ToBinary(_PICKLE_PROPS), base_name, assigned_name))
+            # Optional xTB post-minimisation in implicit water
+            if xtb_level and xtb_env:
+                _xtb_refine(prot, xtb_level, xtb_env)
+
+            results.append((prot.ToBinary(_PICKLE_PROPS), base_name, assigned_name))
+
+        else:
+            min_energy = min(energies)
+            sorted_pairs = sorted(zip(cids, energies), key=lambda x: x[1])
+
+            # Energy window filter (lowest-energy conformer is always kept)
+            window_cids = [cid for cid, e in sorted_pairs if e - min_energy <= energy_window]
+
+            # Greedy RMSD pruning — ensures conformational diversity
+            kept_cids = _prune_by_rmsd(prot, window_cids, rmsd_threshold)
+
+            # Cap at N if keep_confs is an integer
+            if isinstance(keep_confs, int):
+                kept_cids = kept_cids[:keep_confs]
+
+            # One result entry per kept conformer; _confN suffix added to name
+            for conf_idx, cid in enumerate(kept_cids):
+                single = Chem.RWMol(prot)
+                for other_id in [c.GetId() for c in single.GetConformers() if c.GetId() != cid]:
+                    single.RemoveConformer(other_id)
+                single = single.GetMol()
+                single.SetProp('_Name', f"{assigned_name}_conf{conf_idx + 1}")
+                results.append((single.ToBinary(_PICKLE_PROPS), base_name, assigned_name))
 
     return results
 
@@ -368,12 +421,26 @@ def parse_args():
         formatter_class=RawDescriptionRichHelpFormatter,
         epilog="""
 Examples:
+  # Docking preparation — single low-energy conformer (default):
   %(prog)s -i molecules.sdf -o prepared.sdf
+  %(prog)s -i molecules.sdf -o prepared.sdf --mode docking
+  %(prog)s -i molecules.sdf -o prepared.sdf --mode docking --num-confs 10
+
+  # Pharmit conformer database — diverse low-energy conformers:
+  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit
+  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit --num-confs 100
+  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit --energy-window 3.0
+  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit --rmsd-threshold 1.0
+
+  # Override individual settings (--mode sets defaults, flags override):
+  %(prog)s -i molecules.sdf -o prepared.sdf --mode pharmit --keep-confs 5
+  %(prog)s -i molecules.sdf -o prepared.sdf --keep-confs all --num-confs 50
+
+  # Other options:
   %(prog)s -i molecules.smi -o prepared.sdf --id-col "Compound_ID"
   %(prog)s -i molecules.sdf -o prepared.sdf -n 8 --no-enumerate-stereo
   %(prog)s -i molecules.sdf -o prepared.sdf --max-isomers 16
-  %(prog)s -i compounds.csv -o prepared.sdf --smiles-col smiles --id-col name
-  %(prog)s -i compounds.csv -o prepared.sdf --smiles-col 2
+  %(prog)s -i compounds.csv -o prepared.sdf --smiles-col smiles --id-col name --mode pharmit
         """
     )
 
@@ -388,6 +455,17 @@ Examples:
         required=True,
         help="Output SDF file path"
     ).completer = FilesCompleter(allowednames=(".sdf",))
+
+    parser.add_argument(
+        "--mode",
+        choices=["docking", "pharmit"],
+        default="docking",
+        help="Preparation mode (default: docking). "
+             "'docking': 10 conformers generated, single lowest-energy one kept — for GNINA and similar programs. "
+             "'pharmit': 50 conformers generated, diverse low-energy set kept — for pharmacophore databases. "
+             "All conformer settings (--num-confs, --keep-confs, --energy-window, --rmsd-threshold) "
+             "can be overridden individually regardless of mode."
+    )
 
     parser.add_argument(
         "--id-col",
@@ -418,9 +496,39 @@ Examples:
     parser.add_argument(
         "--num-confs",
         type=int,
-        default=3,
-        help="Number of ETKDGv3 conformers to generate per isomer; the lowest-energy one is kept (default: 3). "
-             "Higher values improve ring-conformation sampling at the cost of proportionally more CPU time."
+        default=None,
+        help="Number of ETKDGv3 conformers to generate per isomer "
+             "(default: 10 for docking, 50 for pharmit). "
+             "Higher values improve ring-conformation sampling at the cost of more CPU time."
+    )
+
+    parser.add_argument(
+        "--keep-confs",
+        default=None,
+        metavar="N",
+        help="How many conformers to keep per isomer: "
+             "'best' keeps only the lowest-energy one (default for docking); "
+             "'all' keeps every conformer passing the energy-window and RMSD filters (default for pharmit); "
+             "or an integer N keeps at most N conformers. "
+             "Multiple conformers are written as separate SDF records with a _confN name suffix."
+    )
+
+    parser.add_argument(
+        "--energy-window",
+        type=float,
+        default=None,
+        metavar="KCAL",
+        help="Energy window in kcal/mol: discard conformers with energy > (minimum + KCAL) "
+             "(default: 5.0). Ignored when --keep-confs best."
+    )
+
+    parser.add_argument(
+        "--rmsd-threshold",
+        type=float,
+        default=None,
+        metavar="A",
+        help="RMSD pruning threshold in Angstroms: discard a conformer if it is within A of "
+             "an already-kept lower-energy conformer (default: 0.5). Ignored when --keep-confs best."
     )
 
     parser.add_argument(
@@ -472,9 +580,31 @@ def main():
     n_cpus = max(1, args.ncpus)
     enumerate_stereo = not args.no_enumerate_stereo
     max_isomers = args.max_isomers
-    num_confs = max(1, args.num_confs)
     ph = args.ph
     xtb_level = args.xtb_level if args.xtb else None
+
+    # Apply mode defaults; individual flags override.
+    _mode_defaults = {
+        'docking': dict(num_confs=10, keep_confs='best', energy_window=5.0, rmsd_threshold=0.5),
+        'pharmit': dict(num_confs=50, keep_confs='all',  energy_window=5.0, rmsd_threshold=0.5),
+    }
+    _d = _mode_defaults[args.mode]
+    num_confs      = max(1, args.num_confs      if args.num_confs      is not None else _d['num_confs'])
+    energy_window  =        args.energy_window  if args.energy_window  is not None else _d['energy_window']
+    rmsd_threshold =        args.rmsd_threshold if args.rmsd_threshold is not None else _d['rmsd_threshold']
+
+    keep_confs_raw = args.keep_confs if args.keep_confs is not None else _d['keep_confs']
+    if keep_confs_raw in ('best', 'all'):
+        keep_confs = keep_confs_raw
+    else:
+        try:
+            keep_confs = int(keep_confs_raw)
+            if keep_confs < 1:
+                raise ValueError
+        except ValueError:
+            print(f"ERROR: --keep-confs must be 'best', 'all', or a positive integer "
+                  f"(got '{keep_confs_raw}')", file=sys.stderr)
+            return
 
     if xtb_level and not _XTBBIN:
         print("ERROR: --xtb requested but 'xtb' binary not found on PATH. "
@@ -567,8 +697,16 @@ def main():
         mol_iter = _smi_mol_iter()
 
     print(f"[INFO] obabel binary: {_OBABEL}")
+    _conf_info = (f" (energy window {energy_window} kcal/mol, RMSD threshold {rmsd_threshold} Å)"
+                  if keep_confs != 'best' else "")
+    print(f"[INFO] mode: {args.mode} | conformers: {num_confs} generated, keep: {keep_confs}{_conf_info}")
     if xtb_level:
-        print(f"[INFO] xTB post-minimisation enabled ({xtb_level}, ALPB water) using {_XTBBIN}")
+        if keep_confs != 'best':
+            print(f"[WARNING] --xtb is ignored in multi-conformer mode (keep-confs={keep_confs!r}); "
+                  "xTB is only applied when --keep-confs best.", file=sys.stderr)
+            xtb_level = None
+        else:
+            print(f"[INFO] xTB post-minimisation enabled ({xtb_level}, ALPB water) using {_XTBBIN}")
     if enumerate_stereo:
         print(f"Stereoisomer enumeration enabled (max {max_isomers} isomers per molecule)")
 
@@ -589,7 +727,8 @@ def main():
                 assigned_name = f"{base_name}{get_stereo_suffix(isomer, idx + 1)}"
             else:
                 assigned_name = base_name
-            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col, num_confs, xtb_level))
+            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col,
+                                  num_confs, xtb_level, keep_confs, energy_window, rmsd_threshold))
 
     total_isomers = len(isomer_tasks)
     print(f"Processing {input_count} molecules → {total_isomers} isomers using {n_cpus} CPU(s), {num_confs} conformer(s) each...")
