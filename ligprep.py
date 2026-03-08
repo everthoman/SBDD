@@ -56,6 +56,93 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
 from rdkit.Chem.rdmolfiles import SDWriter
+from rdkit.Geometry import rdGeometry as _Geometry
+
+
+_RING_TEMPLATES = None  # lazy-initialised once per worker process
+
+
+def _init_ring_templates():
+    """Build 3D chair-geometry templates for common 6-membered drug-like rings.
+
+    Called once per worker process on first use.  Each template is a
+    (query_mol, [Point3D, ...]) pair: query_mol is used for substructure
+    matching and the Point3D list holds the corresponding ideal chair
+    coordinates (one per heavy atom in the query).
+
+    Templates cover the rings most commonly found in drug-like molecules:
+    cyclohexane, piperidine, piperazine, morpholine, thiomorpholine,
+    tetrahydropyran, tetrahydrothiopyran, piperidin-2-one, piperazin-2-one.
+    """
+    global _RING_TEMPLATES
+
+    _RING_SMILES = [
+        'C1CCCCC1',    # cyclohexane
+        'C1CCNCC1',    # piperidine
+        'C1CNCCN1',    # piperazine
+        'C1COCCN1',    # morpholine
+        'C1CSCCN1',    # thiomorpholine
+        'C1CCOCC1',    # tetrahydropyran
+        'C1CCSCC1',    # tetrahydrothiopyran
+        'O=C1CCCCN1',  # piperidin-2-one (delta-lactam)
+        'O=C1CNCCN1',  # piperazin-2-one
+    ]
+
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 0xf00d
+    params.useSmallRingTorsions = True
+
+    logger = RDLogger.logger()
+    logger.setLevel(RDLogger.CRITICAL)
+
+    templates = []
+    for smi in _RING_SMILES:
+        query = Chem.MolFromSmiles(smi)
+        if query is None:
+            continue
+        mol_h = Chem.AddHs(Chem.MolFromSmiles(smi))
+        if AllChem.EmbedMolecule(mol_h, params) < 0:
+            continue
+        AllChem.MMFFOptimizeMolecule(mol_h, mmffVariant='MMFF94s')
+        mol_3d = Chem.RemoveHs(mol_h)
+        conf = mol_3d.GetConformer()
+        coords = [
+            _Geometry.Point3D(conf.GetAtomPosition(i).x,
+                              conf.GetAtomPosition(i).y,
+                              conf.GetAtomPosition(i).z)
+            for i in range(mol_3d.GetNumAtoms())
+        ]
+        templates.append((query, coords))
+
+    logger.setLevel(RDLogger.WARNING)
+    _RING_TEMPLATES = templates
+
+
+def _get_ring_coord_map(mol):
+    """Return a coordMap dict seeding common 6-membered rings to chair templates.
+
+    Matches the ring template library against mol (which should have explicit
+    Hs via AddHs).  For each non-overlapping match, the heavy-atom indices in
+    mol are mapped to the corresponding ideal chair coordinates.  Overlapping
+    matches (e.g. fused rings sharing atoms) are skipped.
+
+    Returns {} if no templates match (acyclic molecules, aromatic-only, etc.).
+    """
+    if _RING_TEMPLATES is None:
+        _init_ring_templates()
+    if not _RING_TEMPLATES:
+        return {}
+
+    used_atoms = set()
+    coord_map = {}
+    for query, coords in _RING_TEMPLATES:
+        for match in mol.GetSubstructMatches(query):
+            if any(idx in used_atoms for idx in match):
+                continue  # skip overlapping matches (e.g. fused bicyclics)
+            for i, mol_idx in enumerate(match):
+                coord_map[mol_idx] = coords[i]
+            used_atoms.update(match)
+    return coord_map
 
 
 def obabel_protonate_batch(smiles_list, ph=7.4):
@@ -300,18 +387,37 @@ def _prepare_isomer_batch(batch):
 
         prot = Chem.AddHs(prot)
 
-        # Generate num_confs conformers with ETKDGv3, minimize all, keep the
-        # lowest-energy one.  Multi-conformer sampling avoids the twisted-boat
-        # ring minima that a single fixed-seed embedding can get trapped in.
-        #
-        # Fallback chain for complex ring systems (macrocycles, bridged polycyclics)
-        # where distance-geometry initialisation fails:
-        #   1. ETKDGv3 + useSmallRingTorsions  (normal path)
-        #   2. ETKDGv3 + randomCoords=True      (bypasses DG initialisation)
-        try:
-            cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg)
-        except RuntimeError:
+        # Fallback chain for 3D embedding:
+        #   1. ETKDGv3 + chair templates (coordMap) — for molecules with common
+        #      6-membered rings; seeds DG from pre-computed chair coordinates to
+        #      avoid boat/twist-boat ring geometries
+        #   2. ETKDGv3 standard                     — general case / no template
+        #   3. ETKDGv3 + randomCoords=True           — bypasses DG for difficult
+        #      ring systems (macrocycles, bridged polycyclics)
+        coord_map = _get_ring_coord_map(prot)
+
+        if coord_map:
+            prot.RemoveAllConformers()
             cids = []
+            for _ci in range(num_confs):
+                _p = AllChem.ETKDGv3()
+                _p.randomSeed = 0xf00d + _ci
+                _p.useSmallRingTorsions = True
+                try:
+                    cid = AllChem.EmbedMolecule(prot, params=_p, clearConfs=False,
+                                                coordMap=coord_map)
+                except (RuntimeError, TypeError):
+                    cid = -1
+                if cid >= 0:
+                    cids.append(cid)
+        else:
+            cids = []
+
+        if not cids:
+            try:
+                cids = list(AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg))
+            except RuntimeError:
+                cids = []
 
         if not cids:
             _etkdg_rc = AllChem.ETKDGv3()
@@ -319,7 +425,7 @@ def _prepare_isomer_batch(batch):
             _etkdg_rc.useSmallRingTorsions = True
             _etkdg_rc.useRandomCoords = True
             try:
-                cids = AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg_rc)
+                cids = list(AllChem.EmbedMultipleConfs(prot, numConfs=num_confs, params=_etkdg_rc))
             except RuntimeError:
                 cids = []
 
