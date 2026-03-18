@@ -81,6 +81,21 @@ _DEFAULT_CUSTOM  = _SCRIPT_DIR / 'custom_filters.txt'
 
 # ─── Logging helpers ──────────────────────────────────────────────────────────
 
+class _Tee:
+    """Write to both a file and the original stdout simultaneously."""
+    def __init__(self, fh, original):
+        self._fh = fh
+        self._orig = original
+    def write(self, data):
+        self._orig.write(data)
+        self._fh.write(data)
+    def flush(self):
+        self._orig.flush()
+        self._fh.flush()
+    def isatty(self):
+        return self._orig.isatty()
+
+
 def _ok(msg: str):   print(f"  ✓ {msg}")
 def _info(msg: str): print(f"    {msg}")
 def _warn(msg: str): print(f"  ⚠ {msg}")
@@ -102,28 +117,111 @@ def format_time(seconds: float) -> str:
 
 # ─── Molecule I/O ─────────────────────────────────────────────────────────────
 
-def _iter_smiles(path: Path) -> Iterator[Tuple[Chem.Mol, str]]:
-    """Yield (mol, name) from a SMILES file (comma- or tab-separated)."""
+def _parse_col_spec(s: str):
+    """Parse a column specifier: positive integer string → 0-based int; else column name str."""
+    try:
+        n = int(s)
+        if n < 1:
+            _fatal(f"Column index must be ≥ 1, got {n}")
+        return n - 1  # convert 1-based user input to 0-based
+    except ValueError:
+        return s  # column header name
+
+
+def _resolve_col(spec, header: List[str], label: str) -> int:
+    """Resolve a str column name to its 0-based index in *header*. Fatal if not found."""
+    if spec not in header:
+        _fatal(f"--{label}: column '{spec}' not found in header: {header}")
+    return header.index(spec)
+
+
+def _iter_smiles(path: Path, smiles_col=0, name_col=None,
+                 out_header: Optional[List[str]] = None) -> Iterator[Tuple[Chem.Mol, str]]:
+    """Yield (mol, name) from a SMILES file (comma- or tab-separated).
+
+    smiles_col : 0-based int or str column name (default: 0 = first column)
+    name_col   : 0-based int, str column name, or None (auto = first non-SMILES column)
+    out_header : if a list is provided and a header row is detected, it will be populated
+                 with column names in output order [smiles, name, *extras] before the
+                 first molecule is yielded.
+
+    Extra columns (neither SMILES nor name) are stored as mol properties and
+    written back on output.  If a header row is present, column names are used
+    as property keys; otherwise col_N (1-based) is used.
+    """
     RDLogger.DisableLog('rdApp.*')
-    first_data_line = True
+    need_header = isinstance(smiles_col, str) or isinstance(name_col, str)
+    col_names: List[str] = []        # populated when a header row is detected
+    header_consumed = False
+    smi_idx: int = smiles_col if isinstance(smiles_col, int) else 0  # placeholder
+    nam_idx: Optional[int] = name_col if isinstance(name_col, int) else None
+    auto_name: bool = (name_col is None)
+    out_header_written = False
+
     with path.open(encoding='utf-8', errors='replace') as fh:
         for lineno, raw in enumerate(fh, 1):
             line = raw.strip()
             if not line or line.startswith('#'):
                 continue
-            parts = line.replace(',', '\t').split('\t')
-            smi = parts[0].strip()
-            name = parts[1].strip() if len(parts) > 1 else f"mol_{lineno}"
-            mol = Chem.MolFromSmiles(smi)
-            if mol is None:
-                if first_data_line:
-                    _info(f"Line {lineno}: skipping header row ({smi!r})")
+            parts = [p.strip() for p in line.replace(',', '\t').split('\t')]
+
+            # ── Header handling ───────────────────────────────────────────
+            if not header_consumed:
+                if need_header:
+                    col_names = parts
+                    smi_idx = _resolve_col(smiles_col, col_names, 'smiles-col')
+                    if name_col is not None:
+                        nam_idx = _resolve_col(name_col, col_names, 'name-col')
+                    header_consumed = True
+                    continue
                 else:
-                    _warn(f"Line {lineno}: could not parse SMILES — skipped")
-                first_data_line = False
+                    test = parts[smi_idx] if smi_idx < len(parts) else ''
+                    if Chem.MolFromSmiles(test) is None:
+                        col_names = parts
+                        _info(f"Line {lineno}: skipping header row ({parts[smi_idx]!r})")
+                        header_consumed = True
+                        continue
+                    header_consumed = True
+
+            # ── Auto name column (determined once from first data row) ─────
+            if auto_name and nam_idx is None:
+                nam_idx = next((i for i in range(len(parts)) if i != smi_idx), None)
+                auto_name = False
+
+            # ── Parse SMILES ───────────────────────────────────────────────
+            if smi_idx >= len(parts):
+                _warn(f"Line {lineno}: fewer columns than expected — skipped")
                 continue
-            first_data_line = False
+            mol = Chem.MolFromSmiles(parts[smi_idx])
+            if mol is None:
+                _warn(f"Line {lineno}: could not parse SMILES '{parts[smi_idx]}' — skipped")
+                continue
+
+            # ── Name ──────────────────────────────────────────────────────
+            name = (parts[nam_idx] if nam_idx is not None and nam_idx < len(parts) else '') \
+                   or f"mol_{lineno}"
             mol.SetProp('_Name', name)
+
+            # ── Extra columns ─────────────────────────────────────────────
+            extra_names: List[str] = []
+            for i, val in enumerate(parts):
+                if i == smi_idx or i == nam_idx:
+                    continue
+                cname = col_names[i] if i < len(col_names) else f"col_{i + 1}"
+                mol.SetProp(cname, val)
+                extra_names.append(cname)
+            if extra_names:
+                mol.SetProp('_extra_col_names', '\t'.join(extra_names))
+
+            # ── Populate output header once (requires nam_idx to be resolved) ──
+            if not out_header_written and out_header is not None and col_names:
+                hdr = [col_names[smi_idx] if smi_idx < len(col_names) else 'SMILES']
+                if nam_idx is not None and nam_idx < len(col_names):
+                    hdr.append(col_names[nam_idx])
+                hdr.extend(extra_names)
+                out_header.extend(hdr)
+                out_header_written = True
+
             yield mol, name
 
 
@@ -139,31 +237,46 @@ def _iter_sdf(path: Path) -> Iterator[Tuple[Chem.Mol, str]]:
         yield mol, name
 
 
-def _iter_molecules(path: Path) -> Iterator[Tuple[Chem.Mol, str]]:
+def _iter_molecules(path: Path, smiles_col=0, name_col=None,
+                    out_header: Optional[List[str]] = None) -> Iterator[Tuple[Chem.Mol, str]]:
     """Auto-detect format from extension and yield (mol, name) pairs."""
     if path.suffix.lower() == '.sdf':
         yield from _iter_sdf(path)
     else:
-        yield from _iter_smiles(path)
+        yield from _iter_smiles(path, smiles_col=smiles_col, name_col=name_col,
+                                out_header=out_header)
 
 
 def _write_smiles(mol: Chem.Mol, name: str, fh) -> None:
     smi = Chem.MolToSmiles(Chem.RemoveHs(mol), isomericSmiles=True)
-    fh.write(f"{smi}\t{name}\n")
+    extra = ''
+    if mol.HasProp('_extra_col_names'):
+        col_names = mol.GetProp('_extra_col_names').split('\t')
+        vals = [mol.GetProp(c) if mol.HasProp(c) else '' for c in col_names]
+        extra = '\t' + '\t'.join(vals)
+    fh.write(f"{smi}\t{name}{extra}\n")
 
 
-def _make_writer(out_path: Path):
-    """Return (writer_fn, close_fn) for the given output path."""
+def _make_writer(out_path: Path, header: Optional[List[str]] = None):
+    """Return (writer_fn, close_fn) for the given output path.
+
+    header : if provided and the output is a SMILES file, written as the first line.
+    """
     if out_path.suffix.lower() == '.sdf':
         w = Chem.SDWriter(str(out_path))
         def _write(mol, name):
             mol.SetProp('_Name', name)
             if mol.GetNumConformers() == 0:
                 AllChem.Compute2DCoords(mol)
-            w.write(mol)
+            out_mol = Chem.RWMol(mol)
+            if out_mol.HasProp('_extra_col_names'):
+                out_mol.ClearProp('_extra_col_names')
+            w.write(out_mol.GetMol())
         def _close(): w.close()
     else:
         fh = out_path.open('w', encoding='utf-8')
+        if header:
+            fh.write('\t'.join(header) + '\n')
         def _write(mol, name): _write_smiles(mol, name, fh)
         def _close():          fh.close()
     return _write, _close
@@ -543,6 +656,18 @@ def _make_rb_filter(lo: Optional[float], hi: Optional[float]):
     return _filt
 
 
+def _make_ha_filter(lo: Optional[float], hi: Optional[float]):
+    """Return a heavy-atom count filter."""
+    def _filt(mol, _args):
+        n = mol.GetNumHeavyAtoms()
+        if lo is not None and n < lo:
+            return f"HA {n} < {int(lo)}"
+        if hi is not None and n > hi:
+            return f"HA {n} > {int(hi)}"
+        return None
+    return _filt
+
+
 def _mol_props(mol: Chem.Mol) -> dict:
     """Return a dict of calculated properties for a molecule."""
     return {
@@ -554,6 +679,7 @@ def _mol_props(mol: Chem.Mol) -> dict:
         'TPSA':   rdMolDescriptors.CalcTPSA(mol),
         'QED':    QED.qed(mol),
         'Chiral': rdMolDescriptors.CalcNumAtomStereoCenters(mol),
+        'HA':     float(mol.GetNumHeavyAtoms()),
     }
 
 
@@ -562,11 +688,18 @@ def _mol_props(mol: Chem.Mol) -> dict:
 _shared_pipeline: list = []
 
 
+_PICKLE_PROPS = (Chem.PropertyPickleOptions.MolProps |
+                 Chem.PropertyPickleOptions.PrivateProps)
+
+
 def _pool_worker(batch_binary: list) -> list:
     """Multiprocessing worker. Inherits _shared_pipeline via fork — no pickling.
 
     batch_binary : list of (mol_bytes, name)
     Returns      : list of (mol_bytes_or_None, name, reason_or_None, props)
+
+    Mol properties (extra input columns etc.) are preserved across the
+    ToBinary / Chem.Mol round-trip via PropertyPickleOptions.
     """
     results = []
     for mol_b, name in batch_binary:
@@ -577,8 +710,7 @@ def _pool_worker(batch_binary: list) -> list:
             if reason:
                 break
         props = _mol_props(mol)
-        _pkl = Chem.PropertyPickleOptions.MolProps | Chem.PropertyPickleOptions.PrivateProps
-        results.append((mol.ToBinary(_pkl) if reason is None else None, name, reason, props))
+        results.append((mol.ToBinary(_PICKLE_PROPS) if reason is None else None, name, reason, props))
     return results
 
 
@@ -587,7 +719,7 @@ def _build_filter_pipeline(pains_patterns=None, reos_rules=None,
                            lipinski=False, lipinski_strict=False, ro3=False,
                            qed_range=None, hba_range=None, hbd_range=None,
                            rb_range=None, tpsa_range=None,
-                           chiral_range=None) -> list:
+                           chiral_range=None, ha_range=None) -> list:
     """Return an ordered list of (label, filter_fn) tuples to apply."""
     pipeline = []
     if pains_patterns is not None:
@@ -616,6 +748,8 @@ def _build_filter_pipeline(pains_patterns=None, reos_rules=None,
         pipeline.append(('TPSA',     _make_tpsa_filter(*tpsa_range)))
     if chiral_range is not None:
         pipeline.append(('Chiral',   _make_chiral_filter(*chiral_range)))
+    if ha_range is not None:
+        pipeline.append(('HA',       _make_ha_filter(*ha_range)))
     return pipeline
 
 
@@ -638,9 +772,15 @@ def main():
                     help='Output file (default: <input>_filtered.<ext>)')
     io.add_argument('-j', '--jobs', metavar='N', type=int,
                     default=os.cpu_count(),
-                    help=f'Worker threads for filtering and property calculation '
+                    help=f'Worker processes for filtering and property calculation '
                          f'(default: {os.cpu_count()} — all available CPUs). '
                          f'Use --jobs 1 to disable parallelism.')
+    io.add_argument('--smiles-col', metavar='COL', default='1',
+                    help='Column containing SMILES: 1-based integer index or column '
+                         'header name (default: 1 = first column)')
+    io.add_argument('--name-col', metavar='COL', default=None,
+                    help='Column containing molecule name/ID: 1-based integer index '
+                         'or column header name (default: auto = first non-SMILES column)')
 
     pre = p.add_argument_group('Preprocessing')
     pre.add_argument('--strip', dest='strip', action='store_true', default=True,
@@ -722,11 +862,17 @@ def main():
                       help='Astex Rule of Three for fragment screening: '
                            'MW≤300, logP≤3, HBD≤3, HBA≤3, RotBonds≤3 '
                            '(all rules must pass)')
+    prop.add_argument('--ha', metavar='RANGE', default=None,
+                      help='Heavy-atom count range.  '
+                           'E.g. --ha 10:35  --ha :40  --ha 5:')
 
     if _ARGCOMPLETE:
         argcomplete.autocomplete(p)
 
     args = p.parse_args()
+
+    smiles_col = _parse_col_spec(args.smiles_col)
+    name_col   = _parse_col_spec(args.name_col) if args.name_col is not None else None
 
     t0 = time.time()
 
@@ -738,6 +884,10 @@ def main():
         out_path = Path(args.output).resolve()
     else:
         out_path = in_path.with_name(in_path.stem + '_filtered' + in_path.suffix)
+
+    log_path = out_path.with_suffix('.log')
+    _log_fh  = log_path.open('w', encoding='utf-8')
+    sys.stdout = _Tee(_log_fh, sys.__stdout__)
 
     # ── Config ────────────────────────────────────────────────────────────────
     bar = '─' * 60
@@ -751,6 +901,8 @@ def main():
     _info(f"Deduplicate:   {'yes' if args.unique else 'no (disabled)'}")
     _info(f"Output format: {out_path.suffix.lower()[1:].upper()}")
     _info(f"Workers:       {args.jobs}")
+    _info(f"SMILES col:    {args.smiles_col}")
+    _info(f"Name col:      {args.name_col if args.name_col is not None else 'auto'}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
     _info(f"QED range:     {args.qed if args.qed else 'any'}")
@@ -759,6 +911,7 @@ def main():
     _info(f"RotBonds range:{args.rb   if args.rb   else 'any'}")
     _info(f"TPSA range:    {args.tpsa   if args.tpsa   else 'any'}")
     _info(f"Chiral range:  {args.chiral if args.chiral else 'any'}")
+    _info(f"HA range:      {args.ha if args.ha else 'any'}")
     lip_mode = ('strict' if args.ro5_strict else 'on (1 violation allowed)') if (args.ro5 or args.ro5_strict) else 'off'
     _info(f"Lipinski Ro5:  {lip_mode}")
     _info(f"Rule of Three: {'on' if args.ro3 else 'off'}")
@@ -798,6 +951,7 @@ def main():
     rb_range   = _parse_range(args.rb,   'rb')   if args.rb   else None
     tpsa_range   = _parse_range(args.tpsa,   'tpsa')   if args.tpsa   else None
     chiral_range = _parse_range(args.chiral, 'chiral') if args.chiral else None
+    ha_range     = _parse_range(args.ha,     'ha')     if args.ha     else None
 
     pipeline = _build_filter_pipeline(pains_patterns=pains_patterns,
                                       reos_rules=reos_rules,
@@ -812,16 +966,19 @@ def main():
                                       hbd_range=hbd_range,
                                       rb_range=rb_range,
                                       tpsa_range=tpsa_range,
-                                      chiral_range=chiral_range)
+                                      chiral_range=chiral_range,
+                                      ha_range=ha_range)
     if not pipeline:
         _warn("No preprocessing or filters enabled — all molecules will pass.")
-    elif pipeline:
+    else:
         _info(f"Active filters ({len(pipeline)}): "
               + ', '.join(label for label, _ in pipeline))
     print(bar)
 
     # ── Read & preprocess ─────────────────────────────────────────────────────
-    raw_stream = _iter_molecules(in_path)
+    out_header: List[str] = []
+    raw_stream = _iter_molecules(in_path, smiles_col=smiles_col, name_col=name_col,
+                                 out_header=out_header)
 
     molecules, n_stripped, n_neutralized, n_duplicates = _preprocess(
         raw_stream, do_strip=args.strip, do_neutralize=args.neutralize,
@@ -838,17 +995,17 @@ def main():
     global _shared_pipeline
     _shared_pipeline = pipeline
 
-    # Serialise mols as bytes for inter-process transfer
+    # Serialise mols as bytes for inter-process transfer.
+    # PropertyPickleOptions preserves all mol properties (including extra input
+    # columns stored as string props) across the ToBinary / Chem.Mol round-trip.
     n_jobs = max(1, min(args.jobs, len(molecules)))
     batch_size = math.ceil(len(molecules) / n_jobs) if molecules else 1
-    _PICKLE_PROPS = (Chem.PropertyPickleOptions.MolProps |
-                     Chem.PropertyPickleOptions.PrivateProps)
     batches_binary = [
         [(mol.ToBinary(_PICKLE_PROPS), name) for mol, name in molecules[i:i + batch_size]]
         for i in range(0, len(molecules), batch_size)
     ]
 
-    write_mol, close_out = _make_writer(out_path)
+    write_mol, close_out = _make_writer(out_path, header=out_header or None)
 
     import multiprocessing
     _fork_available = multiprocessing.get_start_method(allow_none=True) in (None, 'fork')
@@ -902,6 +1059,7 @@ def main():
         'TPSA':   '{:8.1f}',
         'QED':    '{:8.3f}',
         'Chiral': '{:8.1f}',
+        'HA':     '{:8.0f}',
     }
 
     def _print_prop_table(label: str, pl: Dict[str, list]):
@@ -926,7 +1084,11 @@ def main():
     if rej_prop_lists:
         _print_prop_table('rejected molecules', rej_prop_lists)
     _info(f"Time:              {format_time(elapsed)}")
+    _info(f"Log:               {log_path.name}")
     print(bar)
+
+    sys.stdout = sys.__stdout__
+    _log_fh.close()
 
 
 if __name__ == '__main__':
