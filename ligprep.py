@@ -26,6 +26,7 @@ Updated by Claude, 2026-02-28: Batch obabel calls, per-isomer task batching, str
 
 import argparse
 import concurrent.futures
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -907,8 +908,14 @@ def main():
     failed_count = 0
     failed_names = []
 
+    # Use spawn context to avoid fork+RDKit deadlocks.  When the main process
+    # forks workers, RDKit's C++ internals (thread pool, lazy-init ring
+    # templates) may have mutex state that deadlocks the child.  Spawn starts
+    # each worker completely fresh so there is no inherited lock state.
+    _mp_ctx = multiprocessing.get_context('spawn')
     writer = SDWriter(output_path)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus,
+                                                mp_context=_mp_ctx) as executor:
         futures = [executor.submit(_prepare_isomer_batch, b) for b in batches]
         del batches
 
