@@ -341,7 +341,7 @@ def _prepare_isomer_batch(batch):
     """Worker: prepare a batch of isomers with one shared obabel call.
 
     Args:
-        batch: list of (mol_binary, base_name, assigned_name, props_dict,
+        batch: list of (mol_binary, base_name, assigned_name,
                         ph, id_col, num_confs, xtb_level,
                         keep_confs, energy_window, rmsd_threshold)
                keep_confs: 'best', 'all', or int N.
@@ -356,12 +356,12 @@ def _prepare_isomer_batch(batch):
     if not batch:
         return []
 
-    ph             = batch[0][4]
-    num_confs      = batch[0][6]
-    xtb_level      = batch[0][7]
-    keep_confs     = batch[0][8]
-    energy_window  = batch[0][9]
-    rmsd_threshold = batch[0][10]
+    ph             = batch[0][3]
+    num_confs      = batch[0][5]
+    xtb_level      = batch[0][6]
+    keep_confs     = batch[0][7]
+    energy_window  = batch[0][8]
+    rmsd_threshold = batch[0][9]
 
     xtb_env = None
     if xtb_level:
@@ -388,7 +388,7 @@ def _prepare_isomer_batch(batch):
 
     # Step 3: embed and minimize each isomer
     results = []
-    for i, (mol_binary, base_name, assigned_name, props_dict, ph, id_col, num_confs, _xtb_level,
+    for i, (mol_binary, base_name, assigned_name, ph, id_col, num_confs, _xtb_level,
             _keep_confs, _energy_window, _rmsd_threshold) in enumerate(batch):
         obabel_failed = protonated[i] is None
         if obabel_failed:
@@ -401,9 +401,7 @@ def _prepare_isomer_batch(batch):
         else:
             prot = protonated[i]
 
-        # Restore SD properties and set name tags after all mol-object surgery.
-        for k, v in props_dict.items():
-            prot.SetProp(k, v)
+        # Set name and identity tags.
         prot.SetProp('_Name', assigned_name)
         if base_name:
             prot.SetProp(id_col, base_name)
@@ -854,15 +852,8 @@ def main():
                 smi = parts[smi_col_idx]
                 mol = Chem.MolFromSmiles(smi)
                 if mol:
-                    # Set ID property
                     if id_col_idx is not None and id_col_idx < len(parts):
                         mol.SetProp(id_col, parts[id_col_idx])
-                    # Preserve all other columns as mol properties
-                    for i, val in enumerate(parts):
-                        if i == smi_col_idx or i == id_col_idx:
-                            continue
-                        prop_name = col_names[i] if i < len(col_names) else f'col_{i + 1}'
-                        mol.SetProp(prop_name, val)
                     yield mol
                 else:
                     print(f"[WARNING] SMILES parse error, skipping: {line}")
@@ -889,10 +880,9 @@ def main():
     input_count = 0
     for mol in mol_iter:
         input_count += 1
-        # Capture name and all properties BEFORE salt stripping — GetMolFrags
-        # creates new mol objects that do not inherit string properties.
+        # Capture name BEFORE salt stripping — GetMolFrags creates new mol
+        # objects that do not inherit string properties.
         base_name = mol.GetProp(id_col) if mol.HasProp(id_col) else ""
-        props = {p: mol.GetProp(p) for p in mol.GetPropNames()}
         mol = strip_salts_keep_largest(mol)
         if mol is None:
             continue
@@ -902,7 +892,7 @@ def main():
                 assigned_name = f"{base_name}{get_stereo_suffix(isomer, idx + 1)}"
             else:
                 assigned_name = base_name
-            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, props, ph, id_col,
+            isomer_tasks.append((isomer.ToBinary(), base_name, assigned_name, ph, id_col,
                                   num_confs, xtb_level, keep_confs, energy_window, rmsd_threshold))
 
     total_isomers = len(isomer_tasks)
