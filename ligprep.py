@@ -551,26 +551,26 @@ def parse_args():
         formatter_class=_HelpFmt,
         epilog="""
 Examples:
-  # Docking preparation — single low-energy conformer (default):
+  # Single conformer — lowest-energy only (default, e.g. docking):
   %(prog)s -i molecules.sdf -o prepared.sdf
-  %(prog)s -i molecules.sdf -o prepared.sdf --mode docking
-  %(prog)s -i molecules.sdf -o prepared.sdf --mode docking --num-confs 10
+  %(prog)s -i molecules.sdf -o prepared.sdf --mode single
+  %(prog)s -i molecules.sdf -o prepared.sdf --mode single --num-confs 10
 
-  # Pharmit conformer database — diverse low-energy conformers:
-  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit
-  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit --num-confs 100
-  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit --energy-window 3.0
-  %(prog)s -i molecules.sdf -o pharmit.sdf --mode pharmit --rmsd-threshold 1.0
+  # Multi-conformer — diverse low-energy set (e.g. pharmacophore databases):
+  %(prog)s -i molecules.sdf -o conformers.sdf --mode multi
+  %(prog)s -i molecules.sdf -o conformers.sdf --mode multi --num-confs 100
+  %(prog)s -i molecules.sdf -o conformers.sdf --mode multi --energy-window 3.0
+  %(prog)s -i molecules.sdf -o conformers.sdf --mode multi --rmsd-threshold 1.0
 
   # Override individual settings (--mode sets defaults, flags override):
-  %(prog)s -i molecules.sdf -o prepared.sdf --mode pharmit --keep-confs 5
+  %(prog)s -i molecules.sdf -o prepared.sdf --mode multi --keep-confs 5
   %(prog)s -i molecules.sdf -o prepared.sdf --keep-confs all --num-confs 50
 
   # Other options:
   %(prog)s -i molecules.smi -o prepared.sdf --id-col "Compound_ID"
   %(prog)s -i molecules.sdf -o prepared.sdf -n 8 --no-enumerate-stereo
   %(prog)s -i molecules.sdf -o prepared.sdf --max-isomers 16
-  %(prog)s -i compounds.csv -o prepared.sdf --smiles-col smiles --id-col name --mode pharmit
+  %(prog)s -i compounds.csv -o prepared.sdf --smiles-col smiles --id-col name --mode multi
         """
     )
 
@@ -590,11 +590,11 @@ Examples:
 
     parser.add_argument(
         "--mode",
-        choices=["docking", "pharmit"],
-        default="docking",
-        help="Preparation mode (default: docking). "
-             "'docking': 10 conformers generated, single lowest-energy one kept — for GNINA and similar programs. "
-             "'pharmit': 50 conformers generated, diverse low-energy set kept — for pharmacophore databases. "
+        choices=["single", "multi"],
+        default="single",
+        help="Preparation mode (default: single). "
+             "'single': 10 conformers generated, lowest-energy one kept — for docking and similar programs. "
+             "'multi': 50 conformers generated, diverse low-energy set kept — for pharmacophore databases etc. "
              "All conformer settings (--num-confs, --keep-confs, --energy-window, --rmsd-threshold) "
              "can be overridden individually regardless of mode."
     )
@@ -633,7 +633,7 @@ Examples:
         type=int,
         default=None,
         help="Number of ETKDGv3 conformers to generate per isomer "
-             "(default: 10 for docking, 50 for pharmit). "
+             "(default: 10 for single, 50 for multi). "
              "Higher values improve ring-conformation sampling at the cost of more CPU time."
     )
 
@@ -642,8 +642,8 @@ Examples:
         default=None,
         metavar="N",
         help="How many conformers to keep per isomer: "
-             "'best' keeps only the lowest-energy one (default for docking); "
-             "'all' keeps every conformer passing the energy-window and RMSD filters (default for pharmit); "
+             "'best' keeps only the lowest-energy one (default for single); "
+             "'all' keeps every conformer passing the energy-window and RMSD filters (default for multi); "
              "or an integer N keeps at most N conformers. "
              "Multiple conformers are written as separate SDF records with a _confN name suffix."
     )
@@ -722,8 +722,8 @@ def main():
 
     # Apply mode defaults; individual flags override.
     _mode_defaults = {
-        'docking': dict(num_confs=10, keep_confs='best', energy_window=5.0, rmsd_threshold=0.5),
-        'pharmit': dict(num_confs=50, keep_confs='all',  energy_window=5.0, rmsd_threshold=0.5),
+        'single': dict(num_confs=10, keep_confs='best', energy_window=5.0, rmsd_threshold=0.5),
+        'multi':  dict(num_confs=50, keep_confs='all',  energy_window=5.0, rmsd_threshold=0.5),
     }
     _d = _mode_defaults[args.mode]
     num_confs      = max(1, args.num_confs      if args.num_confs      is not None else _d['num_confs'])
