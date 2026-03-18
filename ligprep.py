@@ -25,7 +25,6 @@ Updated by Claude, 2026-02-28: Batch obabel calls, per-isomer task batching, str
 """
 
 import argparse
-from rich_argparse import RawDescriptionRichHelpFormatter
 import concurrent.futures
 import os
 import shutil
@@ -33,10 +32,24 @@ import subprocess
 import sys
 import tempfile
 import time
-from tqdm import tqdm
 
-import argcomplete
-from argcomplete.completers import FilesCompleter
+try:
+    from rich_argparse import RawDescriptionRichHelpFormatter as _HelpFmt
+except ImportError:
+    _HelpFmt = argparse.RawDescriptionHelpFormatter
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kwargs):
+        return it
+
+try:
+    import argcomplete
+    from argcomplete.completers import FilesCompleter
+    _ARGCOMPLETE = True
+except ImportError:
+    _ARGCOMPLETE = False
 
 # Prefer the system (apt) obabel 3.1.1+ over the conda 3.1.0 build.
 # The conda 3.1.0 phmodel.txt tetrazole TRANSFORM produces an invalid mol
@@ -143,6 +156,18 @@ def _get_ring_coord_map(mol):
                 coord_map[mol_idx] = coords[i]
             used_atoms.update(match)
     return coord_map
+
+
+def _parse_col_spec(s: str):
+    """Parse a column specifier: positive integer string → 0-based int; else column name str."""
+    try:
+        n = int(s)
+        if n < 1:
+            print(f"ERROR: column index must be ≥ 1, got {n}", file=sys.stderr)
+            sys.exit(1)
+        return n - 1  # convert 1-based user input to 0-based
+    except ValueError:
+        return s  # column header name
 
 
 def obabel_protonate_batch(smiles_list, ph=7.4):
@@ -524,7 +549,7 @@ def format_time(seconds):
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Prepare molecules for docking from SDF or SMILES files.",
-        formatter_class=RawDescriptionRichHelpFormatter,
+        formatter_class=_HelpFmt,
         epilog="""
 Examples:
   # Docking preparation — single low-energy conformer (default):
@@ -550,17 +575,19 @@ Examples:
         """
     )
 
-    parser.add_argument(
+    _input_arg = parser.add_argument(
         "-i", "--input",
         required=True,
-        help="Input file path (SDF or SMILES format)"
-    ).completer = FilesCompleter(allowednames=(".sdf", ".smi", ".smiles", ".csv", ".txt"))
+        help="Input file path (SDF or SMILES format)")
+    if _ARGCOMPLETE:
+        _input_arg.completer = FilesCompleter(allowednames=(".sdf", ".smi", ".smiles", ".csv", ".txt"))
 
-    parser.add_argument(
+    _output_arg = parser.add_argument(
         "-o", "--output",
         required=True,
-        help="Output SDF file path"
-    ).completer = FilesCompleter(allowednames=(".sdf",))
+        help="Output SDF file path")
+    if _ARGCOMPLETE:
+        _output_arg.completer = FilesCompleter(allowednames=(".sdf",))
 
     parser.add_argument(
         "--mode",
@@ -575,8 +602,11 @@ Examples:
 
     parser.add_argument(
         "--id-col",
-        default="Structure ID",
-        help="Identifier property name to preserve (default: 'Structure ID')"
+        default=None,
+        metavar="COL",
+        help="Column containing the molecule ID: 1-based integer index or column header name. "
+             "For SMILES/CSV: default = auto-detect (first non-SMILES column). "
+             "For SDF: default = 'Structure ID' property."
     )
 
     parser.add_argument(
@@ -648,7 +678,8 @@ Examples:
         "--smiles-col",
         default=None,
         metavar="COL",
-        help="SMILES column name or 0-based index in delimited files (default: auto-detect)"
+        help="Column containing SMILES: 1-based integer index or column header name "
+             "(default: auto-detect from common names, then first column)"
     )
 
     parser.add_argument(
@@ -673,7 +704,8 @@ Examples:
         help="Write failed molecule IDs to this file"
     )
 
-    argcomplete.autocomplete(parser)
+    if _ARGCOMPLETE:
+        argcomplete.autocomplete(parser)
     return parser.parse_args()
 
 
@@ -723,6 +755,19 @@ def main():
 
     ext = os.path.splitext(input_path)[1].lower()
 
+    # Resolve column specs (1-based int or header name, like ligfilter.py).
+    # Done before the format branch so both SDF and SMILES paths can use them.
+    smiles_col_spec = _parse_col_spec(args.smiles_col) if args.smiles_col else None
+    id_col_spec     = _parse_col_spec(args.id_col)     if args.id_col     else None
+
+    # For SDF, fall back to 'Structure ID' when --id-col is not given.
+    if id_col_spec is None and ext == '.sdf':
+        id_col = 'Structure ID'
+    elif isinstance(id_col_spec, str):
+        id_col = id_col_spec
+    else:
+        id_col = 'Structure ID'  # placeholder; overwritten below for SMILES input
+
     # Build a lazy mol iterator — SDF supplier is already lazy.
     # For SMILES/CSV, column detection is done eagerly on the header line,
     # then molecules are yielded one at a time via a nested generator.
@@ -738,52 +783,68 @@ def main():
             return
 
         sep = '\t' if '\t' in lines[0] else ','
-        header = [c.strip() for c in lines[0].split(sep)]
 
-        # Detect header by trying to parse the first cell as SMILES
-        smi_col_idx = 0
-        id_col_idx = 1 if len(header) > 1 else None
+        # ── Header detection ──────────────────────────────────────────────────
+        need_header = isinstance(smiles_col_spec, str) or isinstance(id_col_spec, str)
         _rdlog = RDLogger.logger()
         _rdlog.setLevel(RDLogger.CRITICAL)
-        is_header = Chem.MolFromSmiles(header[0]) is None
+        first_cell = lines[0].split(sep)[0].strip()
+        is_header = need_header or (Chem.MolFromSmiles(first_cell) is None)
         _rdlog.setLevel(RDLogger.WARNING)
 
         if is_header:
-            smiles_names = {"smiles", "smi", "canonical_smiles", "smiles_string"}
-            for i, col in enumerate(header):
-                if col.lower() in smiles_names:
-                    smi_col_idx = i
-                    break
-            id_names = {id_col.lower(), "name", "id", "compound_id", "molecule_name"}
-            id_col_idx = None
-            for i, col in enumerate(header):
-                if i != smi_col_idx and col.lower() in id_names:
-                    id_col_idx = i
-                    break
+            col_names = [c.strip() for c in lines[0].split(sep)]
             data_lines = lines[1:]
         else:
+            col_names = []
             data_lines = lines
 
-        # Apply --smiles-col override (name or 0-based index)
-        if args.smiles_col is not None:
-            sc = args.smiles_col
-            if sc.isdigit():
-                smi_col_idx = int(sc)
-            elif is_header:
-                col_lower = [c.lower() for c in header]
-                if sc.lower() in col_lower:
-                    smi_col_idx = col_lower.index(sc.lower())
-                else:
-                    print(f"ERROR: --smiles-col '{sc}' not found in header: {header}")
-                    return
+        # ── Resolve SMILES column ─────────────────────────────────────────────
+        if smiles_col_spec is None:
+            if col_names:
+                _smiles_names = {"smiles", "smi", "canonical_smiles", "smiles_string"}
+                smi_col_idx = next((i for i, c in enumerate(col_names)
+                                    if c.lower() in _smiles_names), 0)
             else:
-                print(f"ERROR: --smiles-col '{sc}' is not a valid index and file has no header row.")
+                smi_col_idx = 0
+        elif isinstance(smiles_col_spec, int):
+            smi_col_idx = smiles_col_spec
+        else:
+            if smiles_col_spec not in col_names:
+                print(f"ERROR: --smiles-col '{smiles_col_spec}' not found in header: {col_names}",
+                      file=sys.stderr)
                 return
+            smi_col_idx = col_names.index(smiles_col_spec)
 
-        smi_label = header[smi_col_idx] if is_header else str(smi_col_idx)
-        id_label = header[id_col_idx] if (is_header and id_col_idx is not None) else str(id_col_idx) if id_col_idx is not None else "none"
-        if is_header or args.smiles_col is not None:
-            print(f"[INFO] SMILES col: '{smi_label}', ID col: '{id_label}'")
+        # ── Resolve ID column ─────────────────────────────────────────────────
+        if id_col_spec is None:
+            if col_names:
+                _id_names = {"name", "id", "compound_id", "molecule_name", "structure id"}
+                id_col_idx = next((i for i, c in enumerate(col_names)
+                                   if i != smi_col_idx and c.lower() in _id_names), None)
+                if id_col_idx is None:
+                    id_col_idx = next((i for i in range(len(col_names)) if i != smi_col_idx), None)
+            else:
+                id_col_idx = next((i for i in range(2) if i != smi_col_idx), None)
+        elif isinstance(id_col_spec, int):
+            id_col_idx = id_col_spec
+        else:
+            if id_col_spec not in col_names:
+                print(f"ERROR: --id-col '{id_col_spec}' not found in header: {col_names}",
+                      file=sys.stderr)
+                return
+            id_col_idx = col_names.index(id_col_spec)
+
+        # ── Determine SDF property name for the molecule ID ───────────────────
+        if col_names and id_col_idx is not None and id_col_idx < len(col_names):
+            id_col = col_names[id_col_idx]
+        elif isinstance(id_col_spec, str):
+            id_col = id_col_spec
+        # else: id_col keeps its current value ('Structure ID' placeholder)
+
+        smi_label = col_names[smi_col_idx] if col_names and smi_col_idx < len(col_names) else str(smi_col_idx + 1)
+        id_label  = col_names[id_col_idx]  if col_names and id_col_idx is not None and id_col_idx < len(col_names) else (str(id_col_idx + 1) if id_col_idx is not None else 'none')
+        print(f"[INFO] SMILES col: '{smi_label}', ID col: '{id_label}'")
 
         def _smi_mol_iter():
             for line in data_lines:
@@ -791,14 +852,20 @@ def main():
                 if smi_col_idx >= len(parts):
                     continue
                 smi = parts[smi_col_idx]
-                name = parts[id_col_idx] if id_col_idx is not None and id_col_idx < len(parts) else None
                 mol = Chem.MolFromSmiles(smi)
                 if mol:
-                    if name:
-                        mol.SetProp(id_col, name)
+                    # Set ID property
+                    if id_col_idx is not None and id_col_idx < len(parts):
+                        mol.SetProp(id_col, parts[id_col_idx])
+                    # Preserve all other columns as mol properties
+                    for i, val in enumerate(parts):
+                        if i == smi_col_idx or i == id_col_idx:
+                            continue
+                        prop_name = col_names[i] if i < len(col_names) else f'col_{i + 1}'
+                        mol.SetProp(prop_name, val)
                     yield mol
                 else:
-                    print(f"SMILES parse error for line: {line}")
+                    print(f"[WARNING] SMILES parse error, skipping: {line}")
 
         mol_iter = _smi_mol_iter()
 
@@ -822,11 +889,13 @@ def main():
     input_count = 0
     for mol in mol_iter:
         input_count += 1
+        # Capture name and all properties BEFORE salt stripping — GetMolFrags
+        # creates new mol objects that do not inherit string properties.
+        base_name = mol.GetProp(id_col) if mol.HasProp(id_col) else ""
+        props = {p: mol.GetProp(p) for p in mol.GetPropNames()}
         mol = strip_salts_keep_largest(mol)
         if mol is None:
             continue
-        base_name = mol.GetProp(id_col) if mol.HasProp(id_col) else ""
-        props = {p: mol.GetProp(p) for p in mol.GetPropNames()}
         isomers = enumerate_stereoisomers(mol, max_isomers) if enumerate_stereo else [mol]
         for idx, isomer in enumerate(isomers):
             if len(isomers) > 1 and base_name:
