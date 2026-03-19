@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 """
-Molecule Preparation Script for Docking
+Molecule Preparation Script
 
-This script takes molecules as input from either an SDF or a SMILES file and prepares them for docking by:
+This script takes molecules as input from either an SDF or a SMILES file and prepares them for structure-based workflows by:
 - Stripping salts and keeping the largest fragment
 - Enumerating stereoisomers for unspecified chiral centers (optional)
 - Protonating molecules at pH 7.4 using OpenBabel
@@ -547,11 +547,11 @@ def format_time(seconds):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Prepare molecules for docking from SDF or SMILES files.",
+        description="Prepare molecules from SDF or SMILES files for structure-based workflows.",
         formatter_class=_HelpFmt,
         epilog="""
 Examples:
-  # Single conformer — lowest-energy only (default, e.g. docking):
+  # Single conformer — lowest-energy only (default):
   %(prog)s -i molecules.sdf -o prepared.sdf
   %(prog)s -i molecules.sdf -o prepared.sdf --mode single
   %(prog)s -i molecules.sdf -o prepared.sdf --mode single --num-confs 10
@@ -593,7 +593,7 @@ Examples:
         choices=["single", "multi"],
         default="single",
         help="Preparation mode (default: single). "
-             "'single': 10 conformers generated, lowest-energy one kept — for docking and similar programs. "
+             "'single': 10 conformers generated, lowest-energy one kept. "
              "'multi': 50 conformers generated, diverse low-energy set kept — for pharmacophore databases etc. "
              "All conformer settings (--num-confs, --keep-confs, --energy-window, --rmsd-threshold) "
              "can be overridden individually regardless of mode."
