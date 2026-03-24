@@ -18,7 +18,8 @@ Installation:
   1. Plugin > Plugin Manager > Install New Plugin > choose this file, or
   2. run /path/to/contact_inspector.py   then   ci_gui
 
-Author:  Built with Claude (Anthropic)
+Authors: Evert J. Homan, PhD; Claude (Anthropic)
+Version: 1.0 (2026-03-24)
 License: MIT
 """
 
