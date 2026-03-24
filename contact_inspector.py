@@ -1,13 +1,3 @@
-from __future__ import annotations
-
-'''
-Description: Maestro-inspired protein-ligand interaction viewer.
-Authors:     Evert J. Homan, PhD; Claude (Anthropic)
-Date:        2026-03-24
-Version:     1.0
-License:     MIT
-'''
-
 """
 Contact Inspector - PyMOL Plugin
 ================================
@@ -29,9 +19,12 @@ Installation:
   2. run /path/to/contact_inspector.py   then   ci_gui
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
-Version: 1.0 (2026-03-24)
+Date:    2026-03-24
+Version: 1.0
 License: MIT
 """
+
+from __future__ import annotations
 
 import math
 from collections import defaultdict
