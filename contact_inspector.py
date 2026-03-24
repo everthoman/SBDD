@@ -1,3 +1,11 @@
+'''
+Description: Maestro-inspired protein-ligand interaction viewer.
+Authors:     Evert J. Homan, PhD; Claude (Anthropic)
+Date:        2026-03-24
+Version:     1.0
+License:     MIT
+'''
+
 """
 Contact Inspector - PyMOL Plugin
 ================================
