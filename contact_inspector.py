@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 '''
 Description: Maestro-inspired protein-ligand interaction viewer.
 Authors:     Evert J. Homan, PhD; Claude (Anthropic)
@@ -30,8 +32,6 @@ Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Version: 1.0 (2026-03-24)
 License: MIT
 """
-
-from __future__ import annotations
 
 import math
 from collections import defaultdict
