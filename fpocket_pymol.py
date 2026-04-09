@@ -76,7 +76,11 @@ def run_pymol_script(out_dir, base_name):
     if os.path.isfile(full_path):
         print(f"Launching PyMOL visualization with {full_path} ...")
         os.chmod(full_path, 0o755)
-        subprocess.run(['bash', pymol_script], check=True, cwd=out_dir)
+        # Run pymol via its own conda env to avoid Qt version conflicts
+        subprocess.run(
+            ['conda', 'run', '-n', 'pymol', 'bash', pymol_script],
+            check=True, cwd=out_dir
+        )
     else:
         print(f"PyMOL script not found: {full_path}")
 
