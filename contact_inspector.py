@@ -321,9 +321,13 @@ def detect_interactions(
     search = max(HALOGEN_DIST_MAX, SALT_BRIDGE_DIST_MAX,
                  PI_CATION_DIST_MAX, PIPI_ETF_DIST_MAX) + 2.0
 
+    _TMP = "_ci_tmp"
     lig_model = cmd.get_model(lig_sel, state=state)
-    prot_model = cmd.get_model(
-        f"{prot_sel} within {search} of ({lig_sel})", state=state)
+    # cmd.select evaluates proximity at the current global state (ligand pose),
+    # then cmd.get_model extracts protein coords at state=1 (protein is single-state).
+    cmd.select(_TMP, f"({prot_sel}) within {search} of ({lig_sel})")
+    prot_model = cmd.get_model(_TMP, state=1)
+    cmd.delete(_TMP)
     if not lig_model.atom or not prot_model.atom:
         return result
 
@@ -362,27 +366,24 @@ def detect_interactions(
                         "p1": lc, "p2": pc, "dist": d,
                         "info1": _il(la), "info2": _ip(pa)})
 
-            if do_any_clash and le != "H" and pe != "H":
+            if do_any_clash:
                 vdw = VDW_RADII.get(le, 1.70) + VDW_RADII.get(pe, 1.70)
                 max_d = vdw * CLASH_GOOD_FRAC
                 if d <= max_d:
                     frac = d / vdw if vdw > 0 else 1.0
-                    # Skip polar pairs for bad/ugly (those are H-bonds)
-                    # but allow them for good contacts
-                    polar = (le in HBOND_ELEMENTS and pe in HBOND_ELEMENTS)
                     if frac < CLASH_UGLY_FRAC:
-                        if do_clash_ugly and not polar:
+                        if do_clash_ugly:
                             result.clash_ugly.append({
                                 "p1": lc, "p2": pc, "dist": d, "vdw": vdw,
                                 "quality": "ugly",
                                 "info1": _il(la), "info2": _ip(pa)})
                     elif frac < CLASH_BAD_FRAC:
-                        if do_clash_bad and not polar:
+                        if do_clash_bad:
                             result.clash_bad.append({
                                 "p1": lc, "p2": pc, "dist": d, "vdw": vdw,
                                 "quality": "bad",
                                 "info1": _il(la), "info2": _ip(pa)})
-                    elif frac < CLASH_GOOD_FRAC:
+                    elif le != "H" and pe != "H":
                         if do_clash_good:
                             result.clash_good.append({
                                 "p1": lc, "p2": pc, "dist": d, "vdw": vdw,
@@ -407,7 +408,9 @@ def detect_interactions(
         try:
             prs = (f"({prot_sel} within {PI_CATION_DIST_MAX+3} of ({lig_sel}))"
                    f" and (resn PHE+TYR+TRP+HIS+HIE+HID+HIP)")
-            _prm = cmd.get_model(prs, state=state)
+            cmd.select(_TMP, prs)
+            _prm = cmd.get_model(_TMP, state=1)
+            cmd.delete(_TMP)
             prot_rings_info, _prm_adj = _get_rings_info(_prm)
         except Exception:
             pass
@@ -477,7 +480,9 @@ def detect_interactions(
         pcs = (f"({prot_sel} within {PI_CATION_DIST_MAX+1} of ({lig_sel}))"
                f" and ((resn ARG and name CZ) or (resn LYS and name NZ))")
         try:
-            pcm = cmd.get_model(pcs, state=state)
+            cmd.select(_TMP, pcs)
+            pcm = cmd.get_model(_TMP, state=1)
+            cmd.delete(_TMP)
             for pa in pcm.atom:
                 pac = tuple(pa.coord)
                 for _, lrc, _ in lig_rings_info:
@@ -693,6 +698,7 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
 
     # Rainbow C atoms + element colors for heteroatoms (matching protein)
     _color_rainbow_elem(_OBJ_SHELL)
+    cmd.label(f"{_OBJ_SHELL} and name CA", '"%s %s" % (resn, resi)')
 
     # Transparent light-grey surface on the ATOM-BASED 5 Å shell (no byres expansion)
     if _OBJ_SURF in _created_objects:
@@ -711,9 +717,6 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
     except Exception:
         pass
 
-    # Label CA atoms with residue name + number
-    cmd.label(f"{_OBJ_SHELL} and name CA",
-              '"%s %s" % (resn, resi)')
 
 
 # ---------------------------------------------------------------------------
@@ -755,8 +758,19 @@ class LigandStepper:
         self.state_object = obj
         self.current_index = 0
         self.mode = "states"
-        _prepare_scene(prot, obj)
-        _create_shell(prot, obj)
+        extras = []
+        for n in cmd.get_names("objects"):
+            if n == obj:
+                continue
+            try:
+                if (cmd.count_atoms(f"{n} and organic") > 0 and
+                        cmd.count_atoms(f"{n} and ({prot})") == 0):
+                    extras.append(n)
+            except Exception:
+                pass
+        all_ligs = [obj] + extras if extras else obj
+        _prepare_scene(prot, all_ligs)
+        _create_shell(prot, all_ligs)
         self._show_current()
 
     def _count(self):
@@ -802,7 +816,7 @@ class LigandStepper:
                 self._update(cur)
         else:
             st = self.current_index + 1
-            cmd.set("state", st, self.state_object)
+            cmd.set("state", st)
             cmd.zoom(f"({self.protein_sel}) within 8 of "
                      f"({self.state_object})", buffer=3.0, animate=1)
             self._update(self.state_object, state=st)
@@ -913,6 +927,16 @@ EXAMPLES
             mode = "states"
         else:
             mode = "objects"
+            for n in names:
+                try:
+                    if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
+                            cmd.count_atoms(f"{n} and ({protein})") == 0 and
+                            cmd.count_states(n) > 1):
+                        mode = "states"
+                        ligands = n
+                        break
+                except CmdException:
+                    pass
 
     if mode == "states":
         _stepper.setup_states(protein, ligands)
@@ -1091,20 +1115,16 @@ def _open_gui():
     cb_cu = _cb(l3, "Ugly",  "#ff2626", checked=False)
     root.addWidget(g3)
 
-    # Labels
+    # Display options
     cb_lb = QtWidgets.QCheckBox("Show distance labels")
     cb_lb.setChecked(True)
     root.addWidget(cb_lb)
-
-    # Summary
-    g_sum = QtWidgets.QGroupBox("Summary")
-    l_sum = QtWidgets.QVBoxLayout(g_sum)
-    t_sum = QtWidgets.QTextEdit()
-    t_sum.setReadOnly(True)
-    t_sum.setFont(QtGui.QFont("Courier", 9))
-    t_sum.setMaximumHeight(180)
-    l_sum.addWidget(t_sum)
-    root.addWidget(g_sum, stretch=1)
+    cb_surf = QtWidgets.QCheckBox("Show surface")
+    cb_surf.setChecked(True)
+    root.addWidget(cb_surf)
+    cb_rlbl = QtWidgets.QCheckBox("Show residue labels")
+    cb_rlbl.setChecked(True)
+    root.addWidget(cb_rlbl)
 
     # Callbacks
     def refresh():
@@ -1115,7 +1135,6 @@ def _open_gui():
             sp.setMaximum(c - 1)
         else:
             lbl.setText("Ready - click Setup")
-        t_sum.setPlainText(_stepper.summary())
 
     def do_setup():
         mode = next(m for m, rb in rb_m.items() if rb.isChecked())
@@ -1124,7 +1143,7 @@ def _open_gui():
 
     def do_clear():
         ci_clear()
-        lbl.setText("Ready - click Setup"); t_sum.clear()
+        lbl.setText("Ready - click Setup")
 
     def do_prev():
         ci_prev(); refresh()
@@ -1157,6 +1176,22 @@ def _open_gui():
     cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad"))
     cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly"))
     cb_lb.stateChanged.connect(_tog(cb_lb, "show_labels"))
+
+    def do_toggle_surf(state):
+        if _OBJ_SURF in _created_objects:
+            if cb_surf.isChecked():
+                cmd.show("surface", _OBJ_SURF)
+            else:
+                cmd.hide("surface", _OBJ_SURF)
+    cb_surf.stateChanged.connect(do_toggle_surf)
+
+    def do_toggle_rlbl(state):
+        if _OBJ_SHELL in _created_objects:
+            if cb_rlbl.isChecked():
+                cmd.show("labels", _OBJ_SHELL)
+            else:
+                cmd.hide("labels", _OBJ_SHELL)
+    cb_rlbl.stateChanged.connect(do_toggle_rlbl)
 
     for key, fn in [(QtCore.Qt.Key_Right, do_next),
                     (QtCore.Qt.Key_Left, do_prev)]:
