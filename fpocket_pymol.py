@@ -70,19 +70,50 @@ def sort_pockets(df):
     return df
 
 
-def run_pymol_script(out_dir, base_name):
-    pymol_script = f"{base_name}_PYMOL.sh"
-    full_path = os.path.join(out_dir, pymol_script)
-    if os.path.isfile(full_path):
-        print(f"Launching PyMOL visualization with {full_path} ...")
-        os.chmod(full_path, 0o755)
-        # Run pymol via its own conda env to avoid Qt version conflicts
+def write_viz_pml(out_dir, pockets_df):
+    lines = [
+        "# Protein: cartoon + rainbow carbons + element colours for heteroatoms",
+        "show cartoon, polymer",
+        "util.cbaw polymer",
+        "spectrum resi, rainbow, (polymer and elem C)",
+        "",
+        "# Residues within 5 Å of any pocket sphere (resn STP = fpocket alpha spheres)",
+        "select pocket_residues, byres (polymer within 5.0 of resn STP)",
+        "show lines, pocket_residues",
+        'label (pocket_residues and name CA), "%s%s" % (resn, resi)',
+        "",
+    ]
+    pocket_names = ' '.join(
+        f"pocket{int(''.join(filter(str.isdigit, str(row['Name']))))}"
+        for _, row in pockets_df.iterrows()
+    )
+    lines += [f"order {pocket_names}, sort=0", "", "deselect"]
+
+    path = os.path.join(out_dir, "viz.pml")
+    with open(path, 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return "viz.pml"
+
+
+def run_pymol_script(out_dir, base_name, pockets_df):
+    pml_file = f"{base_name}.pml"
+    pml_path = os.path.join(out_dir, pml_file)
+    if os.path.isfile(pml_path):
+        abs_out_dir = os.path.abspath(out_dir)
+        viz_file = write_viz_pml(out_dir, pockets_df)
+        print(f"Launching PyMOL: {pml_path} ...")
+        env = os.environ.copy()
+        env.update({
+            'LIBGL_ALWAYS_INDIRECT': '0',
+            'GALLIUM_DRIVER': 'd3d12',
+            'MESA_D3D12_DEFAULT_ADAPTER_NAME': 'NVIDIA',
+        })
         subprocess.run(
-            ['conda', 'run', '-n', 'pymol', 'bash', pymol_script],
-            check=True, cwd=out_dir
+            ['pymol', pml_file, viz_file],
+            check=True, cwd=abs_out_dir, env=env,
         )
     else:
-        print(f"PyMOL script not found: {full_path}")
+        print(f"PyMOL script not found: {pml_path}")
 
 
 def parse_args():
@@ -161,7 +192,7 @@ def main():
     print(pockets_df)
 
     if not args.no_pymol:
-        run_pymol_script(out_dir, base_name)
+        run_pymol_script(out_dir, base_name, pockets_df)
 
 
 if __name__ == "__main__":
