@@ -1344,7 +1344,7 @@ def step_flip_rotamers(
 
 
 def step_minimize(protein_pdb: Path, output_pdb: Path, ph: float,
-                  max_iter: int = 1000, restraint_k: float = 1000.0,
+                  max_iter: int = 1000, restraint_k: float = 10000.0,
                   restrain_sidechains: bool = False,
                   hetatm_heavy: Optional[List[dict]] = None,
                   has_hydrogens: bool = False) -> bool:
@@ -1659,9 +1659,9 @@ Examples:
     mini.add_argument('--max-iter', type=int, default=1000, metavar='N',
                       help='Maximum minimization iterations (default: 1000). '
                            'Use 0 to run until convergence (may be slow).')
-    mini.add_argument('--restraint-k', type=float, default=1000.0, metavar='FLOAT',
+    mini.add_argument('--restraint-k', type=float, default=10000.0, metavar='FLOAT',
                       help='Positional restraint strength in kJ/mol/nm² '
-                           '(default: 1000). Higher = less movement allowed.')
+                           '(default: 10000 ≈ 24 kcal/mol/Å²). Higher = less movement allowed.')
     mini.add_argument('--relax-sidechains', action='store_true',
                       help='Only restrain backbone atoms (N,CA,C,O) during '
                            'minimization, letting sidechains relax freely. '
