@@ -166,6 +166,22 @@ def _angle_normals(n1, n2):
 # Ring detection
 # ---------------------------------------------------------------------------
 
+def _nonpolar_h_indices(model):
+    """Return indices of H atoms bonded only to C (nonpolar H, excluded from clash detection)."""
+    adj = defaultdict(set)
+    for bond in model.bond:
+        i, j = bond.index
+        adj[i].add(j); adj[j].add(i)
+    nonpolar = set()
+    for i, a in enumerate(model.atom):
+        if a.symbol.strip().capitalize() != "H":
+            continue
+        if not any(model.atom[nb].symbol.strip().capitalize() in {"N", "O", "S", "F"}
+                   for nb in adj[i]):
+            nonpolar.add(i)
+    return nonpolar
+
+
 def _ring_planarity_rmsd(coords):
     """Compute RMSD of ring atoms from their best-fit plane.
     Aromatic rings: < 0.1 A.  Cyclohexyl chair: ~ 0.5 A."""
@@ -331,19 +347,24 @@ def detect_interactions(
     if not lig_model.atom or not prot_model.atom:
         return result
 
-    lig_atoms = [(a, tuple(a.coord)) for a in lig_model.atom]
-    prot_atoms = [(a, tuple(a.coord)) for a in prot_model.atom]
+    lig_atoms = [(i, a, tuple(a.coord)) for i, a in enumerate(lig_model.atom)]
+    prot_atoms = [(i, a, tuple(a.coord)) for i, a in enumerate(prot_model.atom)]
 
     do_any_clash = do_clash_good or do_clash_bad or do_clash_ugly
+    if do_any_clash:
+        lig_nonpolar_h = _nonpolar_h_indices(lig_model)
+        prot_nonpolar_h = _nonpolar_h_indices(prot_model)
+    else:
+        lig_nonpolar_h = prot_nonpolar_h = set()
 
     def _el(a): return a.symbol.strip().capitalize()
     def _il(a): return f"{a.resn} {a.name}"
     def _ip(a): return f"{a.chain}/{a.resn}{a.resi}.{a.name}"
 
     # --- Pairwise ---
-    for la, lc in lig_atoms:
+    for li, la, lc in lig_atoms:
         le = _el(la)
-        for pa, pc in prot_atoms:
+        for pi, pa, pc in prot_atoms:
             pe = _el(pa)
             d = _dist(lc, pc)
 
@@ -366,7 +387,9 @@ def detect_interactions(
                         "p1": lc, "p2": pc, "dist": d,
                         "info1": _il(la), "info2": _ip(pa)})
 
-            if do_any_clash:
+            if (do_any_clash
+                    and li not in lig_nonpolar_h
+                    and pi not in prot_nonpolar_h):
                 vdw = VDW_RADII.get(le, 1.70) + VDW_RADII.get(pe, 1.70)
                 max_d = vdw * CLASH_GOOD_FRAC
                 if d <= max_d:
@@ -439,7 +462,7 @@ def detect_interactions(
             lig_ring_indices = [r for r, _, _ in lig_rings_info]
             lig_ch = _get_aromatic_ch_atoms(_lm, lig_ring_indices, _lm_adj)
             for ca, cc, hc in lig_ch:
-                for pa, pc in prot_atoms:
+                for _pi, pa, pc in prot_atoms:
                     if _el(pa) not in AROM_HBOND_ACCEPTORS:
                         continue
                     d = _dist(cc, pc)
@@ -459,7 +482,7 @@ def detect_interactions(
             prot_ring_indices = [r for r, _, _ in prot_rings_info]
             prot_ch = _get_aromatic_ch_atoms(_prm, prot_ring_indices, _prm_adj)
             for ca, cc, hc in prot_ch:
-                for la, lc in lig_atoms:
+                for _li, la, lc in lig_atoms:
                     if _el(la) not in AROM_HBOND_ACCEPTORS:
                         continue
                     d = _dist(cc, lc)
@@ -494,7 +517,7 @@ def detect_interactions(
         except Exception:
             pass
         if _prm:
-            for la, lc in lig_atoms:
+            for _li, la, lc in lig_atoms:
                 if la.formal_charge > 0:
                     for pri, prc, _ in prot_rings_info:
                         d = _dist(lc, prc)

@@ -63,6 +63,12 @@ def parse_pocket_info(base_name, out_dir):
     return pd.DataFrame(pocket_data)
 
 
+PYMOL_COLORS = [
+    "blue", "green", "yellow", "magenta", "cyan",
+    "salmon", "lime", "slate", "orange", "purple",
+]
+
+
 def sort_pockets(df):
     for col in ['Drug Score', 'Druggability Score', 'Score']:
         if col in df.columns:
@@ -180,13 +186,13 @@ def main():
 
     pockets_df = sort_pockets(pockets_df)
 
-    if args.top_n is not None:
-        pockets_df = pockets_df.head(args.top_n)
-        print(f"Showing top {args.top_n} pockets by druggability score.")
-
     csv_out = os.path.join(out_dir, "pockets.csv")
     pockets_df.to_csv(csv_out, index=False)
     print(f"Pocket data saved to {csv_out}")
+
+    if args.top_n is not None:
+        pockets_df = pockets_df.head(args.top_n)
+        print(f"Showing top {args.top_n} pockets by druggability score.")
 
     print("Pocket summary:")
     print(pockets_df)
