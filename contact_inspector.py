@@ -76,7 +76,7 @@ HALOGEN_DONORS = {"Cl", "Br", "I"}
 HALOGEN_ACCEPTORS = {"O", "N", "S"}
 HALOGEN_DIST_MAX = 3.5
 
-AROM_HBOND_DIST_MAX = 3.8
+AROM_HBOND_DIST_MAX = 3.5
 AROM_HBOND_ACCEPTORS = {"O", "N", "S"}
 
 SALT_BRIDGE_DIST_MAX = 4.0
@@ -105,10 +105,10 @@ LABEL_SIZE = 14
 # ---------------------------------------------------------------------------
 
 _created_objects: Set[str] = set()
+_shell_sel: Optional[str] = None   # selection used for lines/labels (no copy object)
 
-_OBJ_PTS = "_ci_pts"
-_OBJ_SHELL = "shell"
-_OBJ_SURF  = "_ci_surf"
+_OBJ_PTS  = "_ci_pts"
+_OBJ_SURF = "_ci_surf"
 
 _INTERACTION_NAMES = {
     "hbonds": "hbonds",
@@ -125,7 +125,22 @@ _INTERACTION_NAMES = {
 def _track(name):
     _created_objects.add(name)
 
+def _clear_shell():
+    global _shell_sel
+    if _shell_sel is not None:
+        try:
+            cmd.hide("lines",  _shell_sel)
+            cmd.hide("labels", f"({_shell_sel}) and name CA")
+        except Exception:
+            pass
+        _shell_sel = None
+    if _OBJ_SURF in _created_objects:
+        try: cmd.delete(_OBJ_SURF)
+        except Exception: pass
+        _created_objects.discard(_OBJ_SURF)
+
 def _clear_all():
+    _clear_shell()
     for name in list(_created_objects):
         try: cmd.delete(name)
         except Exception: pass
@@ -474,8 +489,8 @@ def detect_interactions(
                             min(1.0, max(-1.0, dot))))
                         if angle > 120.0:
                             result.arom_hbonds.append({
-                                "p1": hc, "p2": pc, "dist": _dist(hc, pc),
-                                "info1": f"{ca.resn} {ca.name}-H",
+                                "p1": cc, "p2": pc, "dist": d,
+                                "info1": f"{ca.resn} {ca.name}",
                                 "info2": _ip(pa)})
 
         if _prm and _prm_adj and prot_rings_info:
@@ -494,8 +509,8 @@ def detect_interactions(
                             min(1.0, max(-1.0, dot))))
                         if angle > 120.0:
                             result.arom_hbonds.append({
-                                "p1": hc, "p2": lc, "dist": _dist(hc, lc),
-                                "info1": f"{ca.chain}/{ca.resn}{ca.resi}.{ca.name}-H",
+                                "p1": cc, "p2": lc, "dist": d,
+                                "info1": f"{ca.chain}/{ca.resn}{ca.resi}.{ca.name}",
                                 "info2": _il(la)})
 
     # Pi-cation
@@ -536,7 +551,7 @@ def detect_interactions(
 # ---------------------------------------------------------------------------
 
 def _clear_contacts():
-    keep = {_OBJ_SHELL, _OBJ_SURF}
+    keep = {_OBJ_SURF}
     for name in list(_created_objects):
         if name not in keep:
             try: cmd.delete(name)
@@ -700,35 +715,22 @@ def _lig_union(ligand_sels):
 # ---------------------------------------------------------------------------
 
 def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
+    global _shell_sel
     lig_union = _lig_union(ligand_sels)
 
-    if _OBJ_SHELL in _created_objects:
-        try: cmd.delete(_OBJ_SHELL)
-        except Exception: pass
-        _created_objects.discard(_OBJ_SHELL)
+    _clear_shell()
 
-    shell_sel = f"byres (({protein_sel}) within {dist} of ({lig_union}))"
-
+    sel = f"byres (({protein_sel}) within {dist} of ({lig_union}))"
     try:
-        cmd.create(_OBJ_SHELL, shell_sel)
-    except CmdException:
+        cmd.show("lines", sel)
+        cmd.hide("lines", f"({sel}) and elem H and not (neighbor (elem N+O+S))")
+        cmd.label(f"({sel}) and name CA", '"%s %s" % (resn, resi)')
+        _shell_sel = sel
+    except Exception as e:
+        print(f"Contact Inspector: shell setup warning: {e}")
         return
-    _track(_OBJ_SHELL)
 
-    cmd.hide("everything", _OBJ_SHELL)
-    cmd.show("lines", _OBJ_SHELL)
-    cmd.remove(f"{_OBJ_SHELL} and elem H and not (neighbor (elem N+O+S))")
-
-    # Rainbow C atoms + element colors for heteroatoms (matching protein)
-    _color_rainbow_elem(_OBJ_SHELL)
-    cmd.label(f"{_OBJ_SHELL} and name CA", '"%s %s" % (resn, resi)')
-
-    # Transparent light-grey surface on the ATOM-BASED 5 Å shell (no byres expansion)
-    if _OBJ_SURF in _created_objects:
-        try: cmd.delete(_OBJ_SURF)
-        except Exception: pass
-        _created_objects.discard(_OBJ_SURF)
-
+    # Transparent surface on the atom-based shell (no byres expansion)
     atom_surf_sel = f"({protein_sel}) within {dist} of ({lig_union})"
     try:
         cmd.create(_OBJ_SURF, atom_surf_sel)
@@ -1116,6 +1118,7 @@ def _open_gui():
 
     # Non-covalent bonds
     g1 = QtWidgets.QGroupBox("Non-covalent bonds")
+    g1.setCheckable(True); g1.setChecked(True)
     l1 = QtWidgets.QVBoxLayout(g1)
     cb_hb = _cb(l1, "Hydrogen bonds",  "#ffd900")
     cb_xb = _cb(l1, "Halogen bonds",   "#9933e6")
@@ -1125,6 +1128,7 @@ def _open_gui():
 
     # Pi interactions
     g2 = QtWidgets.QGroupBox("Pi interactions")
+    g2.setCheckable(True); g2.setChecked(True)
     l2 = QtWidgets.QVBoxLayout(g2)
     cb_pp = _cb(l2, "Pi-pi stacking",  "#4dc0ff")
     cb_pc = _cb(l2, "Pi-cation",       "#33cc33")
@@ -1132,10 +1136,11 @@ def _open_gui():
 
     # Contacts / clashes (off by default)
     g3 = QtWidgets.QGroupBox("Contacts / Clashes")
+    g3.setCheckable(True); g3.setChecked(False)
     l3 = QtWidgets.QVBoxLayout(g3)
-    cb_cg = _cb(l3, "Good",  "#33cc33", checked=False)
-    cb_cb = _cb(l3, "Bad",   "#ff9900", checked=False)
-    cb_cu = _cb(l3, "Ugly",  "#ff2626", checked=False)
+    cb_cg = _cb(l3, "Good",  "#33cc33", checked=True)
+    cb_cb = _cb(l3, "Bad",   "#ff9900", checked=True)
+    cb_cu = _cb(l3, "Ugly",  "#ff2626", checked=True)
     root.addWidget(g3)
 
     # Display options
@@ -1177,9 +1182,16 @@ def _open_gui():
     def do_go():
         ci_goto(sp.value()); refresh()
 
-    def _tog(cb, attr):
+    def _tog(cb, attr, group):
         def h(state):
-            setattr(_stepper, attr, cb.isChecked())
+            setattr(_stepper, attr, group.isChecked() and cb.isChecked())
+            ci_update(); refresh()
+        return h
+
+    def _group_tog(group, cb_attr_pairs):
+        def h(checked):
+            for cb, attr in cb_attr_pairs:
+                setattr(_stepper, attr, checked and cb.isChecked())
             ci_update(); refresh()
         return h
 
@@ -1189,16 +1201,27 @@ def _open_gui():
     b_next.clicked.connect(do_next)
     b_go.clicked.connect(do_go)
 
-    cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds"))
-    cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen"))
-    cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt"))
-    cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb"))
-    cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi"))
-    cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation"))
-    cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good"))
-    cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad"))
-    cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly"))
-    cb_lb.stateChanged.connect(_tog(cb_lb, "show_labels"))
+    cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds",     g1))
+    cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen",    g1))
+    cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt",       g1))
+    cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb",    g1))
+    cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi",       g2))
+    cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation",  g2))
+    cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good", g3))
+    cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad",  g3))
+    cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly", g3))
+    cb_lb.stateChanged.connect(lambda s: [setattr(_stepper, "show_labels", cb_lb.isChecked()), ci_update(), refresh()])
+
+    g1.toggled.connect(_group_tog(g1, [
+        (cb_hb, "show_hbonds"), (cb_xb, "show_halogen"),
+        (cb_sb, "show_salt"),   (cb_ah, "show_arom_hb"),
+    ]))
+    g2.toggled.connect(_group_tog(g2, [
+        (cb_pp, "show_pipi"), (cb_pc, "show_pi_cation"),
+    ]))
+    g3.toggled.connect(_group_tog(g3, [
+        (cb_cg, "show_clash_good"), (cb_cb, "show_clash_bad"), (cb_cu, "show_clash_ugly"),
+    ]))
 
     def do_toggle_surf(state):
         if _OBJ_SURF in _created_objects:
@@ -1209,11 +1232,12 @@ def _open_gui():
     cb_surf.stateChanged.connect(do_toggle_surf)
 
     def do_toggle_rlbl(state):
-        if _OBJ_SHELL in _created_objects:
+        if _shell_sel is not None:
+            sel = f"({_shell_sel}) and name CA"
             if cb_rlbl.isChecked():
-                cmd.show("labels", _OBJ_SHELL)
+                cmd.show("labels", sel)
             else:
-                cmd.hide("labels", _OBJ_SHELL)
+                cmd.hide("labels", sel)
     cb_rlbl.stateChanged.connect(do_toggle_rlbl)
 
     for key, fn in [(QtCore.Qt.Key_Right, do_next),
