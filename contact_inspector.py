@@ -767,6 +767,8 @@ class LigandStepper:
         self.show_clash_bad = False
         self.show_clash_ugly = False
         self.show_labels = True
+        self.last_properties: dict = {}
+        self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
 
     def setup_objects(self, prot, ligs):
         self.protein_sel = prot
@@ -826,6 +828,21 @@ class LigandStepper:
             self.current_index = i
             self._show_current()
 
+    def refresh(self):
+        """Re-detect interactions for the current PyMOL state without changing it.
+
+        In states mode this syncs current_index from cmd.get_state() so that
+        manual slider movement is reflected in the panel.
+        """
+        if self.mode == "states" and self.state_object:
+            st = cmd.get_state()          # 1-based; follows the slider
+            self.current_index = max(0, st - 1)
+            cmd.zoom(f"({self.protein_sel}) within 8 of "
+                     f"({self.state_object})", buffer=3.0, animate=1)
+            self._update(self.state_object, state=st)
+        elif self.mode == "objects" and self.ligand_objects:
+            self._show_current()
+
     def _show_current(self):
         if self.mode == "objects":
             obj_names = set(cmd.get_names("objects"))
@@ -858,6 +875,14 @@ class LigandStepper:
                 do_clash_bad=self.show_clash_bad,
                 do_clash_ugly=self.show_clash_ugly)
             self.last_result = r
+            if self.sdf_records:
+                idx = (state - 1) if state > 0 else self.current_index
+                self.last_properties = (self.sdf_records[idx]
+                                        if 0 <= idx < len(self.sdf_records)
+                                        else {})
+            else:
+                prop_state = state if state > 0 else 1
+                self.last_properties = _get_pose_properties(lig, prop_state)
             visualize(lig, self.protein_sel, r,
                       show_hbonds=self.show_hbonds,
                       show_labels=self.show_labels, state=state)
@@ -910,6 +935,63 @@ class LigandStepper:
 
 
 _stepper = LigandStepper()
+
+
+# ---------------------------------------------------------------------------
+# Pose property helpers
+# ---------------------------------------------------------------------------
+
+def _parse_sdf_records(path: str) -> list:
+    """Parse an SDF file and return a list of property dicts (one per record).
+
+    Reads ``> <name>\\nvalue`` SD data tags.  Tries to coerce values to int
+    or float; leaves them as str otherwise.  Also stores the molecule title
+    (first line of each record) under the key ``_name``.
+    """
+    import re
+    records = []
+    try:
+        with open(path) as fh:
+            content = fh.read()
+        for block in content.split("$$$$"):
+            block = block.strip()
+            if not block:
+                continue
+            props = {}
+            lines = block.splitlines()
+            if lines and lines[0].strip():
+                props["_name"] = lines[0].strip()
+            for m in re.finditer(r">\s*<([^>]+)>\s*\n([^\n]*)", block):
+                key = m.group(1).strip()
+                raw = m.group(2).strip()
+                try:
+                    val_f = float(raw)
+                    props[key] = int(val_f) if val_f == int(val_f) else val_f
+                except (ValueError, OverflowError):
+                    props[key] = raw
+            records.append(props)
+    except Exception as e:
+        print(f"Contact Inspector: could not parse SDF '{path}': {e}")
+    return records
+
+
+def _get_pose_properties(lig_name: str, state: int) -> dict:
+    """Return a dict of SD/object properties via PyMOL's incentive-only API.
+
+    Works only in Incentive PyMOL (get_property_list / get_property).
+    Open-source PyMOL returns {} silently.
+    """
+    props = {}
+    try:
+        names = cmd.get_property_list(lig_name, state)
+        if names:
+            for n in names:
+                v = cmd.get_property(n, lig_name, state)
+                if v is not None:
+                    props[n] = v
+    except Exception:
+        pass
+    return props
 
 
 # ---------------------------------------------------------------------------
@@ -1005,6 +1087,22 @@ def ci_goto(index=0):
 def ci_update():
     _stepper._show_current(); _print_summary()
 
+def ci_refresh():
+    """Re-detect interactions for the current PyMOL state (follows state slider)."""
+    _stepper.refresh(); _print_summary()
+
+def ci_load_scores(path=""):
+    """Load per-pose SD properties from an SDF file.
+
+USAGE
+    ci_load_scores /path/to/poses.sdf
+    """
+    if not path:
+        print("Contact Inspector: ci_load_scores requires a file path.")
+        return
+    _stepper.sdf_records = _parse_sdf_records(path)
+    print(f"Contact Inspector: loaded {len(_stepper.sdf_records)} score records from '{path}'.")
+
 def ci_clear():
     _clear_all(); _unbind_keys(); print("Contact Inspector: cleared.")
 
@@ -1016,6 +1114,8 @@ cmd.extend("ci_next", ci_next)
 cmd.extend("ci_prev", ci_prev)
 cmd.extend("ci_goto", ci_goto)
 cmd.extend("ci_update", ci_update)
+cmd.extend("ci_refresh", ci_refresh)
+cmd.extend("ci_load_scores", ci_load_scores)
 cmd.extend("ci_clear", ci_clear)
 cmd.extend("ci_gui", ci_gui)
 
@@ -1074,11 +1174,19 @@ def _open_gui():
     hl_m.addStretch()
     l_s.addLayout(hl_m, 2, 0, 1, 2)
 
+    l_s.addWidget(QtWidgets.QLabel("Scores (SDF):"), 3, 0)
+    hl_sf = QtWidgets.QHBoxLayout()
+    e_scores = QtWidgets.QLineEdit()
+    e_scores.setPlaceholderText("optional")
+    b_browse = QtWidgets.QPushButton("…"); b_browse.setFixedWidth(26)
+    hl_sf.addWidget(e_scores); hl_sf.addWidget(b_browse)
+    l_s.addLayout(hl_sf, 3, 1)
+
     hl_b = QtWidgets.QHBoxLayout()
     b_setup = QtWidgets.QPushButton("Setup")
     b_clear = QtWidgets.QPushButton("Clear")
     hl_b.addWidget(b_setup); hl_b.addWidget(b_clear)
-    l_s.addLayout(hl_b, 3, 0, 1, 2)
+    l_s.addLayout(hl_b, 4, 0, 1, 2)
     root.addWidget(g_s)
 
     # Navigate
@@ -1092,18 +1200,31 @@ def _open_gui():
 
     hl_pn = QtWidgets.QHBoxLayout()
     b_prev = QtWidgets.QPushButton("<  Prev")
+    b_refresh = QtWidgets.QPushButton("Refresh")
     b_next = QtWidgets.QPushButton("Next  >")
-    hl_pn.addWidget(b_prev); hl_pn.addWidget(b_next)
+    hl_pn.addWidget(b_prev); hl_pn.addWidget(b_refresh); hl_pn.addWidget(b_next)
     l_n.addLayout(hl_pn)
 
     hl_j = QtWidgets.QHBoxLayout()
     hl_j.addWidget(QtWidgets.QLabel("Go to #:"))
-    sp = QtWidgets.QSpinBox(); sp.setMinimum(0); sp.setMaximum(99999)
+    sp = QtWidgets.QSpinBox(); sp.setMinimum(1); sp.setMaximum(99999)
     sp.setFixedWidth(70); hl_j.addWidget(sp)
     b_go = QtWidgets.QPushButton("Go"); b_go.setFixedWidth(50)
     hl_j.addWidget(b_go); hl_j.addStretch()
     l_n.addLayout(hl_j)
     root.addWidget(g_n)
+
+    # Pose Data
+    g_pd = QtWidgets.QGroupBox("Pose Data")
+    g_pd.setCheckable(True); g_pd.setChecked(True)
+    l_pd = QtWidgets.QVBoxLayout(g_pd)
+    te_pd = QtWidgets.QPlainTextEdit()
+    te_pd.setReadOnly(True)
+    te_pd.setMaximumHeight(110)
+    mono = QtGui.QFont("Monospace"); mono.setStyleHint(QtGui.QFont.TypeWriter)
+    mono.setPointSize(8); te_pd.setFont(mono)
+    l_pd.addWidget(te_pd)
+    root.addWidget(g_pd)
 
     # Swatch+checkbox helper
     def _cb(lay, text, hex_color, checked=True):
@@ -1155,49 +1276,76 @@ def _open_gui():
     root.addWidget(cb_rlbl)
 
     # Callbacks
-    def refresh():
+    def update_ui():
         c = _stepper._count()
         if c > 0:
             lbl.setText(f"{_stepper._label()}  "
                         f"({_stepper.current_index + 1}/{c})")
-            sp.setMaximum(c - 1)
+            sp.setMaximum(c)
+            sp.setValue(_stepper.current_index + 1)
         else:
             lbl.setText("Ready - click Setup")
+        props = _stepper.last_properties
+        if props and g_pd.isChecked():
+            w = max(len(k) for k in props)
+            lines = [f"{k:<{w}}  {v}" for k, v in sorted(props.items())]
+            te_pd.setPlainText("\n".join(lines))
+        else:
+            te_pd.setPlainText("")
+
+    def do_browse():
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            win, "Select scores SDF", "",
+            "SDF files (*.sdf *.SDF);;All files (*)")
+        if path:
+            e_scores.setText(path)
 
     def do_setup():
         mode = next(m for m, rb in rb_m.items() if rb.isChecked())
+        sf = e_scores.text().strip()
+        if sf:
+            ci_load_scores(sf)
+        else:
+            _stepper.sdf_records = []
         ci_setup(protein=e_prot.text(), ligands=e_lig.text(), mode=mode)
-        refresh()
+        update_ui()
 
     def do_clear():
         ci_clear()
+        _stepper.sdf_records = []
         lbl.setText("Ready - click Setup")
+        te_pd.setPlainText("")
 
     def do_prev():
-        ci_prev(); refresh()
+        ci_prev(); update_ui()
 
     def do_next():
-        ci_next(); refresh()
+        ci_next(); update_ui()
+
+    def do_refresh():
+        ci_refresh(); update_ui()
 
     def do_go():
-        ci_goto(sp.value()); refresh()
+        ci_goto(sp.value() - 1); update_ui()
 
     def _tog(cb, attr, group):
         def h(state):
             setattr(_stepper, attr, group.isChecked() and cb.isChecked())
-            ci_update(); refresh()
+            ci_update(); update_ui()
         return h
 
     def _group_tog(group, cb_attr_pairs):
         def h(checked):
             for cb, attr in cb_attr_pairs:
                 setattr(_stepper, attr, checked and cb.isChecked())
-            ci_update(); refresh()
+            ci_update(); update_ui()
         return h
 
+    b_browse.clicked.connect(do_browse)
     b_setup.clicked.connect(do_setup)
     b_clear.clicked.connect(do_clear)
     b_prev.clicked.connect(do_prev)
+    b_refresh.clicked.connect(do_refresh)
     b_next.clicked.connect(do_next)
     b_go.clicked.connect(do_go)
 
@@ -1210,7 +1358,7 @@ def _open_gui():
     cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good", g3))
     cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad",  g3))
     cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly", g3))
-    cb_lb.stateChanged.connect(lambda s: [setattr(_stepper, "show_labels", cb_lb.isChecked()), ci_update(), refresh()])
+    cb_lb.stateChanged.connect(lambda s: [setattr(_stepper, "show_labels", cb_lb.isChecked()), ci_update(), update_ui()])
 
     g1.toggled.connect(_group_tog(g1, [
         (cb_hb, "show_hbonds"), (cb_xb, "show_halogen"),
@@ -1240,10 +1388,30 @@ def _open_gui():
                 cmd.hide("labels", sel)
     cb_rlbl.stateChanged.connect(do_toggle_rlbl)
 
+    g_pd.toggled.connect(lambda checked: update_ui())
+
     for key, fn in [(QtCore.Qt.Key_Right, do_next),
                     (QtCore.Qt.Key_Left, do_prev)]:
         sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), win)
         sc.activated.connect(fn)
+
+    # Auto-sync: poll PyMOL state every 250 ms so slider movement is reflected
+    # without needing to click Refresh.  Only acts when states differ.
+    _poll_timer = QtCore.QTimer(win)
+    _poll_timer.setInterval(250)
+
+    def _on_poll():
+        if _stepper.mode != "states" or not _stepper.state_object:
+            return
+        try:
+            if cmd.get_state() != _stepper.current_index + 1:
+                ci_refresh()
+                update_ui()
+        except Exception:
+            pass
+
+    _poll_timer.timeout.connect(_on_poll)
+    _poll_timer.start()
 
     win.show(); win.raise_()
 
@@ -1258,6 +1426,8 @@ def _set_gui_none():
 # ---------------------------------------------------------------------------
 
 print("Contact Inspector loaded.")
-print("  ci_gui   - open GUI panel")
-print("  ci_setup - setup from command line")
+print("  ci_gui     - open GUI panel")
+print("  ci_setup   - setup from command line")
+print("  ci_refresh     - sync to current PyMOL state / state slider")
+print("  ci_load_scores - load per-pose properties from SDF file")
 print("  LEFT/RIGHT arrow keys after setup")
