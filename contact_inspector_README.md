@@ -171,5 +171,6 @@ Each group (Non-covalent bonds, Pi interactions, Contacts/Clashes) has a title-b
 
 - Requires PyMOL with Qt support (PyMOL 2.x+)
 - `numpy` is used if available; falls back to pure Python otherwise
-- Open-source PyMOL does not preserve SDF data fields on load (`get_property_list` and `properties` in `iterate` are incentive-only). Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
+- **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no scores file needed, leave the Scores field blank
+- **Open-source PyMOL**: SDF data fields are stripped on load (`get_property_list` and `properties` in `iterate` are incentive-only). Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
 - The shell shows residues within 5 Å of any ligand (pose + reference) as lines with CA labels; the surface covers atoms within 5 Å
