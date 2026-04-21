@@ -107,8 +107,9 @@ LABEL_SIZE = 14
 _created_objects: Set[str] = set()
 _shell_sel: Optional[str] = None   # selection used for lines/labels (no copy object)
 
-_OBJ_PTS  = "_ci_pts"
-_OBJ_SURF = "_ci_surf"
+_OBJ_PTS     = "_ci_pts"
+_OBJ_REF_PTS = "_ci_ref_pts"
+_OBJ_SURF    = "_ci_surf"
 
 _INTERACTION_NAMES = {
     "hbonds": "hbonds",
@@ -578,27 +579,34 @@ def _add_pair(pts, pid, p1, p2, dist_name):
 
 
 def visualize(lig_sel, prot_sel, result: InteractionResult,
-              show_hbonds=True, show_labels=True, state=-1):
+              show_hbonds=True, show_labels=True, state=-1,
+              name_prefix="", clear=True):
     """Visualize all interactions.
 
     H-bonds are created via PyMOL's built-in polar contact detection
     (cmd.distance mode=2). All other types use pseudoatom pairs.
+
+    name_prefix: prepended to all PyMOL object names (used for reference
+                 ligand so its objects are distinct from pose objects).
+    clear:       call _clear_contacts() before drawing (set False when
+                 adding reference interactions after pose interactions).
     """
     _register_colors()
-    _clear_contacts()
+    if clear:
+        _clear_contacts()
+
+    # Thinner dashes for reference ligand interactions (visual distinction)
+    r_scale = 0.65 if name_prefix else 1.0
 
     # --- H-bonds via PyMOL polar contacts (mode=2) ---
-    # cmd.distance returns the number of contacts found (or -1 on error).
-    # count_atoms() always returns 0 for distance/measurement objects and
-    # cannot be used to check whether any H-bonds were found.
-    hb_name = _INTERACTION_NAMES["hbonds"]
+    hb_name = name_prefix + _INTERACTION_NAMES["hbonds"]
     if show_hbonds:
         try:
             n_hb = cmd.distance(hb_name, lig_sel, prot_sel, mode=2)
             if n_hb is not None and n_hb > 0:
                 result.hbond_count = int(n_hb)
                 _track(hb_name)
-                _style(hb_name, "ci_hbond")
+                _style(hb_name, "ci_hbond", radius=DASH_RADIUS * r_scale)
             else:
                 result.hbond_count = 0
                 try: cmd.delete(hb_name)
@@ -609,7 +617,7 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
             except Exception: pass
 
     # --- All other types via pseudoatom pairs ---
-    pts = _OBJ_PTS
+    pts = _OBJ_REF_PTS if name_prefix else _OBJ_PTS
     _track(pts)
     pid = 0
 
@@ -623,22 +631,25 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
             pid += 1
         _style(obj_name, color, **kw)
 
-    N = _INTERACTION_NAMES
-    _draw(result.halogen,      N["halogen"],  "ci_halogen")
-    _draw(result.salt_bridges, N["salt"],     "ci_salt")
-    _draw(result.arom_hbonds,  N["arom_hb"],  "ci_arom_hb")
+    N = {k: name_prefix + v for k, v in _INTERACTION_NAMES.items()}
+    _draw(result.halogen,      N["halogen"],  "ci_halogen",
+          radius=DASH_RADIUS * r_scale)
+    _draw(result.salt_bridges, N["salt"],     "ci_salt",
+          radius=DASH_RADIUS * r_scale)
+    _draw(result.arom_hbonds,  N["arom_hb"],  "ci_arom_hb",
+          radius=DASH_RADIUS * r_scale)
 
     _draw(result.pipi,         N["pipi"],     "ci_pipi",
-          gap=0.30, length=0.25, radius=0.05)
+          gap=0.30, length=0.25, radius=0.05 * r_scale)
     _draw(result.pi_cation,    N["pi_cation"],"ci_pi_cat",
-          gap=0.30, length=0.25, radius=0.05)
+          gap=0.30, length=0.25, radius=0.05 * r_scale)
 
     _draw(result.clash_good,   N["clash_good"],  "ci_clash_good",
-          gap=0.15, length=0.10)
+          gap=0.15, length=0.10, radius=DASH_RADIUS * r_scale)
     _draw(result.clash_bad,    N["clash_bad"],   "ci_clash_bad",
-          gap=0.15, length=0.10)
+          gap=0.15, length=0.10, radius=DASH_RADIUS * r_scale)
     _draw(result.clash_ugly,   N["clash_ugly"],  "ci_clash_ugly",
-          gap=0.15, length=0.10)
+          gap=0.15, length=0.10, radius=DASH_RADIUS * r_scale)
 
     # Contacts/clashes: never show distance labels (too cluttered)
     for q in ("clash_good", "clash_bad", "clash_ugly"):
@@ -769,6 +780,8 @@ class LigandStepper:
         self.show_labels = True
         self.last_properties: dict = {}
         self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
+        self.ref_ligand: Optional[str] = None
+        self.show_ref: bool = True
 
     def setup_objects(self, prot, ligs):
         self.protein_sel = prot
@@ -795,6 +808,7 @@ class LigandStepper:
                     extras.append(n)
             except Exception:
                 pass
+        self.ref_ligand = extras[0] if extras else None
         all_ligs = [obj] + extras if extras else obj
         _prepare_scene(prot, all_ligs)
         _create_shell(prot, all_ligs)
@@ -859,6 +873,14 @@ class LigandStepper:
         else:
             st = self.current_index + 1
             cmd.set("state", st)
+            if self.ref_ligand:
+                try:
+                    if self.show_ref:
+                        cmd.enable(self.ref_ligand)
+                    else:
+                        cmd.disable(self.ref_ligand)
+                except Exception:
+                    pass
             cmd.zoom(f"({self.protein_sel}) within 8 of "
                      f"({self.state_object})", buffer=3.0, animate=1)
             self._update(self.state_object, state=st)
@@ -886,6 +908,22 @@ class LigandStepper:
             visualize(lig, self.protein_sel, r,
                       show_hbonds=self.show_hbonds,
                       show_labels=self.show_labels, state=state)
+            if self.ref_ligand and self.show_ref:
+                try:
+                    r_ref = detect_interactions(
+                        self.ref_ligand, self.protein_sel, state=1,
+                        do_halogen=self.show_halogen,
+                        do_salt=self.show_salt, do_arom_hb=self.show_arom_hb,
+                        do_pipi=self.show_pipi, do_pi_cation=self.show_pi_cation,
+                        do_clash_good=self.show_clash_good,
+                        do_clash_bad=self.show_clash_bad,
+                        do_clash_ugly=self.show_clash_ugly)
+                    visualize(self.ref_ligand, self.protein_sel, r_ref,
+                              show_hbonds=self.show_hbonds,
+                              show_labels=False, state=1,
+                              name_prefix="ref_", clear=False)
+                except Exception:
+                    pass
         except Exception as e:
             msg = f"Contact Inspector error: {e}\n{traceback.format_exc()}"
             print(msg)
@@ -1214,6 +1252,17 @@ def _open_gui():
     l_n.addLayout(hl_j)
     root.addWidget(g_n)
 
+    # Reference ligand
+    g_ref = QtWidgets.QGroupBox("Reference ligand")
+    l_ref = QtWidgets.QHBoxLayout(g_ref)
+    l_ref.addWidget(QtWidgets.QLabel("Object:"))
+    ref_combo = QtWidgets.QComboBox(); ref_combo.addItem("(none)")
+    ref_combo.setMinimumWidth(100)
+    l_ref.addWidget(ref_combo, 1)
+    cb_show_ref = QtWidgets.QCheckBox("Show"); cb_show_ref.setChecked(True)
+    l_ref.addWidget(cb_show_ref)
+    root.addWidget(g_ref)
+
     # Pose Data
     g_pd = QtWidgets.QGroupBox("Pose Data")
     g_pd.setCheckable(True); g_pd.setChecked(True)
@@ -1300,6 +1349,28 @@ def _open_gui():
         if path:
             e_scores.setText(path)
 
+    def _populate_ref_combo():
+        """Refill ref_combo with current organic objects, preserving selection."""
+        prev = ref_combo.currentText()
+        ref_combo.blockSignals(True)
+        ref_combo.clear()
+        ref_combo.addItem("(none)")
+        for n in cmd.get_names("objects"):
+            if n.startswith("_ci_") or n in (
+                    _OBJ_PTS, _OBJ_REF_PTS, _OBJ_SURF):
+                continue
+            try:
+                if (cmd.count_atoms(f"{n} and organic") > 0 and
+                        cmd.count_atoms(f"{n} and ({_stepper.protein_sel or 'polymer.protein'})") == 0):
+                    ref_combo.addItem(n)
+            except Exception:
+                pass
+        # Select auto-detected ref, then fall back to previous selection
+        target = _stepper.ref_ligand or prev
+        idx = ref_combo.findText(target) if target else -1
+        ref_combo.setCurrentIndex(max(idx, 0))
+        ref_combo.blockSignals(False)
+
     def do_setup():
         mode = next(m for m, rb in rb_m.items() if rb.isChecked())
         sf = e_scores.text().strip()
@@ -1308,11 +1379,24 @@ def _open_gui():
         else:
             _stepper.sdf_records = []
         ci_setup(protein=e_prot.text(), ligands=e_lig.text(), mode=mode)
+        _populate_ref_combo()
         update_ui()
+
+    def on_ref_changed(text):
+        _stepper.ref_ligand = None if text == "(none)" else text
+        ci_update(); update_ui()
+
+    def on_show_ref(state):
+        _stepper.show_ref = cb_show_ref.isChecked()
+        ci_update(); update_ui()
 
     def do_clear():
         ci_clear()
         _stepper.sdf_records = []
+        _stepper.ref_ligand = None
+        ref_combo.blockSignals(True)
+        ref_combo.clear(); ref_combo.addItem("(none)")
+        ref_combo.blockSignals(False)
         lbl.setText("Ready - click Setup")
         te_pd.setPlainText("")
 
@@ -1344,6 +1428,8 @@ def _open_gui():
     b_browse.clicked.connect(do_browse)
     b_setup.clicked.connect(do_setup)
     b_clear.clicked.connect(do_clear)
+    ref_combo.currentTextChanged.connect(on_ref_changed)
+    cb_show_ref.stateChanged.connect(on_show_ref)
     b_prev.clicked.connect(do_prev)
     b_refresh.clicked.connect(do_refresh)
     b_next.clicked.connect(do_next)
