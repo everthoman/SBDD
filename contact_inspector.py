@@ -780,6 +780,7 @@ class LigandStepper:
         self.show_labels = True
         self.last_properties: dict = {}
         self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
+        self.all_properties: list = []  # one dict per pose, built at setup time
         self.ref_ligand: Optional[str] = None
         self.show_ref: bool = True
 
@@ -792,6 +793,7 @@ class LigandStepper:
         _create_shell(prot, ligs)
         if ligs:
             self._show_current()
+        self._prefetch_all_properties()
 
     def setup_states(self, prot, obj):
         self.protein_sel = prot
@@ -813,6 +815,7 @@ class LigandStepper:
         _prepare_scene(prot, all_ligs)
         _create_shell(prot, all_ligs)
         self._show_current()
+        self._prefetch_all_properties()
 
     def _count(self):
         if self.mode == "objects":
@@ -933,6 +936,20 @@ class LigandStepper:
                     QtWidgets.QMessageBox.warning(_gui_window, "Contact Inspector", str(e))
                 except Exception:
                     pass
+
+    def _prefetch_all_properties(self):
+        """Populate all_properties: one dict per pose, used by the table view."""
+        if self.sdf_records:
+            self.all_properties = list(self.sdf_records)
+            return
+        self.all_properties = []
+        if self.mode == "states" and self.state_object:
+            n = cmd.count_states(self.state_object)
+            for st in range(1, n + 1):
+                self.all_properties.append(_get_pose_properties(self.state_object, st))
+        elif self.mode == "objects":
+            for obj in self.ligand_objects:
+                self.all_properties.append(_get_pose_properties(obj, 1))
 
     def summary(self):
         r = self.last_result
@@ -1267,12 +1284,25 @@ def _open_gui():
     g_pd = QtWidgets.QGroupBox("Pose Data")
     g_pd.setCheckable(True); g_pd.setChecked(True)
     l_pd = QtWidgets.QVBoxLayout(g_pd)
-    te_pd = QtWidgets.QPlainTextEdit()
-    te_pd.setReadOnly(True)
-    te_pd.setMaximumHeight(110)
-    mono = QtGui.QFont("Monospace"); mono.setStyleHint(QtGui.QFont.TypeWriter)
-    mono.setPointSize(8); te_pd.setFont(mono)
-    l_pd.addWidget(te_pd)
+
+    class _SortItem(QtWidgets.QTableWidgetItem):
+        def __lt__(self, other):
+            a = self.data(QtCore.Qt.UserRole + 1)
+            b = other.data(QtCore.Qt.UserRole + 1)
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                return a < b
+            return self.text() < other.text()
+
+    tw_pd = QtWidgets.QTableWidget(0, 0)
+    tw_pd.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+    tw_pd.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+    tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    tw_pd.setMaximumHeight(200)
+    tw_pd.horizontalHeader().setStretchLastSection(True)
+    tw_pd.horizontalHeader().setSectionsMovable(True)
+    tw_pd.verticalHeader().setDefaultSectionSize(18)
+    tw_pd.setAlternatingRowColors(True)
+    l_pd.addWidget(tw_pd)
     root.addWidget(g_pd)
 
     # Swatch+checkbox helper
@@ -1325,6 +1355,59 @@ def _open_gui():
     root.addWidget(cb_rlbl)
 
     # Callbacks
+    def rebuild_table():
+        tw_pd.setSortingEnabled(False)
+        tw_pd.clearContents()
+        tw_pd.setRowCount(0)
+        all_props = _stepper.all_properties
+        if not all_props:
+            tw_pd.setColumnCount(0)
+            return
+        seen: dict = {}
+        for p in all_props:
+            for k in p:
+                if k not in seen:
+                    seen[k] = None
+        cols = list(seen.keys())
+        if "_name" in cols:
+            cols = ["_name"] + [c for c in cols if c != "_name"]
+        tw_pd.setColumnCount(len(cols))
+        tw_pd.setHorizontalHeaderLabels(cols)
+        tw_pd.setRowCount(len(all_props))
+        for r, props in enumerate(all_props):
+            for c, key in enumerate(cols):
+                val = props.get(key, "")
+                item = _SortItem("" if val == "" else str(val))
+                item.setData(QtCore.Qt.UserRole, r)
+                if isinstance(val, (int, float)):
+                    item.setData(QtCore.Qt.UserRole + 1, val)
+                    item.setTextAlignment(
+                        QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                tw_pd.setItem(r, c, item)
+        tw_pd.resizeColumnsToContents()
+        tw_pd.setSortingEnabled(True)
+        _highlight_current_row()
+
+    def _highlight_current_row():
+        cur = _stepper.current_index
+        for r in range(tw_pd.rowCount()):
+            item0 = tw_pd.item(r, 0)
+            if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
+                tw_pd.selectRow(r)
+                tw_pd.scrollToItem(
+                    item0, QtWidgets.QAbstractItemView.PositionAtCenter)
+                return
+        tw_pd.clearSelection()
+
+    def on_table_clicked(row, col):
+        item0 = tw_pd.item(row, 0)
+        if item0 is None:
+            return
+        pose_idx = item0.data(QtCore.Qt.UserRole)
+        if pose_idx is not None:
+            ci_goto(pose_idx)
+            update_ui()
+
     def update_ui():
         c = _stepper._count()
         if c > 0:
@@ -1334,13 +1417,8 @@ def _open_gui():
             sp.setValue(_stepper.current_index + 1)
         else:
             lbl.setText("Ready - click Setup")
-        props = _stepper.last_properties
-        if props and g_pd.isChecked():
-            w = max(len(k) for k in props)
-            lines = [f"{k:<{w}}  {v}" for k, v in sorted(props.items())]
-            te_pd.setPlainText("\n".join(lines))
-        else:
-            te_pd.setPlainText("")
+        if g_pd.isChecked():
+            _highlight_current_row()
 
     def do_browse():
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1381,6 +1459,7 @@ def _open_gui():
         ci_setup(protein=e_prot.text(), ligands=e_lig.text(), mode=mode)
         _populate_ref_combo()
         update_ui()
+        rebuild_table()
 
     def on_ref_changed(text):
         _stepper.ref_ligand = None if text == "(none)" else text
@@ -1393,12 +1472,16 @@ def _open_gui():
     def do_clear():
         ci_clear()
         _stepper.sdf_records = []
+        _stepper.all_properties = []
         _stepper.ref_ligand = None
         ref_combo.blockSignals(True)
         ref_combo.clear(); ref_combo.addItem("(none)")
         ref_combo.blockSignals(False)
         lbl.setText("Ready - click Setup")
-        te_pd.setPlainText("")
+        tw_pd.setSortingEnabled(False)
+        tw_pd.clearContents()
+        tw_pd.setRowCount(0)
+        tw_pd.setColumnCount(0)
 
     def do_prev():
         ci_prev(); update_ui()
@@ -1474,6 +1557,7 @@ def _open_gui():
                 cmd.hide("labels", sel)
     cb_rlbl.stateChanged.connect(do_toggle_rlbl)
 
+    tw_pd.cellClicked.connect(on_table_clicked)
     g_pd.toggled.connect(lambda checked: update_ui())
 
     for key, fn in [(QtCore.Qt.Key_Right, do_next),
