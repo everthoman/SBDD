@@ -1296,7 +1296,7 @@ def _open_gui():
     tw_pd = QtWidgets.QTableWidget(0, 0)
     tw_pd.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
     tw_pd.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-    tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
     tw_pd.setMaximumHeight(200)
     tw_pd.horizontalHeader().setStretchLastSection(True)
     tw_pd.horizontalHeader().setSectionsMovable(True)
@@ -1369,15 +1369,22 @@ def _open_gui():
                 if k not in seen:
                     seen[k] = None
         cols = list(seen.keys())
-        if "_name" in cols:
-            cols = ["_name"] + [c for c in cols if c != "_name"]
+        rank_cols = [c for c in cols if c != "_name" and "rank" in c.lower()]
+        other_cols = [c for c in cols if c != "_name" and "rank" not in c.lower()]
+        cols = (["_name"] if "_name" in cols else []) + rank_cols + other_cols
         tw_pd.setColumnCount(len(cols))
         tw_pd.setHorizontalHeaderLabels(cols)
         tw_pd.setRowCount(len(all_props))
         for r, props in enumerate(all_props):
             for c, key in enumerate(cols):
                 val = props.get(key, "")
-                item = _SortItem("" if val == "" else str(val))
+                if isinstance(val, float):
+                    display = f"{val:.3f}"
+                elif val == "":
+                    display = ""
+                else:
+                    display = str(val)
+                item = _SortItem(display)
                 item.setData(QtCore.Qt.UserRole, r)
                 if isinstance(val, (int, float)):
                     item.setData(QtCore.Qt.UserRole + 1, val)
