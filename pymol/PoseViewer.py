@@ -881,8 +881,7 @@ class LigandStepper:
                     break
             obj, st2 = self.poses[self.current_index]
             if self.auto_zoom:
-                cmd.zoom(f"({self.protein_sel}) within 8 of ({obj})",
-                         buffer=3.0, animate=1)
+                cmd.zoom(obj, buffer=3.0, animate=1, state=st2)
             self._update(obj, state=st2)
         else:
             self._show_current()
@@ -907,8 +906,7 @@ class LigandStepper:
             except Exception:
                 pass
         if self.auto_zoom:
-            cmd.zoom(f"({self.protein_sel}) within 8 of ({obj})",
-                     buffer=3.0, animate=1)
+            cmd.zoom(obj, buffer=3.0, animate=1, state=st)
         self._update(obj, state=st)
 
     def _update(self, lig, state=-1):
