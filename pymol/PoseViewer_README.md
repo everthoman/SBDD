@@ -130,7 +130,10 @@ Selects a persistent reference ligand (e.g. co-crystal structure) that remains v
 | Control | Description |
 |---|---|
 | Object dropdown | Lists all organic objects that are not the receptor. Auto-populated on Setup; can be overridden. Select `(none)` to disable and hide the reference ligand. |
-| Show checkbox | Hides/shows both the reference ligand object and all its interaction lines |
+| Show ref | Hides/shows the reference ligand object and all its interaction lines |
+| Show pose | Hides/shows the current docking pose object and its interaction lines. Uncheck to isolate the reference ligand and its interactions in the view. |
+
+Reference ligand interaction lines respect the same **Show distance labels** toggle as pose interactions.
 
 ### Pose Data group
 

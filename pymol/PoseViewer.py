@@ -795,6 +795,7 @@ class LigandStepper:
         self.poses: list = []          # [(obj_name, state_1based), ...]
         self.ref_ligand: Optional[str] = None
         self.show_ref: bool = True
+        self.show_pose: bool = True
 
     def setup_objects(self, prot, ligs, ref_lig=None):
         self.protein_sel = prot
@@ -894,7 +895,7 @@ class LigandStepper:
         for n in {o for o, _ in self.poses}:
             if n in obj_names:
                 cmd.disable(n)
-        if obj in obj_names:
+        if obj in obj_names and self.show_pose:
             cmd.enable(obj)
         cmd.set("state", st)
         if self.ref_ligand:
@@ -906,7 +907,10 @@ class LigandStepper:
             except Exception:
                 pass
         if self.auto_zoom:
-            cmd.zoom(obj, buffer=3.0, animate=1, state=st)
+            if self.show_pose:
+                cmd.zoom(obj, buffer=3.0, animate=1, state=st)
+            elif self.ref_ligand and self.show_ref:
+                cmd.zoom(self.ref_ligand, buffer=3.0, animate=1, state=1)
         self._update(obj, state=st)
 
     def _update(self, lig, state=-1):
@@ -929,9 +933,12 @@ class LigandStepper:
             else:
                 self.last_properties = _get_pose_properties(
                     lig, state if state > 0 else 1)
-            visualize(lig, self.protein_sel, r,
-                      show_hbonds=self.show_hbonds,
-                      show_labels=self.show_labels, state=state)
+            if self.show_pose:
+                visualize(lig, self.protein_sel, r,
+                          show_hbonds=self.show_hbonds,
+                          show_labels=self.show_labels, state=state)
+            else:
+                _clear_contacts()
             if self.ref_ligand and self.show_ref:
                 try:
                     r_ref = detect_interactions(
@@ -944,8 +951,8 @@ class LigandStepper:
                         do_clash_ugly=self.show_clash_ugly)
                     visualize(self.ref_ligand, self.protein_sel, r_ref,
                               show_hbonds=self.show_hbonds,
-                              show_labels=False, state=1,
-                              name_prefix="ref_", clear=False)
+                              show_labels=self.show_labels, state=1,
+                              name_prefix="ref_", clear=not self.show_pose)
                 except Exception:
                     pass
         except Exception as e:
@@ -1346,8 +1353,10 @@ def _open_gui():
     ref_combo = QtWidgets.QComboBox(); ref_combo.addItem("(none)")
     ref_combo.setMinimumWidth(100)
     l_ref.addWidget(ref_combo, 1)
-    cb_show_ref = QtWidgets.QCheckBox("Show"); cb_show_ref.setChecked(True)
+    cb_show_ref = QtWidgets.QCheckBox("Show ref"); cb_show_ref.setChecked(True)
     l_ref.addWidget(cb_show_ref)
+    cb_show_pose = QtWidgets.QCheckBox("Show pose"); cb_show_pose.setChecked(True)
+    l_ref.addWidget(cb_show_pose)
     top_l.addWidget(g_ref)
 
     # Pose Data
@@ -1606,6 +1615,10 @@ def _open_gui():
         _stepper.show_ref = cb_show_ref.isChecked()
         ci_update(); update_ui()
 
+    def on_show_pose(state):
+        _stepper.show_pose = cb_show_pose.isChecked()
+        ci_update(); update_ui()
+
     def do_clear():
         ci_clear()
         _stepper.sdf_records = []
@@ -1677,6 +1690,7 @@ def _open_gui():
     b_clear.clicked.connect(do_clear)
     ref_combo.currentTextChanged.connect(on_ref_changed)
     cb_show_ref.stateChanged.connect(on_show_ref)
+    cb_show_pose.stateChanged.connect(on_show_pose)
     b_prev.clicked.connect(do_prev)
     b_refresh.clicked.connect(do_refresh)
     b_next.clicked.connect(do_next)
