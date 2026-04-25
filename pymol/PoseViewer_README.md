@@ -1,9 +1,10 @@
-# PoseViewer
+# PoseViewer — beta
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review.
 
 **Authors:** Evert J. Homan, PhD; Claude (Anthropic)  
-**License:** MIT
+**License:** MIT  
+**Status:** beta
 
 ---
 
@@ -40,11 +41,11 @@ Reference ligand interactions are drawn with the same color scheme but thinner d
 
 **Option A — Plugin Manager (recommended):**
 1. In PyMOL: Plugin → Plugin Manager → Install New Plugin
-2. Select `PoseViewer.py`
+2. Select `pymol/PoseViewer.py`
 
 **Option B — Direct load:**
 ```
-run /path/to/PoseViewer.py
+run /path/to/pymol/PoseViewer.py
 ci_gui
 ```
 
