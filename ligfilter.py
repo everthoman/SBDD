@@ -117,6 +117,36 @@ def format_time(seconds: float) -> str:
 
 # ─── Molecule I/O ─────────────────────────────────────────────────────────────
 
+def _detect_smiles_col(path: Path) -> int:
+    """Scan the first data rows and return the 0-based index of the SMILES column.
+
+    For each row that contains at least one valid SMILES, tallies which columns
+    parse successfully.  The column with the most hits wins.
+    """
+    counts: Dict[int, int] = {}
+    n_data = 0
+    with path.open(encoding='utf-8', errors='replace') as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [p.strip() for p in line.replace(',', '\t').split('\t')]
+            valid = {i: Chem.MolFromSmiles(v) is not None for i, v in enumerate(parts)}
+            if not any(valid.values()):
+                continue  # header or unparseable row
+            n_data += 1
+            for i, ok in valid.items():
+                if ok:
+                    counts[i] = counts.get(i, 0) + 1
+            if n_data >= 10:
+                break
+    if not counts:
+        _warn("Could not auto-detect SMILES column; assuming column 1")
+        return 0
+    detected = max(counts, key=counts.get)
+    _info(f"SMILES column auto-detected: column {detected + 1}")
+    return detected
+
 def _parse_col_spec(s: str):
     """Parse a column specifier: positive integer string → 0-based int; else column name str."""
     try:
@@ -135,7 +165,7 @@ def _resolve_col(spec, header: List[str], label: str) -> int:
     return header.index(spec)
 
 
-def _iter_smiles(path: Path, smiles_col=0, name_col=None,
+def _iter_smiles(path: Path, smiles_col=None, name_col=None,
                  out_header: Optional[List[str]] = None) -> Iterator[Tuple[Chem.Mol, str]]:
     """Yield (mol, name) from a SMILES file (comma- or tab-separated).
 
@@ -150,6 +180,8 @@ def _iter_smiles(path: Path, smiles_col=0, name_col=None,
     as property keys; otherwise col_N (1-based) is used.
     """
     RDLogger.DisableLog('rdApp.*')
+    if smiles_col is None:
+        smiles_col = _detect_smiles_col(path)
     need_header = isinstance(smiles_col, str) or isinstance(name_col, str)
     col_names: List[str] = []        # populated when a header row is detected
     header_consumed = False
@@ -237,7 +269,7 @@ def _iter_sdf(path: Path) -> Iterator[Tuple[Chem.Mol, str]]:
         yield mol, name
 
 
-def _iter_molecules(path: Path, smiles_col=0, name_col=None,
+def _iter_molecules(path: Path, smiles_col=None, name_col=None,
                     out_header: Optional[List[str]] = None) -> Iterator[Tuple[Chem.Mol, str]]:
     """Auto-detect format from extension and yield (mol, name) pairs."""
     if path.suffix.lower() == '.sdf':
@@ -683,6 +715,62 @@ def _mol_props(mol: Chem.Mol) -> dict:
     }
 
 
+# ─── Outlier detection ────────────────────────────────────────────────────────
+
+_OUTLIER_PROP_KEY = {
+    'mw':     'MW',
+    'logp':   'LogP',
+    'hba':    'HBA',
+    'hbd':    'HBD',
+    'rb':     'RB',
+    'tpsa':   'TPSA',
+    'qed':    'QED',
+    'chiral': 'Chiral',
+    'ha':     'HA',
+}
+_VALID_OUTLIER_PROPS = tuple(_OUTLIER_PROP_KEY.keys())
+
+
+def _compute_outlier_bounds(molecules: List[Tuple[Chem.Mol, str]],
+                             props: List[str],
+                             k: float) -> Dict[str, Tuple[float, float]]:
+    """Compute Tukey IQR fences for each property across the molecule set.
+
+    Returns {prop: (lower_fence, upper_fence)} where
+    lower_fence = Q1 - k*IQR,  upper_fence = Q3 + k*IQR.
+    """
+    prop_vals: Dict[str, List[float]] = {p: [] for p in props}
+    for mol, _ in molecules:
+        p_dict = _mol_props(mol)
+        for p in props:
+            prop_vals[p].append(p_dict[p])
+
+    bounds: Dict[str, Tuple[float, float]] = {}
+    for p, vals in prop_vals.items():
+        if len(vals) < 4:
+            _warn(f"Outlier: too few molecules to compute IQR for {p} — skipped")
+            continue
+        qs = statistics.quantiles(vals, n=4)   # [Q1, Q2, Q3]
+        q1, q3 = qs[0], qs[2]
+        iqr = q3 - q1
+        bounds[p] = (q1 - k * iqr, q3 + k * iqr)
+    return bounds
+
+
+def _make_outlier_filter(bounds: Dict[str, Tuple[float, float]]):
+    """Return an IQR outlier filter closed over pre-computed per-property fences."""
+    def _filt(mol, _args):
+        props = _mol_props(mol)
+        for p, (lo, hi) in bounds.items():
+            val = props[p]
+            if val < lo:
+                return f"Outlier {p} {val:.2f} < fence {lo:.2f}"
+            if val > hi:
+                return f"Outlier {p} {val:.2f} > fence {hi:.2f}"
+        return None
+    return _filt
+
+
 # Shared pipeline inherited by worker processes via fork (Linux default).
 # Set in main() before the Pool is created.
 _shared_pipeline: list = []
@@ -766,8 +854,10 @@ def main():
     )
 
     io = p.add_argument_group('Input / Output')
-    io.add_argument('input', metavar='FILE',
+    io.add_argument('input', metavar='FILE', nargs='?', default=None,
                     help='Input SMILES (.smi/.csv/.tsv) or SDF file')
+    io.add_argument('-i', dest='input_flag', metavar='FILE', default=None,
+                    help='Input file (alternative to positional argument)')
     io.add_argument('-o', '--output', metavar='FILE',
                     help='Output file (default: <input>_filtered.<ext>)')
     io.add_argument('-j', '--jobs', metavar='N', type=int,
@@ -775,9 +865,9 @@ def main():
                     help=f'Worker processes for filtering and property calculation '
                          f'(default: {os.cpu_count()} — all available CPUs). '
                          f'Use --jobs 1 to disable parallelism.')
-    io.add_argument('--smiles-col', metavar='COL', default='1',
+    io.add_argument('--smiles-col', metavar='COL', default=None,
                     help='Column containing SMILES: 1-based integer index or column '
-                         'header name (default: 1 = first column)')
+                         'header name (default: auto-detect)')
     io.add_argument('--name-col', metavar='COL', default=None,
                     help='Column containing molecule name/ID: 1-based integer index '
                          'or column header name (default: auto = first non-SMILES column)')
@@ -866,17 +956,34 @@ def main():
                       help='Heavy-atom count range.  '
                            'E.g. --ha 10:35  --ha :40  --ha 5:')
 
+    out = p.add_argument_group('Outlier detection')
+    out.add_argument('--outlier', action='store_true',
+                     help='Reject statistical outliers using Tukey IQR fences '
+                          '(Q1 - k*IQR, Q3 + k*IQR).  Bounds are computed '
+                          'from the preprocessed molecule set, so the fence '
+                          'values reflect the actual input distribution.')
+    out.add_argument('--outlier-iqr', metavar='K', type=float, default=1.5,
+                     help='IQR multiplier k (default: 1.5 = standard box-plot '
+                          'whiskers; use 3.0 to remove only extreme outliers)')
+    out.add_argument('--outlier-props', metavar='PROPS', default='mw,logp,rb',
+                     help='Comma-separated properties to check.  '
+                          f'Valid: {", ".join(_VALID_OUTLIER_PROPS)}  '
+                          '(default: mw,logp,rb)')
+
     if _ARGCOMPLETE:
         argcomplete.autocomplete(p)
 
     args = p.parse_args()
 
-    smiles_col = _parse_col_spec(args.smiles_col)
+    smiles_col = _parse_col_spec(args.smiles_col) if args.smiles_col is not None else None
     name_col   = _parse_col_spec(args.name_col) if args.name_col is not None else None
 
     t0 = time.time()
 
-    in_path = Path(args.input).resolve()
+    input_file = args.input or args.input_flag
+    if not input_file:
+        p.error("input file is required (positional FILE or -i FILE)")
+    in_path = Path(input_file).resolve()
     if not in_path.exists():
         _fatal(f"Input file not found: {in_path}")
 
@@ -901,7 +1008,7 @@ def main():
     _info(f"Deduplicate:   {'yes' if args.unique else 'no (disabled)'}")
     _info(f"Output format: {out_path.suffix.lower()[1:].upper()}")
     _info(f"Workers:       {args.jobs}")
-    _info(f"SMILES col:    {args.smiles_col}")
+    _info(f"SMILES col:    {args.smiles_col if args.smiles_col is not None else 'auto'}")
     _info(f"Name col:      {args.name_col if args.name_col is not None else 'auto'}")
     _info(f"MW range:      {args.mw if args.mw else 'any'}")
     _info(f"LogP range:    {args.logp if args.logp else 'any'}")
@@ -915,6 +1022,8 @@ def main():
     lip_mode = ('strict' if args.ro5_strict else 'on (1 violation allowed)') if (args.ro5 or args.ro5_strict) else 'off'
     _info(f"Lipinski Ro5:  {lip_mode}")
     _info(f"Rule of Three: {'on' if args.ro3 else 'off'}")
+    if args.outlier:
+        _info(f"Outlier filter: IQR k={args.outlier_iqr}, props={args.outlier_props}")
     print(bar)
 
     # ── Load filter data ──────────────────────────────────────────────────────
@@ -968,12 +1077,6 @@ def main():
                                       tpsa_range=tpsa_range,
                                       chiral_range=chiral_range,
                                       ha_range=ha_range)
-    if not pipeline:
-        _warn("No preprocessing or filters enabled — all molecules will pass.")
-    else:
-        _info(f"Active filters ({len(pipeline)}): "
-              + ', '.join(label for label, _ in pipeline))
-    print(bar)
 
     # ── Read & preprocess ─────────────────────────────────────────────────────
     out_header: List[str] = []
@@ -984,6 +1087,26 @@ def main():
         raw_stream, do_strip=args.strip, do_neutralize=args.neutralize,
         do_unique=args.unique)
     n_read = len(molecules) + n_duplicates
+
+    # ── Outlier filter (needs population statistics from preprocessed set) ────
+    if args.outlier:
+        outlier_props = [p.strip() for p in args.outlier_props.split(',')]
+        invalid = [p for p in outlier_props if p not in _VALID_OUTLIER_PROPS]
+        if invalid:
+            _fatal(f"--outlier-props: unknown: {invalid}  valid: {list(_VALID_OUTLIER_PROPS)}")
+        outlier_bounds = _compute_outlier_bounds(
+            molecules, [_OUTLIER_PROP_KEY[p] for p in outlier_props], args.outlier_iqr)
+        _ok(f"Outlier fences (IQR k={args.outlier_iqr}, n={len(molecules)}):")
+        for p, (lo, hi) in outlier_bounds.items():
+            _info(f"  {p:<8} [{lo:.3g},  {hi:.3g}]")
+        pipeline.append(('Outlier', _make_outlier_filter(outlier_bounds)))
+
+    if not pipeline:
+        _warn("No preprocessing or filters enabled — all molecules will pass.")
+    else:
+        _info(f"Active filters ({len(pipeline)}): "
+              + ', '.join(label for label, _ in pipeline))
+    print(bar)
 
     # ── Filter ────────────────────────────────────────────────────────────────
     n_pass = n_fail = 0
