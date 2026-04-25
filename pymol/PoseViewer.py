@@ -715,6 +715,18 @@ def _prepare_scene(protein_sel, ligand_sels):
         print(f"PoseViewer: scene setup warning: {e}")
 
 
+def _apply_lig_h(lig_sel, show):
+    """Show all H on ligand as sticks, or restore default (hide non-polar H only)."""
+    try:
+        if show:
+            cmd.show("sticks", f"({lig_sel}) and elem H")
+        else:
+            cmd.hide("everything",
+                     f"({lig_sel}) and elem H and not (neighbor (elem N+O+S))")
+    except Exception:
+        pass
+
+
 def _color_ref_ligand(name):
     """Color reference ligand with magenta carbons + element colors."""
     try:
@@ -796,6 +808,7 @@ class LigandStepper:
         self.ref_ligand: Optional[str] = None
         self.show_ref: bool = True
         self.show_pose: bool = True
+        self.show_lig_h: bool = False
 
     def setup_objects(self, prot, ligs, ref_lig=None):
         self.protein_sel = prot
@@ -898,7 +911,9 @@ class LigandStepper:
         if obj in obj_names and self.show_pose:
             cmd.enable(obj)
         cmd.set("state", st)
+        _apply_lig_h(obj, self.show_lig_h)
         if self.ref_ligand:
+            _apply_lig_h(self.ref_ligand, self.show_lig_h)
             try:
                 if self.show_ref:
                     cmd.enable(self.ref_ligand)
@@ -1463,7 +1478,8 @@ def _open_gui():
     cb_surf = QtWidgets.QCheckBox("Show surface");          cb_surf.setChecked(True)
     cb_rlbl = QtWidgets.QCheckBox("Show residue labels");   cb_rlbl.setChecked(True)
     cb_zoom = QtWidgets.QCheckBox("Auto-zoom to pose");     cb_zoom.setChecked(True)
-    for _w in (cb_lb, cb_surf, cb_rlbl, cb_zoom):
+    cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
+    for _w in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h):
         l_disp.addWidget(_w)
     bot_l.addWidget(g_disp)
     bot_l.addStretch()
@@ -1738,6 +1754,7 @@ def _open_gui():
 
     def do_disp_group_tog(checked):
         _stepper.show_labels = checked and cb_lb.isChecked()
+        _stepper.show_lig_h  = checked and cb_lig_h.isChecked()
         do_toggle_surf()
         do_toggle_rlbl()
         ci_update(); update_ui()
@@ -1745,6 +1762,10 @@ def _open_gui():
 
     cb_lb.stateChanged.connect(lambda s: [
         setattr(_stepper, "show_labels", g_disp_en.isChecked() and cb_lb.isChecked()),
+        ci_update(), update_ui()])
+
+    cb_lig_h.stateChanged.connect(lambda s: [
+        setattr(_stepper, "show_lig_h", g_disp_en.isChecked() and cb_lig_h.isChecked()),
         ci_update(), update_ui()])
 
     tw_pd.cellClicked.connect(on_table_clicked)

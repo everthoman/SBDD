@@ -155,6 +155,7 @@ Individual interaction types can be toggled within each group. Contacts/Clashes 
 | Show surface | On | Show/hide the transparent pocket surface |
 | Show residue labels | On | Show/hide CA residue name+number labels on the shell |
 | Auto-zoom to pose | On | Zoom to binding site on each pose change |
+| Show nonpolar H on ligands | Off | Show all hydrogens (including nonpolar C-H) on pose and reference ligands as sticks. Off by default (only polar H on N/O/S shown). |
 
 The Display group enable checkbox hides all display elements at once (surface, labels) without changing individual settings.
 
