@@ -1,5 +1,5 @@
 """
-Contact Inspector - PyMOL Plugin
+PoseViewer - PyMOL Plugin
 ================================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -16,7 +16,7 @@ Interaction categories:
 
 Installation:
   1. Plugin > Plugin Manager > Install New Plugin > choose this file, or
-  2. run /path/to/contact_inspector.py   then   ci_gui
+  2. run /path/to/PoseViewer.py   then   ci_gui
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-03-24
@@ -107,9 +107,9 @@ LABEL_SIZE = 14
 _created_objects: Set[str] = set()
 _shell_sel: Optional[str] = None   # selection used for lines/labels (no copy object)
 
-_OBJ_PTS     = "_ci_pts"
-_OBJ_REF_PTS = "_ci_ref_pts"
-_OBJ_SURF    = "_ci_surf"
+_OBJ_PTS        = "_ci_pts"
+_OBJ_REF_PTS    = "_ci_ref_pts"
+_OBJ_SURF       = "_ci_surf"
 
 _INTERACTION_NAMES = {
     "hbonds": "hbonds",
@@ -693,6 +693,7 @@ def _color_rainbow_elem(sel):
 def _prepare_scene(protein_sel, ligand_sels):
     """Color protein rainbow (C atoms) + element colors, cartoon, hide non-polar H."""
     try:
+        cmd.hide("surface")   # remove any pre-existing surfaces before adding ours
         cmd.show("cartoon", protein_sel)
         _color_rainbow_elem(protein_sel)
 
@@ -711,7 +712,16 @@ def _prepare_scene(protein_sel, ligand_sels):
         cmd.color("white", f"({lig_u}) and elem H")
         _apply_elem_colors(lig_u)
     except Exception as e:
-        print(f"Contact Inspector: scene setup warning: {e}")
+        print(f"PoseViewer: scene setup warning: {e}")
+
+
+def _color_ref_ligand(name):
+    """Color reference ligand with magenta carbons + element colors."""
+    try:
+        cmd.color("magenta", f"({name}) and elem C")
+        _apply_elem_colors(name)
+    except Exception:
+        pass
 
 
 def _lig_union(ligand_sels):
@@ -738,7 +748,7 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
         cmd.label(f"({sel}) and name CA", '"%s %s" % (resn, resi)')
         _shell_sel = sel
     except Exception as e:
-        print(f"Contact Inspector: shell setup warning: {e}")
+        print(f"PoseViewer: shell setup warning: {e}")
         return
 
     # Transparent surface on the atom-based shell (no byres expansion)
@@ -778,19 +788,27 @@ class LigandStepper:
         self.show_clash_bad = False
         self.show_clash_ugly = False
         self.show_labels = True
+        self.auto_zoom = True
         self.last_properties: dict = {}
         self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
         self.all_properties: list = []  # one dict per pose, built at setup time
+        self.poses: list = []          # [(obj_name, state_1based), ...]
         self.ref_ligand: Optional[str] = None
         self.show_ref: bool = True
 
-    def setup_objects(self, prot, ligs):
+    def setup_objects(self, prot, ligs, ref_lig=None):
         self.protein_sel = prot
         self.ligand_objects = ligs
         self.current_index = 0
         self.mode = "objects"
-        _prepare_scene(prot, ligs if isinstance(ligs, str) else ligs)
-        _create_shell(prot, ligs)
+        self.ref_ligand = ref_lig
+        self.poses = [(n, st) for n in ligs
+                      for st in range(1, max(1, cmd.count_states(n)) + 1)]
+        all_ligs = list(ligs) + ([ref_lig] if ref_lig else [])
+        _prepare_scene(prot, all_ligs)
+        if ref_lig:
+            _color_ref_ligand(ref_lig)
+        _create_shell(prot, all_ligs)
         if ligs:
             self._show_current()
         self._prefetch_all_properties()
@@ -811,22 +829,24 @@ class LigandStepper:
             except Exception:
                 pass
         self.ref_ligand = extras[0] if extras else None
+        n_states = cmd.count_states(obj)
+        self.poses = [(obj, st) for st in range(1, n_states + 1)]
         all_ligs = [obj] + extras if extras else obj
         _prepare_scene(prot, all_ligs)
+        if self.ref_ligand:
+            _color_ref_ligand(self.ref_ligand)
         _create_shell(prot, all_ligs)
         self._show_current()
         self._prefetch_all_properties()
 
     def _count(self):
-        if self.mode == "objects":
-            return len(self.ligand_objects)
-        return cmd.count_states(self.state_object)
+        return len(self.poses)
 
     def _label(self):
-        if self.mode == "objects":
-            return (self.ligand_objects[self.current_index]
-                    if self.ligand_objects else "none")
-        return f"{self.state_object} state {self.current_index + 1}"
+        if not self.poses:
+            return "none"
+        obj, st = self.poses[self.current_index]
+        return f"{obj} state {st}" if cmd.count_states(obj) > 1 else obj
 
     def next(self):
         c = self._count()
@@ -848,45 +868,48 @@ class LigandStepper:
     def refresh(self):
         """Re-detect interactions for the current PyMOL state without changing it.
 
-        In states mode this syncs current_index from cmd.get_state() so that
-        manual slider movement is reflected in the panel.
+        In states mode (single object) syncs current_index from cmd.get_state()
+        so that manual slider movement is reflected in the panel.
         """
-        if self.mode == "states" and self.state_object:
-            st = cmd.get_state()          # 1-based; follows the slider
-            self.current_index = max(0, st - 1)
-            cmd.zoom(f"({self.protein_sel}) within 8 of "
-                     f"({self.state_object})", buffer=3.0, animate=1)
-            self._update(self.state_object, state=st)
-        elif self.mode == "objects" and self.ligand_objects:
+        if not self.poses:
+            return
+        if self.mode == "states":
+            st = cmd.get_state()   # 1-based; follows the slider
+            for i, (o, s) in enumerate(self.poses):
+                if s == st:
+                    self.current_index = i
+                    break
+            obj, st2 = self.poses[self.current_index]
+            if self.auto_zoom:
+                cmd.zoom(f"({self.protein_sel}) within 8 of ({obj})",
+                         buffer=3.0, animate=1)
+            self._update(obj, state=st2)
+        else:
             self._show_current()
 
     def _show_current(self):
-        if self.mode == "objects":
-            obj_names = set(cmd.get_names("objects"))
-            for n in self.ligand_objects:
-                if n in obj_names:
-                    cmd.disable(n)
-            if self.ligand_objects:
-                cur = self.ligand_objects[self.current_index]
-                if cur in obj_names:
-                    cmd.enable(cur)
-                cmd.zoom(f"({self.protein_sel}) within 8 of ({cur})",
-                         buffer=3.0, animate=1)
-                self._update(cur)
-        else:
-            st = self.current_index + 1
-            cmd.set("state", st)
-            if self.ref_ligand:
-                try:
-                    if self.show_ref:
-                        cmd.enable(self.ref_ligand)
-                    else:
-                        cmd.disable(self.ref_ligand)
-                except Exception:
-                    pass
-            cmd.zoom(f"({self.protein_sel}) within 8 of "
-                     f"({self.state_object})", buffer=3.0, animate=1)
-            self._update(self.state_object, state=st)
+        if not self.poses:
+            return
+        obj, st = self.poses[self.current_index]
+        obj_names = set(cmd.get_names("objects"))
+        for n in {o for o, _ in self.poses}:
+            if n in obj_names:
+                cmd.disable(n)
+        if obj in obj_names:
+            cmd.enable(obj)
+        cmd.set("state", st)
+        if self.ref_ligand:
+            try:
+                if self.show_ref:
+                    cmd.enable(self.ref_ligand)
+                else:
+                    cmd.disable(self.ref_ligand)
+            except Exception:
+                pass
+        if self.auto_zoom:
+            cmd.zoom(f"({self.protein_sel}) within 8 of ({obj})",
+                     buffer=3.0, animate=1)
+        self._update(obj, state=st)
 
     def _update(self, lig, state=-1):
         import traceback
@@ -901,13 +924,13 @@ class LigandStepper:
                 do_clash_ugly=self.show_clash_ugly)
             self.last_result = r
             if self.sdf_records:
-                idx = (state - 1) if state > 0 else self.current_index
+                idx = self.current_index
                 self.last_properties = (self.sdf_records[idx]
                                         if 0 <= idx < len(self.sdf_records)
                                         else {})
             else:
-                prop_state = state if state > 0 else 1
-                self.last_properties = _get_pose_properties(lig, prop_state)
+                self.last_properties = _get_pose_properties(
+                    lig, state if state > 0 else 1)
             visualize(lig, self.protein_sel, r,
                       show_hbonds=self.show_hbonds,
                       show_labels=self.show_labels, state=state)
@@ -928,28 +951,50 @@ class LigandStepper:
                 except Exception:
                     pass
         except Exception as e:
-            msg = f"Contact Inspector error: {e}\n{traceback.format_exc()}"
+            msg = f"PoseViewer error: {e}\n{traceback.format_exc()}"
             print(msg)
             if _gui_window is not None:
                 try:
                     from pymol.Qt import QtWidgets
-                    QtWidgets.QMessageBox.warning(_gui_window, "Contact Inspector", str(e))
+                    QtWidgets.QMessageBox.warning(_gui_window, "PoseViewer", str(e))
                 except Exception:
                     pass
 
     def _prefetch_all_properties(self):
         """Populate all_properties: one dict per pose, used by the table view."""
-        if self.sdf_records:
+        if not self.sdf_records:
+            self.all_properties = [_get_pose_properties(obj, st)
+                                    for obj, st in self.poses]
+            return
+
+        if self.mode == "states":
+            # Single-object states mode: records are 1-to-1 with poses in SDF order
             self.all_properties = list(self.sdf_records)
             return
-        self.all_properties = []
-        if self.mode == "states" and self.state_object:
-            n = cmd.count_states(self.state_object)
-            for st in range(1, n + 1):
-                self.all_properties.append(_get_pose_properties(self.state_object, st))
-        elif self.mode == "objects":
-            for obj in self.ligand_objects:
-                self.all_properties.append(_get_pose_properties(obj, 1))
+
+        # Objects mode with SDF loaded: match records to poses by _name.
+        # Group SDF records by molecule title, preserving their in-file order.
+        # That order corresponds to state indices (1st occurrence = state 1, etc.)
+        # because docking software emits poses per compound in score order.
+        from collections import defaultdict
+        by_name: dict = defaultdict(list)
+        for rec in self.sdf_records:
+            by_name[rec.get("_name", "")].append(rec)
+
+        obj_names = {o for o, _ in self.poses}
+        if obj_names <= set(by_name.keys()):
+            # _name matches object names — use name-based alignment
+            counters: dict = defaultdict(int)
+            self.all_properties = []
+            for obj, _st in self.poses:
+                recs = by_name[obj]
+                i = counters[obj]
+                self.all_properties.append(recs[i] if i < len(recs) else {"_name": obj})
+                counters[obj] += 1
+        else:
+            # Names don't match — fall back to sequential (may mis-align)
+            n = len(self.poses)
+            self.all_properties = (list(self.sdf_records) + [{}] * n)[:n]
 
     def summary(self):
         r = self.last_result
@@ -1020,13 +1065,12 @@ def _parse_sdf_records(path: str) -> list:
                 key = m.group(1).strip()
                 raw = m.group(2).strip()
                 try:
-                    val_f = float(raw)
-                    props[key] = int(val_f) if val_f == int(val_f) else val_f
+                    props[key] = float(raw)
                 except (ValueError, OverflowError):
                     props[key] = raw
             records.append(props)
     except Exception as e:
-        print(f"Contact Inspector: could not parse SDF '{path}': {e}")
+        print(f"PoseViewer: could not parse SDF '{path}': {e}")
     return records
 
 
@@ -1056,7 +1100,7 @@ def _get_pose_properties(lig_name: str, state: int) -> dict:
 def _bind_keys():
     cmd.set_key("right", ci_next)
     cmd.set_key("left", ci_prev)
-    print("Contact Inspector: LEFT/RIGHT arrow keys bound.")
+    print("PoseViewer: LEFT/RIGHT arrow keys bound.")
 
 def _unbind_keys():
     try:
@@ -1073,7 +1117,7 @@ def _unbind_keys():
 def ci_setup(protein="polymer.protein", ligands="organic", mode="auto"):
     """
 DESCRIPTION
-    Setup Contact Inspector.
+    Setup PoseViewer.
 
 USAGE
     ci_setup [protein [, ligands [, mode]]]
@@ -1089,37 +1133,50 @@ EXAMPLES
             mode = "states"
         else:
             mode = "objects"
+            multi_state = []
             for n in names:
                 try:
                     if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
                             cmd.count_atoms(f"{n} and ({protein})") == 0 and
                             cmd.count_states(n) > 1):
-                        mode = "states"
-                        ligands = n
-                        break
+                        multi_state.append(n)
                 except CmdException:
                     pass
+            if len(multi_state) == 1:
+                # exactly one multi-state ligand — use states mode for ref-ligand support
+                mode = "states"
+                ligands = multi_state[0]
+            # else: multiple multi-state ligands or none → stay in objects mode
 
     if mode == "states":
         _stepper.setup_states(protein, ligands)
-        print(f"Contact Inspector: {cmd.count_states(ligands)} states.")
+        print(f"PoseViewer: {cmd.count_states(ligands)} states.")
     else:
         if "," in ligands:
             ligs = [l.strip() for l in ligands.split(",")]
+            ref_lig = None
         else:
             all_n = cmd.get_names("objects")
-            ligs = []
+            multi_ligs, single_ligs = [], []
             for n in all_n:
                 try:
-                    if cmd.count_atoms(f"{n} and ({ligands})") > 0:
-                        if cmd.count_atoms(f"{n} and ({protein})") == 0:
-                            ligs.append(n)
+                    if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
+                            cmd.count_atoms(f"{n} and ({protein})") == 0):
+                        (multi_ligs if cmd.count_states(n) > 1 else single_ligs).append(n)
                 except CmdException:
                     pass
+            # Multi-state objects are docking poses; single-state are ref-lig candidates
+            if multi_ligs:
+                ligs = multi_ligs
+                ref_lig = single_ligs[0] if single_ligs else None
+            else:
+                ligs = single_ligs   # all single-state — treat all as poses
+                ref_lig = None
             if not ligs:
                 ligs = [ligands]
-        _stepper.setup_objects(protein, ligs)
-        print(f"Contact Inspector: {len(ligs)} ligand(s).")
+                ref_lig = None
+        _stepper.setup_objects(protein, ligs, ref_lig=ref_lig)
+        print(f"PoseViewer: {len(ligs)} ligand(s).")
 
     _print_summary()
     _bind_keys()
@@ -1153,13 +1210,13 @@ USAGE
     ci_load_scores /path/to/poses.sdf
     """
     if not path:
-        print("Contact Inspector: ci_load_scores requires a file path.")
+        print("PoseViewer: ci_load_scores requires a file path.")
         return
     _stepper.sdf_records = _parse_sdf_records(path)
-    print(f"Contact Inspector: loaded {len(_stepper.sdf_records)} score records from '{path}'.")
+    print(f"PoseViewer: loaded {len(_stepper.sdf_records)} score records from '{path}'.")
 
 def ci_clear():
-    _clear_all(); _unbind_keys(); print("Contact Inspector: cleared.")
+    _clear_all(); _unbind_keys(); print("PoseViewer: cleared.")
 
 def ci_gui():
     _open_gui()
@@ -1183,7 +1240,7 @@ _gui_window = None
 
 def __init_plugin__(app=None):
     from pymol.plugins import addmenuitemqt
-    addmenuitemqt("Contact Inspector", _open_gui)
+    addmenuitemqt("PoseViewer", _open_gui)
 
 
 def _open_gui():
@@ -1199,7 +1256,7 @@ def _open_gui():
 
     win = QtWidgets.QWidget()
     _gui_window = win
-    win.setWindowTitle("Contact Inspector")
+    win.setWindowTitle("PoseViewer")
     win.setMinimumWidth(440)
     win.setAttribute(QtCore.Qt.WA_DeleteOnClose)
     win.destroyed.connect(lambda: _set_gui_none())
@@ -1207,6 +1264,21 @@ def _open_gui():
     root = QtWidgets.QVBoxLayout(win)
     root.setContentsMargins(8, 8, 8, 8)
     root.setSpacing(5)
+
+    splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+    root.addWidget(splitter)
+
+    top_w = QtWidgets.QWidget()
+    top_l = QtWidgets.QVBoxLayout(top_w)
+    top_l.setContentsMargins(0, 0, 0, 0)
+    top_l.setSpacing(5)
+    splitter.addWidget(top_w)
+
+    bot_w = QtWidgets.QWidget()
+    bot_l = QtWidgets.QVBoxLayout(bot_w)
+    bot_l.setContentsMargins(0, 0, 0, 0)
+    bot_l.setSpacing(5)
+    splitter.addWidget(bot_w)
 
     # Setup
     g_s = QtWidgets.QGroupBox("Setup")
@@ -1242,7 +1314,7 @@ def _open_gui():
     b_clear = QtWidgets.QPushButton("Clear")
     hl_b.addWidget(b_setup); hl_b.addWidget(b_clear)
     l_s.addLayout(hl_b, 4, 0, 1, 2)
-    root.addWidget(g_s)
+    top_l.addWidget(g_s)
 
     # Navigate
     g_n = QtWidgets.QGroupBox("Navigate")
@@ -1267,7 +1339,7 @@ def _open_gui():
     b_go = QtWidgets.QPushButton("Go"); b_go.setFixedWidth(50)
     hl_j.addWidget(b_go); hl_j.addStretch()
     l_n.addLayout(hl_j)
-    root.addWidget(g_n)
+    top_l.addWidget(g_n)
 
     # Reference ligand
     g_ref = QtWidgets.QGroupBox("Reference ligand")
@@ -1278,7 +1350,7 @@ def _open_gui():
     l_ref.addWidget(ref_combo, 1)
     cb_show_ref = QtWidgets.QCheckBox("Show"); cb_show_ref.setChecked(True)
     l_ref.addWidget(cb_show_ref)
-    root.addWidget(g_ref)
+    top_l.addWidget(g_ref)
 
     # Pose Data
     g_pd = QtWidgets.QGroupBox("Pose Data")
@@ -1296,14 +1368,14 @@ def _open_gui():
     tw_pd = QtWidgets.QTableWidget(0, 0)
     tw_pd.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
     tw_pd.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-    tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-    tw_pd.setMaximumHeight(200)
+    tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    tw_pd.setMinimumHeight(80)
     tw_pd.horizontalHeader().setStretchLastSection(True)
     tw_pd.horizontalHeader().setSectionsMovable(True)
     tw_pd.verticalHeader().setDefaultSectionSize(18)
     tw_pd.setAlternatingRowColors(True)
     l_pd.addWidget(tw_pd)
-    root.addWidget(g_pd)
+    top_l.addWidget(g_pd, 1)
 
     # Swatch+checkbox helper
     def _cb(lay, text, hex_color, checked=True):
@@ -1316,43 +1388,80 @@ def _open_gui():
         lay.addLayout(row)
         return cb
 
+    def _section(title, enabled=True, expanded=True, show_enable=True):
+        """Return (QGroupBox, enable_cb_or_None, body_widget, body_layout).
+
+        enable_cb toggles the group's interactions on/off independently of the
+        collapse arrow, which only shows/hides the body widget.
+        show_enable=False: header shows a plain bold label (e.g. Display group).
+        """
+        g = QtWidgets.QGroupBox()
+        gl = QtWidgets.QVBoxLayout(g)
+        gl.setContentsMargins(6, 4, 6, 6)
+        gl.setSpacing(2)
+        hl = QtWidgets.QHBoxLayout()
+        if show_enable:
+            en = QtWidgets.QCheckBox(title)
+            en.setChecked(enabled)
+            _f = en.font(); _f.setBold(True); en.setFont(_f)
+            hl.addWidget(en)
+        else:
+            lbl = QtWidgets.QLabel(title)
+            _f = lbl.font(); _f.setBold(True); lbl.setFont(_f)
+            hl.addWidget(lbl)
+            en = None
+        hl.addStretch()
+        btn_col = QtWidgets.QToolButton()
+        btn_col.setCheckable(True); btn_col.setChecked(expanded)
+        btn_col.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+        btn_col.setAutoRaise(True)
+        hl.addWidget(btn_col)
+        gl.addLayout(hl)
+        body = QtWidgets.QWidget()
+        bl = QtWidgets.QVBoxLayout(body)
+        bl.setContentsMargins(0, 2, 0, 0)
+        bl.setSpacing(2)
+        body.setVisible(expanded)
+        gl.addWidget(body)
+        def _toggle(checked):
+            body.setVisible(checked)
+            btn_col.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
+        btn_col.toggled.connect(_toggle)
+        return g, en, body, bl
+
     # Non-covalent bonds
-    g1 = QtWidgets.QGroupBox("Non-covalent bonds")
-    g1.setCheckable(True); g1.setChecked(True)
-    l1 = QtWidgets.QVBoxLayout(g1)
+    g1, g1_en, _g1b, l1 = _section("Non-covalent bonds", enabled=True, expanded=False)
     cb_hb = _cb(l1, "Hydrogen bonds",  "#ffd900")
     cb_xb = _cb(l1, "Halogen bonds",   "#9933e6")
     cb_sb = _cb(l1, "Salt bridges",    "#e633e6")
     cb_ah = _cb(l1, "Aromatic H-Bond", "#4dd97f")
-    root.addWidget(g1)
+    bot_l.addWidget(g1)
 
     # Pi interactions
-    g2 = QtWidgets.QGroupBox("Pi interactions")
-    g2.setCheckable(True); g2.setChecked(True)
-    l2 = QtWidgets.QVBoxLayout(g2)
+    g2, g2_en, _g2b, l2 = _section("Pi interactions", enabled=True, expanded=False)
     cb_pp = _cb(l2, "Pi-pi stacking",  "#4dc0ff")
     cb_pc = _cb(l2, "Pi-cation",       "#33cc33")
-    root.addWidget(g2)
+    bot_l.addWidget(g2)
 
-    # Contacts / clashes (off by default)
-    g3 = QtWidgets.QGroupBox("Contacts / Clashes")
-    g3.setCheckable(True); g3.setChecked(False)
-    l3 = QtWidgets.QVBoxLayout(g3)
+    # Contacts / clashes (disabled + collapsed by default)
+    g3, g3_en, _g3b, l3 = _section("Contacts / Clashes", enabled=False, expanded=False)
     cb_cg = _cb(l3, "Good",  "#33cc33", checked=True)
     cb_cb = _cb(l3, "Bad",   "#ff9900", checked=True)
     cb_cu = _cb(l3, "Ugly",  "#ff2626", checked=True)
-    root.addWidget(g3)
+    bot_l.addWidget(g3)
 
-    # Display options
-    cb_lb = QtWidgets.QCheckBox("Show distance labels")
-    cb_lb.setChecked(True)
-    root.addWidget(cb_lb)
-    cb_surf = QtWidgets.QCheckBox("Show surface")
-    cb_surf.setChecked(True)
-    root.addWidget(cb_surf)
-    cb_rlbl = QtWidgets.QCheckBox("Show residue labels")
-    cb_rlbl.setChecked(True)
-    root.addWidget(cb_rlbl)
+    # Display options — collapsible + group enable (hides all display effects when off)
+    g_disp, g_disp_en, _gdb, l_disp = _section("Display", enabled=True, expanded=False)
+    cb_lb   = QtWidgets.QCheckBox("Show distance labels");  cb_lb.setChecked(True)
+    cb_surf = QtWidgets.QCheckBox("Show surface");          cb_surf.setChecked(True)
+    cb_rlbl = QtWidgets.QCheckBox("Show residue labels");   cb_rlbl.setChecked(True)
+    cb_zoom = QtWidgets.QCheckBox("Auto-zoom to pose");     cb_zoom.setChecked(True)
+    for _w in (cb_lb, cb_surf, cb_rlbl, cb_zoom):
+        l_disp.addWidget(_w)
+    bot_l.addWidget(g_disp)
+    bot_l.addStretch()
+
+    splitter.setSizes([460, 200])
 
     # Callbacks
     def rebuild_table():
@@ -1369,17 +1478,17 @@ def _open_gui():
                 if k not in seen:
                     seen[k] = None
         cols = list(seen.keys())
-        rank_cols = [c for c in cols if c != "_name" and "rank" in c.lower()]
-        other_cols = [c for c in cols if c != "_name" and "rank" not in c.lower()]
-        cols = (["_name"] if "_name" in cols else []) + rank_cols + other_cols
+        cols = (["_name"] if "_name" in cols else []) + [
+            c for c in cols if c != "_name" and "rank" not in c.lower()]
         tw_pd.setColumnCount(len(cols))
-        tw_pd.setHorizontalHeaderLabels(cols)
+        headers = ["Ligand_ID" if c == "_name" else c for c in cols]
+        tw_pd.setHorizontalHeaderLabels(headers)
         tw_pd.setRowCount(len(all_props))
         for r, props in enumerate(all_props):
             for c, key in enumerate(cols):
                 val = props.get(key, "")
-                if isinstance(val, float):
-                    display = f"{val:.3f}"
+                if isinstance(val, (int, float)):
+                    display = f"{val:.2f}"
                 elif val == "":
                     display = ""
                 else:
@@ -1469,7 +1578,30 @@ def _open_gui():
         rebuild_table()
 
     def on_ref_changed(text):
+        prev = _stepper.ref_ligand
         _stepper.ref_ligand = None if text == "(none)" else text
+        if _stepper.ref_ligand:
+            _color_ref_ligand(_stepper.ref_ligand)
+            _stepper.show_ref = True
+            cb_show_ref.blockSignals(True)
+            cb_show_ref.setChecked(True)
+            cb_show_ref.blockSignals(False)
+        else:
+            if prev:
+                try:
+                    cmd.disable(prev)
+                except Exception:
+                    pass
+            if _OBJ_REF_PTS in _created_objects:
+                try:
+                    cmd.delete(_OBJ_REF_PTS)
+                    _created_objects.discard(_OBJ_REF_PTS)
+                except Exception:
+                    pass
+            _stepper.show_ref = False
+            cb_show_ref.blockSignals(True)
+            cb_show_ref.setChecked(False)
+            cb_show_ref.blockSignals(False)
         ci_update(); update_ui()
 
     def on_show_ref(state):
@@ -1490,11 +1622,38 @@ def _open_gui():
         tw_pd.setRowCount(0)
         tw_pd.setColumnCount(0)
 
+    def _table_adjacent(delta):
+        """Navigate to the row delta steps from the current row in table order."""
+        n_rows = tw_pd.rowCount()
+        if n_rows == 0:
+            # No table — fall back to poses order
+            if delta > 0:
+                ci_next()
+            else:
+                ci_prev()
+            update_ui()
+            return
+        cur = _stepper.current_index
+        # Find the row that matches the current pose
+        cur_row = -1
+        for r in range(n_rows):
+            item0 = tw_pd.item(r, 0)
+            if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
+                cur_row = r
+                break
+        next_row = (cur_row + delta) % n_rows
+        item0 = tw_pd.item(next_row, 0)
+        if item0 is not None:
+            pose_idx = item0.data(QtCore.Qt.UserRole)
+            if pose_idx is not None:
+                ci_goto(pose_idx)
+        update_ui()
+
     def do_prev():
-        ci_prev(); update_ui()
+        _table_adjacent(-1)
 
     def do_next():
-        ci_next(); update_ui()
+        _table_adjacent(1)
 
     def do_refresh():
         ci_refresh(); update_ui()
@@ -1502,13 +1661,13 @@ def _open_gui():
     def do_go():
         ci_goto(sp.value() - 1); update_ui()
 
-    def _tog(cb, attr, group):
+    def _tog(cb, attr, group_en):
         def h(state):
-            setattr(_stepper, attr, group.isChecked() and cb.isChecked())
+            setattr(_stepper, attr, group_en.isChecked() and cb.isChecked())
             ci_update(); update_ui()
         return h
 
-    def _group_tog(group, cb_attr_pairs):
+    def _group_tog(group_en, cb_attr_pairs):
         def h(checked):
             for cb, attr in cb_attr_pairs:
                 setattr(_stepper, attr, checked and cb.isChecked())
@@ -1525,44 +1684,56 @@ def _open_gui():
     b_next.clicked.connect(do_next)
     b_go.clicked.connect(do_go)
 
-    cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds",     g1))
-    cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen",    g1))
-    cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt",       g1))
-    cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb",    g1))
-    cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi",       g2))
-    cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation",  g2))
-    cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good", g3))
-    cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad",  g3))
-    cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly", g3))
-    cb_lb.stateChanged.connect(lambda s: [setattr(_stepper, "show_labels", cb_lb.isChecked()), ci_update(), update_ui()])
 
-    g1.toggled.connect(_group_tog(g1, [
+    cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds",     g1_en))
+    cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen",    g1_en))
+    cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt",       g1_en))
+    cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb",    g1_en))
+    cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi",       g2_en))
+    cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation",  g2_en))
+    cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good", g3_en))
+    cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad",  g3_en))
+    cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly", g3_en))
+    cb_zoom.stateChanged.connect(lambda s: setattr(_stepper, "auto_zoom", cb_zoom.isChecked()))
+
+    g1_en.stateChanged.connect(_group_tog(g1_en, [
         (cb_hb, "show_hbonds"), (cb_xb, "show_halogen"),
         (cb_sb, "show_salt"),   (cb_ah, "show_arom_hb"),
     ]))
-    g2.toggled.connect(_group_tog(g2, [
+    g2_en.stateChanged.connect(_group_tog(g2_en, [
         (cb_pp, "show_pipi"), (cb_pc, "show_pi_cation"),
     ]))
-    g3.toggled.connect(_group_tog(g3, [
+    g3_en.stateChanged.connect(_group_tog(g3_en, [
         (cb_cg, "show_clash_good"), (cb_cb, "show_clash_bad"), (cb_cu, "show_clash_ugly"),
     ]))
 
-    def do_toggle_surf(state):
+    def do_toggle_surf(state=None):
         if _OBJ_SURF in _created_objects:
-            if cb_surf.isChecked():
+            if g_disp_en.isChecked() and cb_surf.isChecked():
                 cmd.show("surface", _OBJ_SURF)
             else:
                 cmd.hide("surface", _OBJ_SURF)
     cb_surf.stateChanged.connect(do_toggle_surf)
 
-    def do_toggle_rlbl(state):
+    def do_toggle_rlbl(state=None):
         if _shell_sel is not None:
             sel = f"({_shell_sel}) and name CA"
-            if cb_rlbl.isChecked():
+            if g_disp_en.isChecked() and cb_rlbl.isChecked():
                 cmd.show("labels", sel)
             else:
                 cmd.hide("labels", sel)
     cb_rlbl.stateChanged.connect(do_toggle_rlbl)
+
+    def do_disp_group_tog(checked):
+        _stepper.show_labels = checked and cb_lb.isChecked()
+        do_toggle_surf()
+        do_toggle_rlbl()
+        ci_update(); update_ui()
+    g_disp_en.stateChanged.connect(do_disp_group_tog)
+
+    cb_lb.stateChanged.connect(lambda s: [
+        setattr(_stepper, "show_labels", g_disp_en.isChecked() and cb_lb.isChecked()),
+        ci_update(), update_ui()])
 
     tw_pd.cellClicked.connect(on_table_clicked)
     g_pd.toggled.connect(lambda checked: update_ui())
@@ -1571,24 +1742,6 @@ def _open_gui():
                     (QtCore.Qt.Key_Left, do_prev)]:
         sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), win)
         sc.activated.connect(fn)
-
-    # Auto-sync: poll PyMOL state every 250 ms so slider movement is reflected
-    # without needing to click Refresh.  Only acts when states differ.
-    _poll_timer = QtCore.QTimer(win)
-    _poll_timer.setInterval(250)
-
-    def _on_poll():
-        if _stepper.mode != "states" or not _stepper.state_object:
-            return
-        try:
-            if cmd.get_state() != _stepper.current_index + 1:
-                ci_refresh()
-                update_ui()
-        except Exception:
-            pass
-
-    _poll_timer.timeout.connect(_on_poll)
-    _poll_timer.start()
 
     win.show(); win.raise_()
 
@@ -1602,7 +1755,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-print("Contact Inspector loaded.")
+print("PoseViewer loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
 print("  ci_refresh     - sync to current PyMOL state / state slider")

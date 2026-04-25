@@ -1,4 +1,4 @@
-# Contact Inspector
+# PoseViewer
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review.
 
@@ -11,11 +11,10 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 
 - Detects and visualizes all major non-covalent protein-ligand interactions
 - Steps through docking poses (multi-state objects) or individual ligand objects
-- Auto-syncs interaction display when PyMOL's state slider is moved
 - Residue shell with line representation, CA labels, and a transparent surface
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
-- Pose data panel: displays docking scores and SD properties per pose
-- Qt GUI panel with group-level and per-type interaction toggles
+- Pose data table: sortable, clickable table of docking scores and SD properties per pose
+- Qt GUI panel with collapsible groups and per-type interaction toggles
 
 ### Interaction types
 
@@ -41,11 +40,11 @@ Reference ligand interactions are drawn with the same color scheme but thinner d
 
 **Option A — Plugin Manager (recommended):**
 1. In PyMOL: Plugin → Plugin Manager → Install New Plugin
-2. Select `contact_inspector.py`
+2. Select `PoseViewer.py`
 
 **Option B — Direct load:**
 ```
-run /path/to/contact_inspector.py
+run /path/to/PoseViewer.py
 ci_gui
 ```
 
@@ -71,9 +70,9 @@ ci_gui
 | `ci_prev` | Step to previous pose |
 | `ci_goto <index>` | Jump to pose by 0-based index |
 | `ci_update` | Re-detect interactions for current pose |
-| `ci_refresh` | Sync to current PyMOL state (follows state slider) |
+| `ci_refresh` | Sync panel to current PyMOL state |
 | `ci_load_scores <path>` | Load per-pose SD properties from an SDF file |
-| `ci_clear` | Remove all contact inspector objects |
+| `ci_clear` | Remove all PoseViewer objects |
 
 ### `ci_setup` parameters
 
@@ -98,9 +97,9 @@ ci_load_scores /path/to/gnina_output.sdf
 
 **objects mode** — each ligand is a separate PyMOL object. The plugin cycles through them, enabling one at a time.
 
-**states mode** — all docking poses are states of a single PyMOL object (e.g. GNINA output). The plugin steps through states. The panel auto-syncs with PyMOL's state slider every 250 ms — no need to click Refresh when the slider is moved manually.
+**states mode** — all docking poses are states of a single PyMOL object (e.g. GNINA output). The plugin steps through states.
 
-**auto mode** — inspects loaded objects. Uses states mode if any object matching the ligand selection has more than one state; otherwise uses objects mode.
+**auto mode** — inspects loaded objects. Uses states mode if exactly one object matching the ligand selection has more than one state; otherwise uses objects mode.
 
 ---
 
@@ -113,40 +112,47 @@ ci_load_scores /path/to/gnina_output.sdf
 | Protein | PyMOL selection for the receptor |
 | Ligand(s) | Object name(s) or selection (comma-separated for objects mode) |
 | Mode | auto / objects / states |
-| Scores (SDF) | Optional path to an SDF file containing per-pose SD data tags (e.g. GNINA output). Browse button available. Scores are read directly from the file since open-source PyMOL does not preserve SDF properties on load. |
+| Scores (SDF) | Optional path to an SDF file with per-pose SD data tags (e.g. GNINA output). Browse button available. Scores are read directly from the file since open-source PyMOL does not preserve SDF properties on load. |
 
 ### Navigate group
 
 | Control | Description |
 |---|---|
-| Prev / Next | Step through poses |
-| Refresh | Re-detect interactions for the current PyMOL state; syncs panel to state slider in states mode |
+| Prev / Next | Step through poses in current table sort order |
+| Refresh | Re-detect interactions for the current PyMOL state |
 | Go to # | Jump to pose by 1-based number |
 
 ### Reference ligand group
 
-Selects a persistent reference ligand (e.g. co-crystal structure) that remains visible alongside every pose and always shows its own interaction lines.
+Selects a persistent reference ligand (e.g. co-crystal structure) that remains visible alongside every pose and always shows its own interaction lines. The reference is colored magenta (C atoms) to distinguish it from docking poses.
 
 | Control | Description |
 |---|---|
-| Object dropdown | Lists all organic objects that are not the receptor. Auto-populated on Setup; can be overridden. Select `(none)` to disable. |
+| Object dropdown | Lists all organic objects that are not the receptor. Auto-populated on Setup; can be overridden. Select `(none)` to disable and hide the reference ligand. |
 | Show checkbox | Hides/shows both the reference ligand object and all its interaction lines |
 
 ### Pose Data group
 
-Displays SD data tag properties for the current pose (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Requires a scores SDF to be loaded. Collapsible.
+Sortable, clickable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Clicking a row navigates to that pose. Prev/Next step in current sort order. Column headers are movable. Rank columns are excluded (redundant with score sorting). Requires a scores SDF to be loaded, or Incentive PyMOL.
 
-### Interaction type groups
+### Interaction groups (Non-covalent bonds / Pi interactions / Contacts/Clashes)
 
-Each group (Non-covalent bonds, Pi interactions, Contacts/Clashes) has a title-bar checkbox to toggle the entire group. Individual interaction types can be toggled independently within each group. Contacts/Clashes group is off by default.
+Each group has:
+- An **enable checkbox** (bold title) — toggles all interactions in that group on/off independently
+- A **collapse arrow** (▶/▼) — hides/shows the group body without affecting the enable state
 
-### Display options
+Individual interaction types can be toggled within each group. Contacts/Clashes are disabled by default.
+
+### Display group
 
 | Option | Default | Description |
 |---|---|---|
 | Show distance labels | On | Show/hide Å labels on interaction dashes |
 | Show surface | On | Show/hide the transparent pocket surface |
 | Show residue labels | On | Show/hide CA residue name+number labels on the shell |
+| Auto-zoom to pose | On | Zoom to binding site on each pose change |
+
+The Display group enable checkbox hides all display elements at once (surface, labels) without changing individual settings.
 
 ---
 
