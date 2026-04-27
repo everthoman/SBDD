@@ -1002,8 +1002,10 @@ class LigandStepper:
             by_name[rec.get("_name", "")].append(rec)
 
         obj_names = {o for o, _ in self.poses}
-        if obj_names <= set(by_name.keys()):
-            # _name matches object names — use name-based alignment
+        if obj_names & set(by_name.keys()):
+            # at least some _names match object names — use name-based alignment;
+            # unmatched objects (e.g. a ref ligand included as a pose) get a
+            # sparse entry instead of stealing a sequential SDF record
             counters: dict = defaultdict(int)
             self.all_properties = []
             for obj, _st in self.poses:
@@ -1194,8 +1196,23 @@ EXAMPLES
                 ligs = multi_ligs
                 ref_lig = single_ligs[0] if single_ligs else None
             else:
-                ligs = single_ligs   # all single-state — treat all as poses
-                ref_lig = None
+                # All single-state: if a scores SDF is loaded, use its molecule
+                # names to separate pose ligands (appear in SDF) from ref candidates
+                # (don't appear in SDF). Without SDF, treat everything as poses.
+                if _stepper.sdf_records:
+                    sdf_names = {r.get("_name", "")
+                                 for r in _stepper.sdf_records if r.get("_name")}
+                    matched   = [n for n in single_ligs if n in sdf_names]
+                    unmatched = [n for n in single_ligs if n not in sdf_names]
+                    if matched:
+                        ligs    = matched
+                        ref_lig = unmatched[0] if len(unmatched) == 1 else None
+                    else:
+                        ligs    = single_ligs
+                        ref_lig = None
+                else:
+                    ligs    = single_ligs
+                    ref_lig = None
             if not ligs:
                 ligs = [ligands]
                 ref_lig = None
