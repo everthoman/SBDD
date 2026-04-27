@@ -834,7 +834,7 @@ class LigandStepper:
         self.mode = "states"
         extras = []
         for n in cmd.get_names("objects"):
-            if n == obj:
+            if n == obj or n in _created_objects:
                 continue
             try:
                 if (cmd.count_atoms(f"{n} and organic") > 0 and
@@ -1155,6 +1155,8 @@ EXAMPLES
             mode = "objects"
             multi_state = []
             for n in names:
+                if n in _created_objects:
+                    continue
                 try:
                     if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
                             cmd.count_atoms(f"{n} and ({protein})") == 0 and
@@ -1179,6 +1181,8 @@ EXAMPLES
             all_n = cmd.get_names("objects")
             multi_ligs, single_ligs = [], []
             for n in all_n:
+                if n in _created_objects:
+                    continue
                 try:
                     if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
                             cmd.count_atoms(f"{n} and ({protein})") == 0):
