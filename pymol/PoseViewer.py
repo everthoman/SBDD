@@ -1087,9 +1087,12 @@ def _parse_sdf_records(path: str) -> list:
                 key = m.group(1).strip()
                 raw = m.group(2).strip()
                 try:
-                    props[key] = float(raw)
+                    props[key] = int(raw)
                 except (ValueError, OverflowError):
-                    props[key] = raw
+                    try:
+                        props[key] = float(raw)
+                    except (ValueError, OverflowError):
+                        props[key] = raw
             records.append(props)
     except Exception as e:
         print(f"PoseViewer: could not parse SDF '{path}': {e}")
@@ -1531,7 +1534,9 @@ def _open_gui():
         for r, props in enumerate(all_props):
             for c, key in enumerate(cols):
                 val = props.get(key, "")
-                if isinstance(val, (int, float)):
+                if isinstance(val, int):
+                    display = str(val)
+                elif isinstance(val, float):
                     display = f"{val:.2f}"
                 elif val == "":
                     display = ""
