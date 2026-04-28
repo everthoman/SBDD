@@ -306,7 +306,7 @@ def run_cv(
             f"  CV ROC-AUC {np.mean(aucs):.3f} ± {np.std(aucs):.3f}  "
             f"AP {np.mean(aps):.3f} ± {np.std(aps):.3f}"
         )
-    return cv_proba, cp_p_hit, cp_p_nonhit
+    return cv_proba, cp_p_hit, cp_p_nonhit, aucs, aps
 
 
 # ── MVS-A sample influence ───────────────────────────────────────────────────
@@ -442,6 +442,22 @@ def annotate_filters(
 
 # ── report ────────────────────────────────────────────────────────────────────
 
+_FP_COLORS = {0: "#2ca02c", 1: "#ff7f0e", 2: "#d62728"}   # green / orange / red
+
+
+def _flag_count(s) -> int:
+    if pd.isna(s) or s == "":
+        return 0
+    return len(s.split(";"))
+
+
+def _savefig(fig, tmp: str, name: str) -> str:
+    import os
+    p = os.path.join(tmp, name)
+    fig.savefig(p, dpi=130, bbox_inches="tight")
+    return p
+
+
 def write_report(
     df_out: pd.DataFrame,
     activity_cols: list[str],
@@ -452,72 +468,204 @@ def write_report(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Image, Paragraph, Spacer, Table
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.lib.units import cm
-        import tempfile, os
+        import tempfile
 
+        plt.rcParams.update({"font.size": 9, "axes.titlesize": 10})
         tmp = tempfile.mkdtemp()
-        figs = []
+        figs: list[str] = []
 
-        # Activity + score distributions
-        n = len(activity_cols)
-        fig, axes = plt.subplots(n, 2, figsize=(10, 3 * n), squeeze=False)
+        n_total  = len(df_out)
+        n_hits   = int(df_out["is_hit"].sum())
+        base_rate = n_hits / n_total if n_total else 0
+
+        # ── 1. Activity raw + z-score distributions ───────────────────────────
+        n_cols = len(activity_cols)
+        fig, axes = plt.subplots(n_cols, 2, figsize=(10, 3 * n_cols), squeeze=False)
         for i, (ac, sc) in enumerate(zip(activity_cols, score_cols)):
-            axes[i, 0].hist(df_out[ac].dropna(), bins=50, color="steelblue", edgecolor="white")
-            axes[i, 0].set_xlabel(ac); axes[i, 0].set_ylabel("Count")
-            axes[i, 0].set_title(f"Activity: {ac}")
-            axes[i, 1].hist(df_out[sc].dropna(), bins=50, color="darkorange", edgecolor="white")
-            axes[i, 1].set_xlabel(sc); axes[i, 1].set_ylabel("Count")
-            axes[i, 1].set_title(f"Normalized: {sc}")
+            axes[i, 0].hist(df_out[ac].dropna(), bins=60, color="steelblue", edgecolor="none")
+            axes[i, 0].set(xlabel=ac, ylabel="Count", title=f"Activity: {ac}")
+            axes[i, 1].hist(df_out[sc].dropna(), bins=60, color="darkorange", edgecolor="none")
+            axes[i, 1].set(xlabel=sc, ylabel="Count", title=f"Normalised: {sc}")
         fig.tight_layout()
-        p = os.path.join(tmp, "hist_activity.png")
-        fig.savefig(p, dpi=120, bbox_inches="tight")
+        figs.append(_savefig(fig, tmp, "01_activity_dist.png"))
         plt.close(fig)
-        figs.append(p)
 
-        # Score vs rank
-        fig, ax = plt.subplots(figsize=(6, 3))
-        rank_col = "cv_hit_prob" if "cv_hit_prob" in df_out.columns else "hit_prob"
-        ax.plot(df_out["rank"].values, df_out[rank_col].values, lw=0.8, color="firebrick")
-        ax.set_xlabel("Rank"); ax.set_ylabel("Predicted hit probability")
-        ax.set_title("Score vs rank")
-        p = os.path.join(tmp, "score_vs_rank.png")
-        fig.savefig(p, dpi=120, bbox_inches="tight")
-        plt.close(fig)
-        figs.append(p)
+        # ── 2. Enrichment curve ───────────────────────────────────────────────
+        if n_hits > 0:
+            is_hit_sorted = df_out["is_hit"].values
+            k = np.arange(1, n_total + 1)
+            cumhits  = np.cumsum(is_hit_sorted)
+            prec_k   = cumhits / k
+            recall_k = cumhits / n_hits
+            ef_k     = prec_k / base_rate
 
-        # Conformal confidence histogram (if available)
-        if "cp_confidence" in df_out.columns:
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.hist(df_out["cp_confidence"].dropna(), bins=50, color="seagreen", edgecolor="white")
-            ax.set_xlabel("Conformal confidence"); ax.set_ylabel("Count")
-            ax.set_title("Prediction confidence distribution")
-            p = os.path.join(tmp, "cp_confidence.png")
-            fig.savefig(p, dpi=120, bbox_inches="tight")
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+            # Precision@k (hit rate in top-k)
+            ax = axes[0]
+            ax.plot(k / n_total * 100, prec_k * 100, color="firebrick", lw=1.2, label="hitpicker")
+            ax.axhline(base_rate * 100, color="grey", lw=0.8, ls="--", label="random")
+            ax.set(xlabel="% library screened", ylabel="Hit rate (%)",
+                   title="Enrichment: precision@k", xlim=(0, 100))
+            ax.legend(frameon=False)
+
+            # Enrichment factor@k
+            ax = axes[1]
+            ax.plot(k / n_total * 100, ef_k, color="steelblue", lw=1.2)
+            ax.axhline(1.0, color="grey", lw=0.8, ls="--")
+            ax.set(xlabel="% library screened", ylabel="Enrichment factor",
+                   title="Enrichment factor@k", xlim=(0, 100))
+
+            fig.tight_layout()
+            figs.append(_savefig(fig, tmp, "02_enrichment.png"))
             plt.close(fig)
-            figs.append(p)
 
+        # ── 3. Z-score vs MVS-A scatter (confirmed hits) ──────────────────────
+        if "mvsa_score" in df_out.columns and n_hits > 0:
+            hits = df_out[df_out["is_hit"] == 1].copy()
+            primary_score = score_cols[0]
+            n_fp = hits.get("fp_flags", pd.Series("", index=hits.index)).apply(_flag_count)
+            c = n_fp.clip(upper=2).map(_FP_COLORS)
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(hits[primary_score], hits["mvsa_score"],
+                       c=c, s=30, alpha=0.75, linewidths=0)
+            if "mvsa_score" in df_out.columns:
+                cut = df_out.loc[df_out["is_hit"] == 1, "mvsa_score"].median()
+                ax.axhline(cut, color="grey", lw=0.8, ls="--", label="MVS-A median (high_mvsa cutoff)")
+            ax.set(xlabel=f"Z-score ({primary_score})", ylabel="MVS-A score",
+                   title="Z-score vs MVS-A for confirmed hits\n"
+                         "(bottom-right = high activity + low false-positive risk)")
+            patches = [mpatches.Patch(color=_FP_COLORS[k], label=f"{k}{'+'*(k==2)} fp_flags")
+                       for k in (0, 1, 2)]
+            ax.legend(handles=patches, frameon=False, fontsize=8)
+            fig.tight_layout()
+            figs.append(_savefig(fig, tmp, "03_zscore_vs_mvsa.png"))
+            plt.close(fig)
+
+        # ── 4. MVS-A distribution: hits vs non-hits ───────────────────────────
+        if "mvsa_score" in df_out.columns:
+            hit_mvsa    = df_out.loc[df_out["is_hit"] == 1, "mvsa_score"].dropna()
+            nonhit_mvsa = df_out.loc[df_out["is_hit"] == 0, "mvsa_score"].dropna()
+
+            fig, ax = plt.subplots(figsize=(7, 4))
+            bins = np.histogram_bin_edges(
+                pd.concat([hit_mvsa, nonhit_mvsa]), bins=50
+            )
+            ax.hist(nonhit_mvsa, bins=bins, color="steelblue",  alpha=0.5,
+                    label=f"Non-hits (n={len(nonhit_mvsa):,})", density=True)
+            ax.hist(hit_mvsa,    bins=bins, color="firebrick",  alpha=0.7,
+                    label=f"Confirmed hits (n={len(hit_mvsa):,})", density=True)
+            if len(hit_mvsa) > 0:
+                cut = hit_mvsa.median()
+                ax.axvline(cut, color="black", lw=1.0, ls="--",
+                           label=f"hit median = {cut:.3f}\n(high_mvsa threshold)")
+            ax.set(xlabel="MVS-A score", ylabel="Density",
+                   title="MVS-A distribution\n"
+                         "Hits: low = likely true positive  |  Non-hits: high = likely false negative")
+            ax.legend(frameon=False, fontsize=8)
+            fig.tight_layout()
+            figs.append(_savefig(fig, tmp, "04_mvsa_dist.png"))
+            plt.close(fig)
+
+        # ── 5. False-positive flag breakdown ─────────────────────────────────
+        if "fp_flags" in df_out.columns and n_hits > 0:
+            hit_flags = df_out.loc[df_out["is_hit"] == 1, "fp_flags"].fillna("")
+            flag_types = ["high_mvsa", "struct_alert", "reos"]
+            tier_counts = hit_flags.apply(_flag_count).value_counts().sort_index()
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+            # Left: tier bar chart
+            ax = axes[0]
+            tiers = [0, 1, 2]
+            counts_by_tier = [int(tier_counts.get(t, 0)) for t in tiers]
+            colors_tier = [_FP_COLORS[t] for t in tiers]
+            bars = ax.bar([f"{t} flag{'s' if t!=1 else ''}" for t in tiers],
+                          counts_by_tier, color=colors_tier, edgecolor="white")
+            ax.bar_label(bars, padding=2)
+            ax.set(ylabel="Confirmed hits", title="FP risk tier distribution")
+
+            # Right: individual flag prevalence
+            ax = axes[1]
+            flag_counts = {f: int(hit_flags.str.contains(f).sum()) for f in flag_types}
+            ax.barh(list(flag_counts.keys()), list(flag_counts.values()),
+                    color=["#d62728", "#9467bd", "#8c564b"], edgecolor="white")
+            ax.set(xlabel="Confirmed hits flagged", title="Individual flag prevalence",
+                   xlim=(0, max(flag_counts.values()) * 1.15 + 1))
+            for i, (k, v) in enumerate(flag_counts.items()):
+                ax.text(v + 0.3, i, str(v), va="center", fontsize=8)
+
+            fig.tight_layout()
+            figs.append(_savefig(fig, tmp, "05_fp_flags.png"))
+            plt.close(fig)
+
+        # ── 6. Conformal prediction breakdown ────────────────────────────────
+        if "cp_prediction" in df_out.columns:
+            labels   = ["hit", "nonhit", "uncertain", "outlier"]
+            cp_colors = ["#2ca02c", "#aec7e8", "#ff7f0e", "#d62728"]
+            all_counts = [int((df_out["cp_prediction"] == l).sum()) for l in labels]
+            hit_counts = [
+                int(((df_out["cp_prediction"] == l) & (df_out["is_hit"] == 1)).sum())
+                for l in labels
+            ]
+
+            fig, ax = plt.subplots(figsize=(7, 4))
+            x = np.arange(len(labels))
+            w = 0.35
+            b1 = ax.bar(x - w/2, all_counts, w, label="All compounds",
+                        color=cp_colors, alpha=0.6, edgecolor="white")
+            b2 = ax.bar(x + w/2, hit_counts,  w, label="Confirmed hits",
+                        color=cp_colors, alpha=1.0, edgecolor="white")
+            ax.bar_label(b1, padding=2, fontsize=7)
+            ax.bar_label(b2, padding=2, fontsize=7)
+            ax.set_xticks(x); ax.set_xticklabels(labels)
+            ax.set(ylabel="Count",
+                   title=f"Conformal prediction sets  (α = {df_out.get('cp_p_hit', pd.Series()).name or '?'})")
+            ax.legend(frameon=False)
+            fig.tight_layout()
+            figs.append(_savefig(fig, tmp, "06_cp_prediction.png"))
+            plt.close(fig)
+
+        # ── assemble PDF ──────────────────────────────────────────────────────
         pdf_path = out_prefix + "_hitpicker_report.pdf"
         doc = SimpleDocTemplate(pdf_path, pagesize=A4)
         styles = getSampleStyleSheet()
-        story = [Paragraph("hitpicker.py — Hit Picking Report", styles["Title"]),
-                 Spacer(1, 0.4 * cm)]
+        story  = [
+            Paragraph("hitpicker.py — Hit Picking Report", styles["Title"]),
+            Spacer(1, 0.3 * cm),
+        ]
 
-        n_hits = int(df_out["is_hit"].sum())
-        hit_rate = n_hits / len(df_out) * 100
-        top100_rate = df_out.head(100)["is_hit"].mean() * 100
+        top_n = min(100, n_hits) if n_hits > 0 else 100
+        top_rate = df_out.head(top_n)["is_hit"].mean() * 100
+        n_0flag = int(((df_out.get("fp_flags", pd.Series("")).apply(_flag_count) == 0)
+                       & (df_out["is_hit"] == 1)).sum()) if "fp_flags" in df_out.columns else "—"
         summary = [
-            ["Total compounds", str(len(df_out))],
-            ["Confirmed hits", f"{n_hits} ({hit_rate:.1f}%)"],
-            ["Top-100 hit rate", f"{top100_rate:.1f}%"],
+            ["Total compounds",      f"{n_total:,}"],
+            ["Confirmed hits",       f"{n_hits:,} ({base_rate*100:.1f}%)"],
+            [f"Top-{top_n} hit rate", f"{top_rate:.1f}%"],
+            ["0-flag hits (safest)", str(n_0flag)],
         ]
         story.append(Table(summary))
         story.append(Spacer(1, 0.4 * cm))
 
-        for fig_path in figs:
-            story.append(Image(fig_path, width=14 * cm, height=7 * cm))
+        fig_h = {
+            "01_activity_dist.png": 9,
+            "02_enrichment.png":    6,
+            "03_zscore_vs_mvsa.png": 7,
+            "04_mvsa_dist.png":     5,
+            "05_fp_flags.png":      5,
+            "06_cp_prediction.png": 5,
+        }
+        for p in figs:
+            name = p.split("/")[-1]
+            h = fig_h.get(name, 6)
+            story.append(Image(p, width=14 * cm, height=h * cm))
             story.append(Spacer(1, 0.3 * cm))
 
         doc.build(story)
@@ -705,9 +853,11 @@ def main():
 
     # ── cross-validation + conformal prediction ───────────────────────────────
     cv_proba = cp_p_hit = cp_p_nonhit = None
+    cv_aucs: list[float] = []
+    cv_aps:  list[float] = []
     if not args.no_cv and n_train_hits >= 2 and (len(y_train) - n_train_hits) >= 2:
         log.info(f"Running {args.n_folds}-fold stratified CV with conformal prediction…")
-        cv_proba, cp_p_hit, cp_p_nonhit = run_cv(
+        cv_proba, cp_p_hit, cp_p_nonhit, cv_aucs, cv_aps = run_cv(
             X, y_train, n_splits=args.n_folds, seed=args.seed
         )
     elif args.no_cv:
@@ -863,6 +1013,45 @@ def main():
         f"Top-{top_n} hit rate: {top_hit_rate:.1f}%  "
         f"(overall: {hit_rate:.1f}%,  clean training hits: {n_train_hits})"
     )
+
+    # ── model statistics ──────────────────────────────────────────────────────
+    import json
+    stats: dict = {
+        "n_compounds":  int(len(df_out)),
+        "n_hits":       int(n_hits),
+        "hit_rate":     round(hit_rate / 100, 4),
+        "n_train_hits": int(n_train_hits),
+    }
+
+    if cv_proba is not None and int(y_train.sum()) > 0 and int((y_train == 0).sum()) > 0:
+        from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+        stats["cv_roc_auc"]       = round(float(roc_auc_score(y_train, cv_proba)), 4)
+        stats["cv_avg_precision"] = round(float(average_precision_score(y_train, cv_proba)), 4)
+        stats["cv_brier"]         = round(float(brier_score_loss(y_train, cv_proba)), 4)
+        if cv_aucs:
+            stats["cv_roc_auc_per_fold"]       = [round(v, 4) for v in cv_aucs]
+            stats["cv_avg_precision_per_fold"] = [round(v, 4) for v in cv_aps]
+
+    # enrichment factors ranked by model score (not the hit-first sort order)
+    ef_score_col = "cv_hit_prob" if "cv_hit_prob" in df_out.columns else "hit_prob"
+    if n_hits > 0 and ef_score_col in df_out.columns:
+        ranked_hits = df_out.sort_values(ef_score_col, ascending=False)["is_hit"].values
+        n_total = len(ranked_hits)
+        base_rate = n_hits / n_total
+        for k in (0.01, 0.05, 0.10):
+            cutoff = max(1, int(np.ceil(n_total * k)))
+            prec_k = float(ranked_hits[:cutoff].mean())
+            ef = round(prec_k / base_rate, 3) if base_rate > 0 else None
+            label = int(k * 100)
+            stats[f"ef_{label}pct"]           = ef
+            stats[f"hit_rate_top_{label}pct"] = round(prec_k, 4)
+
+    stats[f"hit_rate_top{top_n}"] = round(float(top_hit_rate / 100), 4)
+
+    stats_path = out_prefix + "_hitpicker_stats.json"
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    log.info(f"Wrote stats → {stats_path}")
 
     if args.report:
         write_report(df_out, args.act_col, score_cols, out_prefix)
