@@ -1683,8 +1683,8 @@ def _open_gui():
         for r, props in enumerate(all_props):
             for c, key in enumerate(cols):
                 val = props.get(key, "")
-                if isinstance(val, int) or (isinstance(val, float) and val == int(val)):
-                    display = str(int(val))
+                if isinstance(val, int):
+                    display = str(val)
                 elif isinstance(val, float):
                     display = f"{val:.2f}"
                 elif val == "":
