@@ -146,6 +146,7 @@ def _clear_all():
         try: cmd.delete(name)
         except Exception: pass
     _created_objects.clear()
+    _stepper._cleanup_cmp()
 
 # ---------------------------------------------------------------------------
 # Vector helpers
@@ -782,6 +783,8 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
 # ---------------------------------------------------------------------------
 
 class LigandStepper:
+    _COMPARE_PALETTE = ["cyan", "tv_orange", "forest", "hotpink", "violet", "salmon"]
+
     def __init__(self):
         self.protein_sel = ""
         self.ligand_objects: List[str] = []
@@ -809,6 +812,11 @@ class LigandStepper:
         self.show_ref: bool = True
         self.show_pose: bool = True
         self.show_lig_h: bool = False
+        self._cmp_objs:      List[str]      = []
+        self._cmp_indices:   List[int]      = []
+        self._in_compare:    bool           = False
+        self._obj_colors:    Dict[str, str] = {}
+        self.show_cmp_hbonds: bool          = False
 
     def setup_objects(self, prot, ligs, ref_lig=None):
         self.protein_sel = prot
@@ -826,6 +834,7 @@ class LigandStepper:
         if ligs:
             self._show_current()
         self._prefetch_all_properties()
+        self._build_obj_colors()
 
     def setup_states(self, prot, obj):
         self.protein_sel = prot
@@ -852,6 +861,7 @@ class LigandStepper:
         _create_shell(prot, all_ligs)
         self._show_current()
         self._prefetch_all_properties()
+        self._build_obj_colors()
 
     def _count(self):
         return len(self.poses)
@@ -885,6 +895,8 @@ class LigandStepper:
         In states mode (single object) syncs current_index from cmd.get_state()
         so that manual slider movement is reflected in the panel.
         """
+        if self._in_compare:
+            return
         if not self.poses:
             return
         if self.mode == "states":
@@ -901,6 +913,7 @@ class LigandStepper:
             self._show_current()
 
     def _show_current(self):
+        self._cleanup_cmp()
         if not self.poses:
             return
         obj, st = self.poses[self.current_index]
@@ -927,6 +940,136 @@ class LigandStepper:
             elif self.ref_ligand and self.show_ref:
                 cmd.zoom(self.ref_ligand, buffer=3.0, animate=1, state=1)
         self._update(obj, state=st)
+
+    def _build_obj_colors(self):
+        seen = dict.fromkeys(obj for obj, _ in self.poses)
+        self._obj_colors = {n: self._COMPARE_PALETTE[i % len(self._COMPARE_PALETTE)]
+                            for i, n in enumerate(seen)}
+
+    def _cleanup_cmp(self):
+        for name in self._cmp_objs:
+            try: cmd.delete(name)
+            except Exception: pass
+            _created_objects.discard(name)
+        self._cmp_objs.clear()
+        self._in_compare = False
+
+    def show_comparison(self, indices: List[int]):
+        """Show two poses simultaneously as colored single-state copies.
+
+        Each pose is extracted via cmd.create so the global state slider does not
+        interfere.  Interactions are hidden by default; H-bonds shown if
+        show_cmp_hbonds is True, colored per source object.
+        """
+        self._cleanup_cmp()
+        _clear_contacts()
+        _register_colors()
+
+        for obj in {o for o, _ in self.poses}:
+            try: cmd.disable(obj)
+            except Exception: pass
+
+        # Two poses from the same object get slot-index colors (e.g. states mode);
+        # poses from different objects use their per-object palette entry.
+        n = len(indices)
+        same_obj = (n >= 2 and self.poses[indices[0]][0] == self.poses[indices[1]][0])
+
+        def _slot_color(slot: int, pose_idx: int) -> str:
+            if same_obj:
+                return self._COMPARE_PALETTE[slot % len(self._COMPARE_PALETTE)]
+            obj, _ = self.poses[pose_idx]
+            return self._obj_colors.get(obj, self._COMPARE_PALETTE[slot % len(self._COMPARE_PALETTE)])
+
+        lig_sels: List[str] = []
+        for i, pose_idx in enumerate(indices[:2]):
+            obj, st = self.poses[pose_idx]
+            tmp = f"_cmp_{i}"
+            try:
+                cmd.create(tmp, obj, st, 1)
+                _track(tmp)
+                self._cmp_objs.append(tmp)
+                color = _slot_color(i, pose_idx)
+                cmd.show("sticks", tmp)
+                cmd.color(color,   f"({tmp}) and elem C")
+                cmd.color("white", f"({tmp}) and elem H")
+                _apply_elem_colors(tmp)
+                cmd.hide("everything",
+                         f"({tmp}) and elem H and not (neighbor (elem N+O+S))")
+                if self.show_lig_h:
+                    _apply_lig_h(tmp, True)
+                lig_sels.append(tmp)
+            except Exception as e:
+                print(f"PoseViewer: compare copy failed for pose {pose_idx}: {e}")
+
+        if not lig_sels:
+            return
+
+        self._in_compare  = True
+        self._cmp_indices = list(indices[:2])
+        self.current_index = indices[0]
+
+        if self.ref_ligand:
+            try:
+                cmd.enable(self.ref_ligand) if self.show_ref else cmd.disable(self.ref_ligand)
+            except Exception:
+                pass
+            if self.show_ref:
+                _color_ref_ligand(self.ref_ligand)
+
+        shell_ligs = lig_sels + ([self.ref_ligand] if self.ref_ligand and self.show_ref else [])
+        _create_shell(self.protein_sel, shell_ligs)
+
+        if self.show_cmp_hbonds:
+            for i, (tmp, pose_idx) in enumerate(zip(lig_sels, indices[:2])):
+                color = _slot_color(i, pose_idx)
+                hb_name = f"_cmp_hb_{i}"
+                try:
+                    n_hb = cmd.distance(hb_name, tmp, self.protein_sel, mode=2)
+                    if n_hb and n_hb > 0:
+                        _track(hb_name)
+                        cmd.set("dash_radius", DASH_RADIUS, hb_name)
+                        cmd.set("dash_gap",    DASH_GAP,    hb_name)
+                        cmd.set("dash_length", DASH_LENGTH, hb_name)
+                        cmd.color(color, hb_name)
+                        cmd.set("label_color", "white",     hb_name)
+                        cmd.set("label_size",  LABEL_SIZE,  hb_name)
+                        if not self.show_labels:
+                            cmd.hide("labels", hb_name)
+                    else:
+                        try: cmd.delete(hb_name)
+                        except Exception: pass
+                except Exception:
+                    pass
+            if self.ref_ligand and self.show_ref:
+                hb_ref = "_cmp_hb_ref"
+                try:
+                    n_hb = cmd.distance(hb_ref, self.ref_ligand, self.protein_sel, mode=2)
+                    if n_hb and n_hb > 0:
+                        _track(hb_ref)
+                        cmd.set("dash_radius", DASH_RADIUS * 0.65, hb_ref)
+                        cmd.set("dash_gap",    DASH_GAP,            hb_ref)
+                        cmd.set("dash_length", DASH_LENGTH,         hb_ref)
+                        cmd.color("ci_hbond", hb_ref)
+                        cmd.set("label_color", "white",    hb_ref)
+                        cmd.set("label_size",  LABEL_SIZE, hb_ref)
+                    else:
+                        try: cmd.delete(hb_ref)
+                        except Exception: pass
+                except Exception:
+                    pass
+
+        if self.auto_zoom and lig_sels:
+            union = " or ".join(f"({s})" for s in lig_sels)
+            try: cmd.zoom(union, buffer=3.0, animate=1)
+            except Exception: pass
+
+    def compare_label(self) -> str:
+        parts = []
+        for idx in self._cmp_indices:
+            if 0 <= idx < len(self.poses):
+                obj, st = self.poses[idx]
+                parts.append(f"{obj}(s{st})" if cmd.count_states(obj) > 1 else obj)
+        return "  vs  ".join(parts) if parts else "Compare"
 
     def _update(self, lig, state=-1):
         import traceback
@@ -1359,6 +1502,9 @@ def _open_gui():
     b_go = QtWidgets.QPushButton("Go"); b_go.setFixedWidth(50)
     hl_j.addWidget(b_go); hl_j.addStretch()
     l_n.addLayout(hl_j)
+    cb_cmp_hb = QtWidgets.QCheckBox("H-bonds in compare mode")
+    cb_cmp_hb.setChecked(False)
+    l_n.addWidget(cb_cmp_hb)
     top_l.addWidget(g_n)
 
     # Reference ligand
@@ -1390,7 +1536,7 @@ def _open_gui():
     tw_pd = QtWidgets.QTableWidget(0, 0)
     tw_pd.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
     tw_pd.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-    tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
     tw_pd.setMinimumHeight(80)
     tw_pd.horizontalHeader().setStretchLastSection(True)
     tw_pd.horizontalHeader().setSectionsMovable(True)
@@ -1487,6 +1633,9 @@ def _open_gui():
     splitter.setSizes([460, 200])
 
     # Callbacks
+    _sel_order: list = []   # table row indices in arrival order (max 2)
+    _sel_busy  = [False]    # re-entrancy guard for programmatic selection changes
+
     def rebuild_table():
         tw_pd.setSortingEnabled(False)
         tw_pd.clearContents()
@@ -1525,38 +1674,78 @@ def _open_gui():
                 tw_pd.setItem(r, c, item)
         tw_pd.resizeColumnsToContents()
         tw_pd.setSortingEnabled(True)
+        _sel_order.clear()
         _highlight_current_row()
 
     def _highlight_current_row():
-        cur = _stepper.current_index
-        for r in range(tw_pd.rowCount()):
-            item0 = tw_pd.item(r, 0)
-            if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
-                tw_pd.selectRow(r)
-                tw_pd.scrollToItem(
-                    item0, QtWidgets.QAbstractItemView.PositionAtCenter)
-                return
-        tw_pd.clearSelection()
-
-    def on_table_clicked(row, col):
-        item0 = tw_pd.item(row, 0)
-        if item0 is None:
+        """Sync table selection to current single-pose index (no-op in compare mode)."""
+        if _stepper._in_compare:
             return
-        pose_idx = item0.data(QtCore.Qt.UserRole)
-        if pose_idx is not None:
-            ci_goto(pose_idx)
+        cur = _stepper.current_index
+        tw_pd.blockSignals(True)
+        try:
+            _sel_order.clear()
+            for r in range(tw_pd.rowCount()):
+                item0 = tw_pd.item(r, 0)
+                if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
+                    tw_pd.selectRow(r)
+                    _sel_order.append(r)
+                    tw_pd.scrollToItem(
+                        item0, QtWidgets.QAbstractItemView.PositionAtCenter)
+                    return
+            tw_pd.clearSelection()
+        finally:
+            tw_pd.blockSignals(False)
+
+    def on_selection_changed():
+        if _sel_busy[0]:
+            return
+        selected = {idx.row() for idx in tw_pd.selectionModel().selectedRows()}
+        # prune deselected rows then append new arrivals in sorted order
+        _sel_order[:] = [r for r in _sel_order if r in selected]
+        for r in sorted(selected):
+            if r not in _sel_order:
+                _sel_order.append(r)
+        # rolling window: drop oldest when a third row is selected
+        if len(_sel_order) > 2:
+            oldest = _sel_order.pop(0)
+            _sel_busy[0] = True
+            try:
+                tw_pd.selectionModel().select(
+                    tw_pd.model().index(oldest, 0),
+                    QtCore.QItemSelectionModel.Deselect |
+                    QtCore.QItemSelectionModel.Rows)
+            finally:
+                _sel_busy[0] = False
+
+        pose_indices = []
+        for r in _sel_order:
+            item0 = tw_pd.item(r, 0)
+            if item0 is not None:
+                pi = item0.data(QtCore.Qt.UserRole)
+                if pi is not None:
+                    pose_indices.append(pi)
+
+        if len(pose_indices) == 2:
+            _stepper.show_comparison(pose_indices)
+            update_ui()
+        elif len(pose_indices) == 1:
+            ci_goto(pose_indices[0])
             update_ui()
 
     def update_ui():
         c = _stepper._count()
         if c > 0:
-            lbl.setText(f"{_stepper._label()}  "
-                        f"({_stepper.current_index + 1}/{c})")
+            if _stepper._in_compare:
+                lbl.setText(_stepper.compare_label())
+            else:
+                lbl.setText(f"{_stepper._label()}  "
+                            f"({_stepper.current_index + 1}/{c})")
             sp.setMaximum(c)
             sp.setValue(_stepper.current_index + 1)
         else:
             lbl.setText("Ready - click Setup")
-        if g_pd.isChecked():
+        if g_pd.isChecked() and not _stepper._in_compare:
             _highlight_current_row()
 
     def do_browse():
@@ -1640,6 +1829,7 @@ def _open_gui():
         _stepper.sdf_records = []
         _stepper.all_properties = []
         _stepper.ref_ligand = None
+        _sel_order.clear()
         ref_combo.blockSignals(True)
         ref_combo.clear(); ref_combo.addItem("(none)")
         ref_combo.blockSignals(False)
@@ -1768,7 +1958,14 @@ def _open_gui():
         setattr(_stepper, "show_lig_h", g_disp_en.isChecked() and cb_lig_h.isChecked()),
         ci_update(), update_ui()])
 
-    tw_pd.cellClicked.connect(on_table_clicked)
+    def on_cmp_hb(state):
+        _stepper.show_cmp_hbonds = cb_cmp_hb.isChecked()
+        if _stepper._in_compare:
+            _stepper.show_comparison(_stepper._cmp_indices)
+            update_ui()
+    cb_cmp_hb.stateChanged.connect(on_cmp_hb)
+
+    tw_pd.itemSelectionChanged.connect(on_selection_changed)
     g_pd.toggled.connect(lambda checked: update_ui())
 
     for key, fn in [(QtCore.Qt.Key_Right, do_next),

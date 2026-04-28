@@ -12,6 +12,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 
 - Detects and visualizes all major non-covalent protein-ligand interactions
 - Steps through docking poses (multi-state objects) or individual ligand objects
+- **Compare mode**: select any two poses simultaneously — including pose #3 of ligand A vs pose #7 of ligand B — to overlay them in the binding site with distinct colors
 - Residue shell with line representation, CA labels, and a transparent surface
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
 - Pose data table: sortable, clickable table of docking scores and SD properties per pose
@@ -119,9 +120,10 @@ ci_load_scores /path/to/gnina_output.sdf
 
 | Control | Description |
 |---|---|
-| Prev / Next | Step through poses in current table sort order |
+| Prev / Next | Step through poses in current table sort order (exits compare mode) |
 | Refresh | Re-detect interactions for the current PyMOL state |
-| Go to # | Jump to pose by 1-based number |
+| Go to # | Jump to pose by 1-based number (exits compare mode) |
+| H-bonds in compare mode | When checked, H-bond dashes are drawn during compare mode, colored to match each pose |
 
 ### Reference ligand group
 
@@ -137,7 +139,9 @@ Reference ligand interaction lines respect the same **Show distance labels** tog
 
 ### Pose Data group
 
-Sortable, clickable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Clicking a row navigates to that pose. Prev/Next step in current sort order. Column headers are movable. Rank columns are excluded (redundant with score sorting). Requires a scores SDF to be loaded, or Incentive PyMOL.
+Sortable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Column headers are movable. Rank columns are excluded. Requires a scores SDF to be loaded, or Incentive PyMOL.
+
+**Single-click** a row to navigate to that pose. **Ctrl-click** (or click a second row) to enter compare mode — the two most recently selected rows are shown simultaneously. A third selection automatically drops the oldest, maintaining a rolling window of two. Clicking Prev/Next or Go exits compare mode and resumes single-pose navigation.
 
 ### Interaction groups (Non-covalent bonds / Pi interactions / Contacts/Clashes)
 
@@ -158,6 +162,24 @@ Individual interaction types can be toggled within each group. Contacts/Clashes 
 | Show nonpolar H on ligands | Off | Show all hydrogens (including nonpolar C-H) on pose and reference ligands as sticks. Off by default (only polar H on N/O/S shown). |
 
 The Display group enable checkbox hides all display elements at once (surface, labels) without changing individual settings.
+
+---
+
+## Compare mode
+
+Compare mode lets you overlay any two poses side-by-side in the binding site, regardless of which ligand object or state they come from — e.g. pose #3 of ligand A vs pose #7 of ligand B.
+
+**How it works:**  
+Each selected pose is extracted into a temporary single-state PyMOL object (`_cmp_0`, `_cmp_1`) via `cmd.create`. This bypasses PyMOL's global state slider, which would otherwise force both objects to the same state number. The temporary objects are automatically removed when you navigate away or click Clear.
+
+**Colors:**  
+Poses from different ligand objects are colored by their object's palette entry (assigned at Setup). Poses from the same object (e.g. two states of the same docking run) receive distinct slot colors instead. The color palette is: cyan, orange, forest green, hotpink, violet, salmon. The reference ligand always remains magenta.
+
+**Interactions:**  
+All interaction types are hidden in compare mode to keep the view uncluttered — the spatial overlay is the primary information. Enable **H-bonds in compare mode** in the Navigate group to overlay H-bond dashes colored to match each pose.
+
+**Limitations:**  
+Maximum two poses at a time (excluding the reference ligand). The full interaction panel (all types) remains available in single-pose mode.
 
 ---
 
