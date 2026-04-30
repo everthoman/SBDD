@@ -183,12 +183,12 @@ def main():
     )
     parser.add_argument(
         "--sep",
-        default=",",
-        help="Input CSV delimiter (default: ',')",
+        default=None,
+        help="Input file delimiter (default: auto-detect)",
     )
     args = parser.parse_args()
 
-    df = pd.read_csv(args.input, sep=args.sep)
+    df = pd.read_csv(args.input, sep=args.sep, engine="python")
 
     # Resolve identifier column and type
     if args.smiles_col:
