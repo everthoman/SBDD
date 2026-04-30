@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import math
 import sys
 import time
 from io import StringIO
@@ -23,6 +24,16 @@ try:
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
+
+
+def _wilson_lower(active: int, tested: int, z: float = 1.96) -> float:
+    """Wilson score lower bound for a binomial proportion, returned as a percentage."""
+    if tested == 0:
+        return 0.0
+    p = active / tested
+    centre = p + z**2 / (2 * tested)
+    margin = z * math.sqrt(p * (1 - p) / tested + z**2 / (4 * tested**2))
+    return round((centre - margin) / (1 + z**2 / tested) * 100, 2)
 
 
 def _cid_url_inchikey(key: str) -> tuple[str, str]:
@@ -131,7 +142,7 @@ def query_compound(identifier: str, id_type: str, delay: float) -> dict:
             t_tested_str = t_active_str = ""
             c_tested = c_active = 0
 
-        tpi = (c_active / c_tested * 100) if c_tested > 0 else 0.0
+        tpi = _wilson_lower(c_active, c_tested)
 
         result.update(
             {

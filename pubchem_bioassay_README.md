@@ -70,7 +70,7 @@ Nine columns are appended to the right of all original input columns:
 | `Active_Assays` | Number of assays with outcome = Active |
 | `Unique_Targets_Tested` | Number of distinct biological targets tested |
 | `Unique_Targets_Active` | Number of distinct biological targets with ≥1 active result |
-| `Target_Promiscuity_Index` | `Unique_Targets_Active / Unique_Targets_Tested × 100` (%) |
+| `Target_Promiscuity_Index` | Wilson score lower bound (95% CI) for the active-target hit rate (%). Penalises compounds with few targets screened — see Notes. |
 | `List_Targets_Tested` | Comma-separated list of all target IDs tested |
 | `List_Targets_Active` | Comma-separated list of target IDs with active result |
 | `PubChem_Status` | `Success`, `Skeleton Not Found`, `No bioassay data`, `Invalid InChIKey`, or error message |
@@ -121,6 +121,13 @@ python pubchem_bioassay.py library_10k.csv -o out.csv --batch-size 500
 
 - **Rate limiting**: PubChem's public API allows ~3 requests/second. The default `--delay 0.35` keeps
   well within this. For large batches consider using the PubChem Power User Gateway (PUG) async API.
+
+- **Target Promiscuity Index** is the Wilson score lower bound of the 95% confidence interval for
+  the true active-target hit rate, expressed as a percentage. Unlike a raw ratio it accounts for
+  screening depth: a compound with 1/23 active targets scores ~0.8%, while one with 20/462 active
+  targets (same raw ratio) scores ~2.5%, reflecting that the broader screen gives more evidence of
+  genuine promiscuity. Formula: `(p + z²/2n − z·√(p(1−p)/n + z²/4n²)) / (1 + z²/n) × 100`
+  where `p = active/tested`, `n = tested`, `z = 1.96`.
 
 - **Batched output**: Results are written to the output file after each batch of `--batch-size` rows
   (default 1000). If the run is interrupted, completed batches are already on disk; re-run from
