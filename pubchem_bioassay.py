@@ -4,13 +4,15 @@ pubchem_bioassay.py — assess compound promiscuity via PubChem bioassay data
 
 Usage:
     python pubchem_bioassay.py input.csv -o output.csv
-    python pubchem_bioassay.py input.csv -o output.csv --inchikey-col InChIKey --delay 0.5
+    python pubchem_bioassay.py input.csv -o output.csv --inchikey-col InChIKey
+    python pubchem_bioassay.py input.csv -o output.csv --smiles-col SMILES
 """
 
 import argparse
 import sys
 import time
 from io import StringIO
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -23,7 +25,31 @@ except ImportError:
     HAS_TQDM = False
 
 
-def query_compound(key: str, delay: float) -> dict:
+def _cid_url_inchikey(key: str) -> tuple[str, str]:
+    """Return (cid_url, invalid_msg) for an InChIKey identifier."""
+    if pd.isna(key) or len(str(key)) < 14:
+        return "", "Invalid InChIKey"
+    connectivity_layer = str(key).strip().split("-")[0]
+    url = (
+        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/inchikey"
+        f"/{connectivity_layer}/cids/JSON"
+    )
+    return url, ""
+
+
+def _cid_url_smiles(smiles: str) -> tuple[str, str]:
+    """Return (cid_url, invalid_msg) for a SMILES identifier."""
+    if pd.isna(smiles) or not str(smiles).strip():
+        return "", "Invalid SMILES"
+    encoded = quote(str(smiles).strip(), safe="")
+    url = (
+        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles"
+        f"/{encoded}/cids/JSON"
+    )
+    return url, ""
+
+
+def query_compound(identifier: str, id_type: str, delay: float) -> dict:
     result = {
         "PubChem_CID": "None",
         "Total_Assays": np.nan,
@@ -36,22 +62,20 @@ def query_compound(key: str, delay: float) -> dict:
         "PubChem_Status": "",
     }
 
-    if pd.isna(key) or len(str(key)) < 14:
-        result["PubChem_Status"] = "Invalid InChIKey"
+    if id_type == "inchikey":
+        cid_url, invalid_msg = _cid_url_inchikey(identifier)
+    else:
+        cid_url, invalid_msg = _cid_url_smiles(identifier)
+
+    if not cid_url:
+        result["PubChem_Status"] = invalid_msg
         return result
 
-    clean_key = str(key).strip()
-    connectivity_layer = clean_key.split("-")[0]
-
     try:
-        cid_url = (
-            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/inchikey"
-            f"/{connectivity_layer}/cids/JSON"
-        )
         cid_resp = requests.get(cid_url, timeout=15)
 
         if cid_resp.status_code != 200:
-            result["PubChem_Status"] = "Skeleton Not Found"
+            result["PubChem_Status"] = "Not Found in PubChem"
             return result
 
         cid = cid_resp.json()["IdentifierList"]["CID"][0]
@@ -136,13 +160,21 @@ def main():
     parser = argparse.ArgumentParser(
         description="Assess compound promiscuity using PubChem bioassay data."
     )
-    parser.add_argument("input", help="Input CSV file with an InChIKey column")
+    parser.add_argument("input", help="Input CSV file")
     parser.add_argument("-o", "--output", required=True, help="Output CSV file")
-    parser.add_argument(
+
+    id_group = parser.add_mutually_exclusive_group()
+    id_group.add_argument(
         "--inchikey-col",
         default=None,
-        help="InChIKey column name (default: auto-detect by 'inchi' in name)",
+        help="InChIKey column name (auto-detected if any column contains 'inchi')",
     )
+    id_group.add_argument(
+        "--smiles-col",
+        default=None,
+        help="SMILES column name (auto-detected if any column contains 'smiles')",
+    )
+
     parser.add_argument(
         "--delay",
         type=float,
@@ -158,32 +190,48 @@ def main():
 
     df = pd.read_csv(args.input, sep=args.sep)
 
-    if args.inchikey_col:
-        ikey_col = args.inchikey_col
-        if ikey_col not in df.columns:
-            sys.exit(f"Error: column '{ikey_col}' not found. Available: {list(df.columns)}")
+    # Resolve identifier column and type
+    if args.smiles_col:
+        id_col = args.smiles_col
+        id_type = "smiles"
+        if id_col not in df.columns:
+            sys.exit(f"Error: column '{id_col}' not found. Available: {list(df.columns)}")
+    elif args.inchikey_col:
+        id_col = args.inchikey_col
+        id_type = "inchikey"
+        if id_col not in df.columns:
+            sys.exit(f"Error: column '{id_col}' not found. Available: {list(df.columns)}")
     else:
-        candidates = [c for c in df.columns if "inchi" in c.lower()]
-        if not candidates:
-            sys.exit(f"Error: no InChIKey column found. Use --inchikey-col. Available: {list(df.columns)}")
-        ikey_col = candidates[0]
+        # Auto-detect: prefer InChIKey, fall back to SMILES
+        inchi_candidates = [c for c in df.columns if "inchi" in c.lower()]
+        smiles_candidates = [c for c in df.columns if "smiles" in c.lower()]
+        if inchi_candidates:
+            id_col, id_type = inchi_candidates[0], "inchikey"
+        elif smiles_candidates:
+            id_col, id_type = smiles_candidates[0], "smiles"
+        else:
+            sys.exit(
+                "Error: no InChIKey or SMILES column found. "
+                "Use --inchikey-col or --smiles-col. "
+                f"Available: {list(df.columns)}"
+            )
 
-    print(f"Input:       {args.input}  ({len(df)} rows)")
-    print(f"InChIKey col: {ikey_col}")
-    print(f"Output:      {args.output}")
+    print(f"Input:          {args.input}  ({len(df)} rows)")
+    print(f"Identifier col: {id_col}  ({id_type})")
+    print(f"Output:         {args.output}")
 
-    keys = df[ikey_col].tolist()
+    identifiers = df[id_col].tolist()
     rows = []
 
-    iterator = tqdm(keys, unit="cpd") if HAS_TQDM else keys
+    iterator = tqdm(identifiers, unit="cpd") if HAS_TQDM else identifiers
     if not HAS_TQDM:
         print("(install tqdm for a progress bar)")
 
-    for i, key in enumerate(iterator):
-        result = query_compound(key, args.delay)
+    for i, identifier in enumerate(iterator):
+        result = query_compound(identifier, id_type, args.delay)
         rows.append(result)
         if not HAS_TQDM and (i + 1) % 10 == 0:
-            print(f"  {i + 1}/{len(keys)} done")
+            print(f"  {i + 1}/{len(identifiers)} done")
 
     results_df = pd.DataFrame(rows)
     out_df = pd.concat([df.reset_index(drop=True), results_df], axis=1)

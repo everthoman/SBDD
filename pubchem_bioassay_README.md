@@ -39,16 +39,20 @@ Input CSV (with InChIKey column)
 ## Usage
 
 ```
-pubchem_bioassay.py [-h] -o FILE [--inchikey-col COL] [--delay FLOAT] [--sep CHAR] input
+pubchem_bioassay.py [-h] -o FILE [--inchikey-col COL | --smiles-col COL] [--delay FLOAT] [--sep CHAR] input
 ```
+
+`--inchikey-col` and `--smiles-col` are mutually exclusive. If neither is given the script
+auto-detects: InChIKey column (name contains "inchi") takes priority, then SMILES (name contains "smiles").
 
 ### Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `input` | required | Input CSV file containing an InChIKey column |
+| `input` | required | Input CSV file |
 | `-o / --output FILE` | required | Output CSV file |
-| `--inchikey-col COL` | auto-detect | InChIKey column name; auto-detected if any column name contains "inchi" |
+| `--inchikey-col COL` | auto-detect | InChIKey column name; uses connectivity layer for PubChem lookup |
+| `--smiles-col COL` | auto-detect | SMILES column name; SMILES are URL-encoded for PubChem lookup |
 | `--delay FLOAT` | `0.35` | Seconds between PubChem requests (NCBI rate limit: ~3 req/s) |
 | `--sep CHAR` | `,` | Input CSV delimiter |
 
@@ -74,14 +78,19 @@ Nine columns are appended to the right of all original input columns:
 
 ## Examples
 
-### Basic
+### Basic (auto-detect identifier column)
 ```bash
 python pubchem_bioassay.py compounds.csv -o compounds_bioassay.csv
 ```
 
-### Explicit InChIKey column name
+### Explicit InChIKey column
 ```bash
 python pubchem_bioassay.py compounds.csv -o out.csv --inchikey-col std_inchikey
+```
+
+### Query by SMILES
+```bash
+python pubchem_bioassay.py compounds.csv -o out.csv --smiles-col SMILES
 ```
 
 ### Tab-separated input, slower request rate
@@ -93,9 +102,13 @@ python pubchem_bioassay.py compounds.tsv -o out.csv --sep $'\t' --delay 0.5
 
 ## Notes
 
-- **CID lookup uses the connectivity layer only** (first segment of the InChIKey, before the first `-`).
+- **InChIKey lookup uses the connectivity layer only** (first segment, before the first `-`).
   This means stereoisomers and salts of the same scaffold map to the same CID, which is appropriate
   for bioassay data aggregation.
+
+- **SMILES lookup** passes the full SMILES string to PubChem (URL-encoded). PubChem performs a
+  structure search and returns the best-matching CID. Stereochemistry and salt forms in the SMILES
+  are respected, so results may differ from InChIKey-based lookup for the same compound.
 
 - **Target identifier column** is auto-selected from the assay summary: `geneid`, `accession`, or
   `targetid` (whichever is present). If none is found, target counts are reported as 0 and TPI as 0.
