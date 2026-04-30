@@ -9,7 +9,6 @@ Usage:
 """
 
 import argparse
-import math
 import sys
 import time
 from io import StringIO
@@ -26,14 +25,14 @@ except ImportError:
     HAS_TQDM = False
 
 
-def _wilson_lower(active: int, tested: int, z: float = 1.96) -> float:
-    """Wilson score lower bound for a binomial proportion, returned as a percentage."""
-    if tested == 0:
-        return 0.0
-    p = active / tested
-    centre = p + z**2 / (2 * tested)
-    margin = z * math.sqrt(p * (1 - p) / tested + z**2 / (4 * tested**2))
-    return round((centre - margin) / (1 + z**2 / tested) * 100, 2)
+def _regularized_tpi(active: int, tested: int, prior_n: int = 100) -> float:
+    """active / (tested + prior_n) × 100.
+
+    prior_n virtual inactive targets shrink sparse observations toward zero —
+    a compound tested against 2 targets cannot outscore one tested against 500.
+    Equivalent to a Beta-Binomial posterior mean with Beta(0, prior_n) prior.
+    """
+    return round(active / (tested + prior_n) * 100, 2)
 
 
 def _cid_url_inchikey(key: str) -> tuple[str, str]:
@@ -60,7 +59,7 @@ def _cid_url_smiles(smiles: str) -> tuple[str, str]:
     return url, ""
 
 
-def query_compound(identifier: str, id_type: str, delay: float) -> dict:
+def query_compound(identifier: str, id_type: str, delay: float, prior_n: int = 100) -> dict:
     result = {
         "PubChem_CID": "None",
         "Total_Assays": np.nan,
@@ -142,7 +141,7 @@ def query_compound(identifier: str, id_type: str, delay: float) -> dict:
             t_tested_str = t_active_str = ""
             c_tested = c_active = 0
 
-        tpi = _wilson_lower(c_active, c_tested)
+        tpi = _regularized_tpi(c_active, c_tested, prior_n)
 
         result.update(
             {
@@ -203,6 +202,12 @@ def main():
         default=1000,
         help="Rows per batch; results are written after each batch (default: 1000)",
     )
+    parser.add_argument(
+        "--prior-n",
+        type=int,
+        default=100,
+        help="Virtual inactive targets added to denominator for TPI (default: 100)",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.input, sep=args.sep, engine="python")
@@ -257,7 +262,7 @@ def main():
             iterator = identifiers
 
         for i, identifier in enumerate(iterator):
-            result = query_compound(identifier, id_type, args.delay)
+            result = query_compound(identifier, id_type, args.delay, args.prior_n)
             rows.append(result)
             if not HAS_TQDM and (i + 1) % 10 == 0:
                 print(f"  {i + 1}/{len(identifiers)} done")
