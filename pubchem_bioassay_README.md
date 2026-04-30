@@ -39,7 +39,7 @@ Input CSV (with InChIKey column)
 ## Usage
 
 ```
-pubchem_bioassay.py [-h] -o FILE [--inchikey-col COL | --smiles-col COL] [--delay FLOAT] [--sep CHAR] input
+pubchem_bioassay.py [-h] -o FILE [--inchikey-col COL | --smiles-col COL] [--delay FLOAT] [--sep CHAR] [--batch-size N] input
 ```
 
 `--inchikey-col` and `--smiles-col` are mutually exclusive. If neither is given the script
@@ -55,6 +55,7 @@ auto-detects: InChIKey column (name contains "inchi") takes priority, then SMILE
 | `--smiles-col COL` | auto-detect | SMILES column name; SMILES are URL-encoded for PubChem lookup |
 | `--delay FLOAT` | `0.35` | Seconds between PubChem requests (NCBI rate limit: ~3 req/s) |
 | `--sep CHAR` | `,` | Input CSV delimiter |
+| `--batch-size N` | `1000` | Rows per batch; output is written after each batch completes |
 
 ---
 
@@ -98,6 +99,11 @@ python pubchem_bioassay.py compounds.csv -o out.csv --smiles-col SMILES
 python pubchem_bioassay.py compounds.tsv -o out.csv --sep $'\t' --delay 0.5
 ```
 
+### Large library with smaller batches
+```bash
+python pubchem_bioassay.py library_10k.csv -o out.csv --batch-size 500
+```
+
 ---
 
 ## Notes
@@ -115,6 +121,10 @@ python pubchem_bioassay.py compounds.tsv -o out.csv --sep $'\t' --delay 0.5
 
 - **Rate limiting**: PubChem's public API allows ~3 requests/second. The default `--delay 0.35` keeps
   well within this. For large batches consider using the PubChem Power User Gateway (PUG) async API.
+
+- **Batched output**: Results are written to the output file after each batch of `--batch-size` rows
+  (default 1000). If the run is interrupted, completed batches are already on disk; re-run from
+  scratch or subset the input to resume from a specific row.
 
 - **`PubChem_Status = "Skeleton Not Found"`** means no PubChem compound matches the connectivity
   layer of the InChIKey. This is common for proprietary or very recently synthesised compounds.

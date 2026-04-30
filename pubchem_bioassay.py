@@ -186,6 +186,12 @@ def main():
         default=None,
         help="Input file delimiter (default: auto-detect)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Rows per batch; results are written after each batch (default: 1000)",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.input, sep=args.sep, engine="python")
@@ -216,31 +222,46 @@ def main():
                 f"Available: {list(df.columns)}"
             )
 
-    print(f"Input:          {args.input}  ({len(df)} rows)")
+    total = len(df)
+    n_batches = (total + args.batch_size - 1) // args.batch_size
+
+    print(f"Input:          {args.input}  ({total} rows, {n_batches} batch(es) of {args.batch_size})")
     print(f"Identifier col: {id_col}  ({id_type})")
     print(f"Output:         {args.output}")
-
-    identifiers = df[id_col].tolist()
-    rows = []
-
-    iterator = tqdm(identifiers, unit="cpd") if HAS_TQDM else identifiers
     if not HAS_TQDM:
         print("(install tqdm for a progress bar)")
 
-    for i, identifier in enumerate(iterator):
-        result = query_compound(identifier, id_type, args.delay)
-        rows.append(result)
-        if not HAS_TQDM and (i + 1) % 10 == 0:
-            print(f"  {i + 1}/{len(identifiers)} done")
-
-    results_df = pd.DataFrame(rows)
     int_cols = ["Total_Assays", "Active_Assays", "Unique_Targets_Tested", "Unique_Targets_Active"]
-    results_df[int_cols] = results_df[int_cols].astype("Int64")
-    out_df = pd.concat([df.reset_index(drop=True), results_df], axis=1)
-    out_df.to_csv(args.output, index=False)
+    n_ok = 0
 
-    n_ok = (results_df["PubChem_Status"] == "Success").sum()
-    print(f"\nDone: {n_ok}/{len(df)} succeeded  →  {args.output}")
+    for batch_num, batch_start in enumerate(range(0, total, args.batch_size), start=1):
+        batch_df = df.iloc[batch_start : batch_start + args.batch_size]
+        identifiers = batch_df[id_col].tolist()
+        print(f"\nBatch {batch_num}/{n_batches} — rows {batch_start + 1}–{batch_start + len(identifiers)}")
+
+        rows = []
+        if HAS_TQDM:
+            iterator = tqdm(identifiers, unit="cpd", desc=f"Batch {batch_num}/{n_batches}")
+        else:
+            iterator = identifiers
+
+        for i, identifier in enumerate(iterator):
+            result = query_compound(identifier, id_type, args.delay)
+            rows.append(result)
+            if not HAS_TQDM and (i + 1) % 10 == 0:
+                print(f"  {i + 1}/{len(identifiers)} done")
+
+        results_df = pd.DataFrame(rows)
+        results_df[int_cols] = results_df[int_cols].astype("Int64")
+        out_batch = pd.concat([batch_df.reset_index(drop=True), results_df], axis=1)
+
+        write_header = batch_num == 1
+        out_batch.to_csv(args.output, index=False, header=write_header, mode="w" if write_header else "a")
+
+        n_ok += (results_df["PubChem_Status"] == "Success").sum()
+        print(f"  Written → {args.output}")
+
+    print(f"\nDone: {n_ok}/{total} succeeded  →  {args.output}")
 
 
 if __name__ == "__main__":
