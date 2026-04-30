@@ -135,10 +135,10 @@ def query_compound(identifier: str, id_type: str, delay: float) -> dict:
 
         result.update(
             {
-                "Total_Assays": float(total_count),
-                "Active_Assays": float(len(active_df)),
-                "Unique_Targets_Tested": float(c_tested),
-                "Unique_Targets_Active": float(c_active),
+                "Total_Assays": int(total_count),
+                "Active_Assays": int(len(active_df)),
+                "Unique_Targets_Tested": int(c_tested),
+                "Unique_Targets_Active": int(c_active),
                 "Target_Promiscuity_Index": round(tpi, 2),
                 "List_Targets_Tested": t_tested_str,
                 "List_Targets_Active": t_active_str,
@@ -234,6 +234,8 @@ def main():
             print(f"  {i + 1}/{len(identifiers)} done")
 
     results_df = pd.DataFrame(rows)
+    int_cols = ["Total_Assays", "Active_Assays", "Unique_Targets_Tested", "Unique_Targets_Active"]
+    results_df[int_cols] = results_df[int_cols].astype("Int64")
     out_df = pd.concat([df.reset_index(drop=True), results_df], axis=1)
     out_df.to_csv(args.output, index=False)
 
