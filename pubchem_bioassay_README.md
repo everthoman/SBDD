@@ -39,7 +39,7 @@ Input CSV (with InChIKey column)
 ## Usage
 
 ```
-pubchem_bioassay.py [-h] -o FILE [--inchikey-col COL | --smiles-col COL] [--delay FLOAT] [--sep CHAR] [--batch-size N] input
+pubchem_bioassay.py [-h] -o FILE [--inchikey-col COL | --smiles-col COL] [--delay FLOAT] [--sep CHAR] [--batch-size N] [--failed-output FILE] input
 ```
 
 `--inchikey-col` and `--smiles-col` are mutually exclusive. If neither is given the script
@@ -57,6 +57,7 @@ auto-detects: InChIKey column (name contains "inchi") takes priority, then SMILE
 | `--sep CHAR` | `,` | Input CSV delimiter |
 | `--batch-size N` | `1000` | Rows per batch; output is written after each batch completes |
 | `--prior-n N` | `100` | Virtual inactive targets added to TPI denominator (see Notes) |
+| `--failed-output FILE` | auto-derived | CSV for rows that errored (network failures, timeouts, aborted connections); only written if errors occur. Default: `<output>_failed.csv` |
 
 ---
 
@@ -105,6 +106,15 @@ python pubchem_bioassay.py compounds.tsv -o out.csv --sep $'\t' --delay 0.5
 python pubchem_bioassay.py library_10k.csv -o out.csv --batch-size 500
 ```
 
+### Retry failed rows after a network-interrupted run
+```bash
+# First run — network failures land in out_failed.csv automatically
+python pubchem_bioassay.py library.csv -o out.csv
+
+# Re-run only the failed rows
+python pubchem_bioassay.py out_failed.csv -o out_retry.csv
+```
+
 ---
 
 ## Notes
@@ -133,6 +143,13 @@ python pubchem_bioassay.py library_10k.csv -o out.csv --batch-size 500
 - **Batched output**: Results are written to the output file after each batch of `--batch-size` rows
   (default 1000). If the run is interrupted, completed batches are already on disk; re-run from
   scratch or subset the input to resume from a specific row.
+
+- **Failed-row output**: Rows where the PubChem request raised a network error (timeout, connection
+  abort, etc.) are written to a separate CSV containing only the original input columns. By default
+  this file is named `<output>_failed.csv` (e.g. `out_failed.csv` when `-o out.csv`). Only rows
+  with a transient error status are included; compounds not found in PubChem or with no bioassay
+  data are considered valid results and appear only in the main output. The failed file can be passed
+  directly as input for a retry run.
 
 - **`PubChem_Status = "Skeleton Not Found"`** means no PubChem compound matches the connectivity
   layer of the InChIKey. This is common for proprietary or very recently synthesised compounds.

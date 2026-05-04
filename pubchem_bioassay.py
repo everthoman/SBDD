@@ -208,6 +208,11 @@ def main():
         default=100,
         help="Virtual inactive targets added to denominator for TPI (default: 100)",
     )
+    parser.add_argument(
+        "--failed-output",
+        default=None,
+        help="CSV for rows that errored (network failures etc.); auto-derived from --output if omitted",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.input, sep=args.sep, engine="python")
@@ -241,14 +246,24 @@ def main():
     total = len(df)
     n_batches = (total + args.batch_size - 1) // args.batch_size
 
+    # Derive failed-output path
+    if args.failed_output:
+        failed_path = args.failed_output
+    else:
+        stem = args.output.rsplit(".", 1)
+        failed_path = f"{stem[0]}_failed.{stem[1]}" if len(stem) == 2 else f"{args.output}_failed"
+
     print(f"Input:          {args.input}  ({total} rows, {n_batches} batch(es) of {args.batch_size})")
     print(f"Identifier col: {id_col}  ({id_type})")
     print(f"Output:         {args.output}")
+    print(f"Failed output:  {failed_path}  (written only if errors occur)")
     if not HAS_TQDM:
         print("(install tqdm for a progress bar)")
 
     int_cols = ["Total_Assays", "Active_Assays", "Unique_Targets_Tested", "Unique_Targets_Active"]
     n_ok = 0
+    n_failed = 0
+    failed_header_written = False
 
     for batch_num, batch_start in enumerate(range(0, total, args.batch_size), start=1):
         batch_df = df.iloc[batch_start : batch_start + args.batch_size]
@@ -275,9 +290,25 @@ def main():
         out_batch.to_csv(args.output, index=False, header=write_header, mode="w" if write_header else "a")
 
         n_ok += (results_df["PubChem_Status"] == "Success").sum()
-        print(f"  Written → {args.output}")
 
-    print(f"\nDone: {n_ok}/{total} succeeded  →  {args.output}")
+        # Write rows that errored (network failures) to the failed file
+        error_mask = results_df["PubChem_Status"].str.startswith("Error:", na=False)
+        if error_mask.any():
+            failed_rows = batch_df.reset_index(drop=True)[error_mask]
+            failed_rows.to_csv(
+                failed_path,
+                index=False,
+                header=not failed_header_written,
+                mode="w" if not failed_header_written else "a",
+            )
+            failed_header_written = True
+            n_failed += int(error_mask.sum())
+            print(f"  Written → {args.output}  ({int(error_mask.sum())} error(s) → {failed_path})")
+        else:
+            print(f"  Written → {args.output}")
+
+    failed_note = f"  {n_failed} failed → {failed_path}" if n_failed else ""
+    print(f"\nDone: {n_ok}/{total} succeeded  →  {args.output}{failed_note}")
 
 
 if __name__ == "__main__":
