@@ -1992,6 +1992,45 @@ def _open_gui():
     cb_cmp_hb.stateChanged.connect(on_cmp_hb)
 
     tw_pd.itemSelectionChanged.connect(on_selection_changed)
+
+    # Ctrl+click on an already-selected row should deselect just that row and
+    # keep the other selected.  Qt's ExtendedSelection deselects everything
+    # instead, so we intercept the mouse press and handle it ourselves.
+    class _CtrlDeselFilter(QtCore.QObject):
+        def eventFilter(self, obj, event):
+            if (event.type() == QtCore.QEvent.MouseButtonPress and
+                    event.button() == QtCore.Qt.LeftButton and
+                    event.modifiers() & QtCore.Qt.ControlModifier):
+                row = tw_pd.rowAt(event.pos().y())
+                if row >= 0 and row in _sel_order:
+                    _sel_order.remove(row)
+                    _sel_busy[0] = True
+                    try:
+                        tw_pd.selectionModel().select(
+                            tw_pd.model().index(row, 0),
+                            QtCore.QItemSelectionModel.Deselect |
+                            QtCore.QItemSelectionModel.Rows)
+                    finally:
+                        _sel_busy[0] = False
+                    pose_indices = []
+                    for r in _sel_order:
+                        item0 = tw_pd.item(r, 0)
+                        if item0 is not None:
+                            pi = item0.data(QtCore.Qt.UserRole)
+                            if pi is not None:
+                                pose_indices.append(pi)
+                    if len(pose_indices) == 1:
+                        ci_goto(pose_indices[0])
+                        update_ui()
+                    elif len(pose_indices) == 0:
+                        _stepper._cleanup_cmp()
+                        update_ui()
+                    return True  # event consumed
+            return False
+
+    win._ctrl_desel_filter = _CtrlDeselFilter(tw_pd)
+    tw_pd.viewport().installEventFilter(win._ctrl_desel_filter)
+
     g_pd.toggled.connect(lambda checked: update_ui())
 
     for key, fn in [(QtCore.Qt.Key_Right, do_next),
