@@ -1944,7 +1944,7 @@ def _open_gui():
 
     def do_toggle_surf(state=None):
         if _OBJ_SURF in _created_objects:
-            if g_disp_en.isChecked() and cb_surf.isChecked():
+            if cb_surf.isChecked():
                 cmd.show("surface", _OBJ_SURF)
             else:
                 cmd.hide("surface", _OBJ_SURF)
@@ -1953,7 +1953,7 @@ def _open_gui():
     def do_toggle_rlbl(state=None):
         if _shell_sel is not None:
             sel = f"({_shell_sel}) and name CA"
-            if g_disp_en.isChecked() and cb_rlbl.isChecked():
+            if cb_rlbl.isChecked():
                 cmd.show("labels", sel)
             else:
                 cmd.hide("labels", sel)
@@ -1973,11 +1973,11 @@ def _open_gui():
     g_disp_en.stateChanged.connect(do_disp_group_tog)
 
     cb_lb.stateChanged.connect(lambda s: [
-        setattr(_stepper, "show_labels", g_disp_en.isChecked() and cb_lb.isChecked()),
+        setattr(_stepper, "show_labels", cb_lb.isChecked()),
         ci_update(), update_ui()])
 
     cb_lig_h.stateChanged.connect(lambda s: [
-        setattr(_stepper, "show_lig_h", g_disp_en.isChecked() and cb_lig_h.isChecked()),
+        setattr(_stepper, "show_lig_h", cb_lig_h.isChecked()),
         ci_update(), update_ui()])
 
     def on_cmp_hb(state):
