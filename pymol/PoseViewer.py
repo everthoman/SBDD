@@ -1999,7 +1999,8 @@ def _open_gui():
         sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), win)
         sc.activated.connect(fn)
 
-    # Detect external PyMOL state changes (built-in slider / play buttons / ci_next from CLI).
+    # Detect external PyMOL state/object changes (built-in slider / play buttons /
+    # ci_next from CLI / clicking enable on a different object in the panel).
     # IMPORTANT: timer must be stored on `win` (not as a local variable) so that
     # neither the QTimer C++ object nor its Python wrapper are garbage-collected
     # when _open_gui() returns.  Passing `win` as parent also lets Qt stop and
@@ -2012,19 +2013,54 @@ def _open_gui():
         except Exception:
             return
         cur_obj, cur_st = _stepper.poses[_stepper.current_index]
-        if cur_st == pymol_st:
-            return  # Already in sync
-        if _stepper.mode == "states":
+
+        if _stepper.mode == "objects":
+            # Detect if a different pose object was enabled externally.
+            # get_names("objects", 1) returns only enabled objects.
+            try:
+                enabled = set(cmd.get_names("objects", 1))
+            except Exception:
+                enabled = set()
+            pose_objs = list(dict.fromkeys(o for o, _ in _stepper.poses))
+            enabled_poses = [o for o in pose_objs if o in enabled]
+            # A new object is active if cur_obj was disabled or another pose
+            # object became enabled alongside it.
+            if cur_obj not in enabled:
+                new_obj = enabled_poses[0] if enabled_poses else None
+            elif len(enabled_poses) > 1:
+                new_obj = next((o for o in enabled_poses if o != cur_obj), None)
+            else:
+                new_obj = None
+
+            if new_obj is not None:
+                # Prefer (new_obj, pymol_st); fall back to first state of new_obj.
+                for i, (o, s) in enumerate(_stepper.poses):
+                    if o == new_obj and s == pymol_st:
+                        _stepper.current_index = i
+                        break
+                else:
+                    for i, (o, s) in enumerate(_stepper.poses):
+                        if o == new_obj:
+                            _stepper.current_index = i
+                            break
+                _stepper._show_current()
+                update_ui()
+                return
+
+            # Object unchanged — check for a state change within cur_obj.
+            if cur_st != pymol_st:
+                for i, (o, s) in enumerate(_stepper.poses):
+                    if o == cur_obj and s == pymol_st:
+                        _stepper.current_index = i
+                        _stepper._update(o, state=s)
+                        update_ui()
+                        break
+        else:
+            # States mode: only state sync matters.
+            if cur_st == pymol_st:
+                return
             for i, (o, s) in enumerate(_stepper.poses):
                 if s == pymol_st:
-                    _stepper.current_index = i
-                    _stepper._update(o, state=s)
-                    update_ui()
-                    break
-        else:
-            # Objects mode: sync within the currently active object
-            for i, (o, s) in enumerate(_stepper.poses):
-                if o == cur_obj and s == pymol_st:
                     _stepper.current_index = i
                     _stepper._update(o, state=s)
                     update_ui()
