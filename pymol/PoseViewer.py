@@ -1477,30 +1477,19 @@ def _open_gui():
     e_lig = QtWidgets.QLineEdit("organic")
     l_s.addWidget(e_lig, 1, 1)
 
-    hl_m = QtWidgets.QHBoxLayout()
-    hl_m.addWidget(QtWidgets.QLabel("Mode:"))
-    bg_m = QtWidgets.QButtonGroup(win)
-    rb_m = {}
-    for m in ("auto", "objects", "states"):
-        rb = QtWidgets.QRadioButton(m)
-        if m == "auto": rb.setChecked(True)
-        bg_m.addButton(rb); rb_m[m] = rb; hl_m.addWidget(rb)
-    hl_m.addStretch()
-    l_s.addLayout(hl_m, 2, 0, 1, 2)
-
-    l_s.addWidget(QtWidgets.QLabel("Scores (SDF):"), 3, 0)
+    l_s.addWidget(QtWidgets.QLabel("Scores (SDF):"), 2, 0)
     hl_sf = QtWidgets.QHBoxLayout()
     e_scores = QtWidgets.QLineEdit()
     e_scores.setPlaceholderText("optional")
     b_browse = QtWidgets.QPushButton("…"); b_browse.setFixedWidth(26)
     hl_sf.addWidget(e_scores); hl_sf.addWidget(b_browse)
-    l_s.addLayout(hl_sf, 3, 1)
+    l_s.addLayout(hl_sf, 2, 1)
 
     hl_b = QtWidgets.QHBoxLayout()
     b_setup = QtWidgets.QPushButton("Setup")
     b_clear = QtWidgets.QPushButton("Clear")
     hl_b.addWidget(b_setup); hl_b.addWidget(b_clear)
-    l_s.addLayout(hl_b, 4, 0, 1, 2)
+    l_s.addLayout(hl_b, 3, 0, 1, 2)
     top_l.addWidget(g_s)
 
     # Navigate
@@ -1804,13 +1793,12 @@ def _open_gui():
         ref_combo.blockSignals(False)
 
     def do_setup():
-        mode = next(m for m, rb in rb_m.items() if rb.isChecked())
         sf = e_scores.text().strip()
         if sf:
             ci_load_scores(sf)
         else:
             _stepper.sdf_records = []
-        ci_setup(protein=e_prot.text(), ligands=e_lig.text(), mode=mode)
+        ci_setup(protein=e_prot.text(), ligands=e_lig.text(), mode="auto")
         _populate_ref_combo()
         update_ui()
         rebuild_table()
