@@ -2007,10 +2007,12 @@ def _open_gui():
     # when _open_gui() returns.  Passing `win` as parent also lets Qt stop and
     # destroy the timer automatically when the window is closed.
     win._known_pymol_objs = set(cmd.get_names("objects"))
+    win._sync_tick = 0
 
     def _sync_if_external_change():
         if _stepper._in_compare or not _stepper.poses:
             return
+        win._sync_tick += 1
         try:
             pymol_st = cmd.get_state()
         except Exception:
@@ -2076,7 +2078,9 @@ def _open_gui():
                 _populate_ref_combo()
 
         # --- States-count sync: detect states added/removed from the tracked object ---
-        if _stepper.mode == "states" and _stepper.state_object and _stepper.poses:
+        # Only run every 4th tick (every 2 s) — state count rarely changes.
+        if (win._sync_tick % 4 == 0 and
+                _stepper.mode == "states" and _stepper.state_object and _stepper.poses):
             try:
                 n_states = cmd.count_states(_stepper.state_object)
             except Exception:
@@ -2153,7 +2157,7 @@ def _open_gui():
                     break
 
     win._sync_timer = QtCore.QTimer(win)
-    win._sync_timer.setInterval(250)
+    win._sync_timer.setInterval(500)
     win._sync_timer.timeout.connect(_sync_if_external_change)
     win._sync_timer.start()
 
