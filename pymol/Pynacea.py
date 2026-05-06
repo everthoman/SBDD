@@ -1,5 +1,5 @@
 """
-SBDD Suite — PyMOL Plugin
+Pynacea — PyMOL Plugin
 =========================
 Structure-Based Drug Design workflow plugin for PyMOL.  Four tabs follow
 the standard pipeline:
@@ -19,7 +19,7 @@ Installation
 ------------
   Plugin > Plugin Manager > Install New Plugin > choose this file
   — or —
-  run /path/to/sbdd_suite.py   then   sbdd_suite
+  run /path/to/Pynacea.py   then   pynacea
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-04-27
@@ -54,7 +54,7 @@ from pymol.Qt import QtCore, QtGui, QtWidgets
 PLUGIN_VERSION = "0.2"
 _IS_WINDOWS    = platform.system() == "Windows"
 
-_CFG_FILE = Path.home() / ".config" / "sbdd_suite.json"
+_CFG_FILE = Path.home() / ".config" / "pynacea.json"
 
 _DEFAULTS: Dict[str, str] = {
     "gnina_path":      os.environ.get("GNINA_PATH", "/opt/gnina/gnina"),
@@ -424,7 +424,7 @@ class ProtprepWorker(QtCore.QThread):
 class ProtprepPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tmpdir  = tempfile.mkdtemp(prefix="sbdd_prot_")
+        self._tmpdir  = tempfile.mkdtemp(prefix="pynacea_prot_")
         self._worker: Optional[ProtprepWorker] = None
         self._info: Dict[str, Any] = {}
         self._het_checks: Dict[str, QtWidgets.QCheckBox] = {}
@@ -570,7 +570,7 @@ class ProtprepPanel(QtWidgets.QWidget):
     def _inspect(self):
         p = self._file_edit.text().strip()
         if not p or not os.path.exists(p):
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite", "Specify a valid PDB file first.")
+            QtWidgets.QMessageBox.warning(self, "Pynacea", "Specify a valid PDB file first.")
             return
         self._inspect_path(p)
 
@@ -626,11 +626,11 @@ class ProtprepPanel(QtWidgets.QWidget):
         python = self._py_edit.path()
         script = self._sc_edit.path()
         if not python or not os.path.exists(python):
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite",
+            QtWidgets.QMessageBox.warning(self, "Pynacea",
                 "Configure the openmmdl Python path first.")
             return
         if not script or not os.path.exists(script):
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite",
+            QtWidgets.QMessageBox.warning(self, "Pynacea",
                 "Configure the protprep.py script path first.")
             return
 
@@ -804,7 +804,7 @@ class LigprepPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tmpdir = tempfile.mkdtemp(prefix="sbdd_lig_")
+        self._tmpdir = tempfile.mkdtemp(prefix="pynacea_lig_")
         self._worker: Optional[LigprepWorker] = None
         self._out_sdf = ""
         self._build_ui()
@@ -913,19 +913,19 @@ class LigprepPanel(QtWidgets.QWidget):
     def _run(self):
         obabel = self._ob_edit.path()
         if not obabel:
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite", "Set the obabel path first.")
+            QtWidgets.QMessageBox.warning(self, "Pynacea", "Set the obabel path first.")
             return
 
         if self._rb_smiles.isChecked():
             text    = self._smiles_edit.toPlainText().strip()
             entries = _parse_smiles_input(text)
             if not entries:
-                QtWidgets.QMessageBox.warning(self, "SBDD Suite", "Enter at least one SMILES.")
+                QtWidgets.QMessageBox.warning(self, "Pynacea", "Enter at least one SMILES.")
                 return
         else:
             sdf_in = self._sdf_edit.text().strip()
             if not sdf_in or not os.path.exists(sdf_in):
-                QtWidgets.QMessageBox.warning(self, "SBDD Suite", "Select a valid SDF file.")
+                QtWidgets.QMessageBox.warning(self, "Pynacea", "Select a valid SDF file.")
                 return
             # Re-prepare from SMILES extracted by RDKit, or pass SDF through obabel
             if _RDKIT:
@@ -939,13 +939,13 @@ class LigprepPanel(QtWidgets.QWidget):
                     entries.append((smi, name))
             else:
                 QtWidgets.QMessageBox.warning(
-                    self, "SBDD Suite",
+                    self, "Pynacea",
                     "SDF input mode requires RDKit to extract SMILES.\n"
                     "Install RDKit or paste SMILES directly."
                 )
                 return
             if not entries:
-                QtWidgets.QMessageBox.warning(self, "SBDD Suite", "No valid molecules in SDF.")
+                QtWidgets.QMessageBox.warning(self, "Pynacea", "No valid molecules in SDF.")
                 return
 
         out_path = self._out_edit.text().strip()
@@ -1013,7 +1013,7 @@ class DockingPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tmpdir  = tempfile.mkdtemp(prefix="sbdd_dock_")
+        self._tmpdir  = tempfile.mkdtemp(prefix="pynacea_dock_")
         self._worker: Optional[GninaWorker] = None
         self._results: List[Dict[str, Any]] = []
         self._out_sdf = ""
@@ -1167,20 +1167,20 @@ class DockingPanel(QtWidgets.QWidget):
         out_nm  = self.out_edit.text().strip() or "docking_out"
 
         if not rec_obj or not ref_obj:
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite", "Select receptor and ref ligand.")
+            QtWidgets.QMessageBox.warning(self, "Pynacea", "Select receptor and ref ligand.")
             return
 
         if self._rb_lig_file.isChecked():
             lig_f = self.lig_edit.text().strip()
             if not lig_f or not os.path.exists(lig_f):
-                QtWidgets.QMessageBox.warning(self, "SBDD Suite", "Specify a valid ligand SDF.")
+                QtWidgets.QMessageBox.warning(self, "Pynacea", "Specify a valid ligand SDF.")
                 return
         else:
             sel_items = [self.lig_obj_list.item(i).text()
                          for i in range(self.lig_obj_list.count())
                          if self.lig_obj_list.item(i).isSelected()]
             if not sel_items:
-                QtWidgets.QMessageBox.warning(self, "SBDD Suite",
+                QtWidgets.QMessageBox.warning(self, "Pynacea",
                     "Select at least one PyMOL ligand object.")
                 return
             lig_f = os.path.join(self._tmpdir, "lig_from_pymol.sdf")
@@ -1188,7 +1188,7 @@ class DockingPanel(QtWidgets.QWidget):
                 for obj in sel_items:
                     tmp = os.path.join(self._tmpdir, f"_lig_{obj}.sdf")
                     if not _save_sel(obj, tmp):
-                        QtWidgets.QMessageBox.warning(self, "SBDD Suite",
+                        QtWidgets.QMessageBox.warning(self, "Pynacea",
                             f"Could not save '{obj}' to SDF.")
                         return
                     with open(tmp) as th:
@@ -1200,7 +1200,7 @@ class DockingPanel(QtWidgets.QWidget):
 
         cmd.save(rec_pdb, rec_obj, state=1)
         if not _save_sel(ref_obj, ref_sdf, state=1):
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite",
+            QtWidgets.QMessageBox.warning(self, "Pynacea",
                 f"Could not save reference ligand '{ref_obj}'.")
             return
 
@@ -1303,7 +1303,7 @@ class _HistEntry:
 class DesignPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tmpdir = tempfile.mkdtemp(prefix="sbdd_design_")
+        self._tmpdir = tempfile.mkdtemp(prefix="pynacea_design_")
         self._worker: Optional[GninaWorker] = None
         self._history: List[_HistEntry] = []
         self._iter = 0
@@ -1420,7 +1420,7 @@ class DesignPanel(QtWidgets.QWidget):
         lig_obj = self.lig_box.currentText()
         if not rec_obj or not ref_obj or not lig_obj:
             QtWidgets.QMessageBox.warning(
-                self, "SBDD Suite", "Select receptor, ref ligand, and design ligand."
+                self, "Pynacea", "Select receptor, ref ligand, and design ligand."
             )
             return
 
@@ -1432,11 +1432,11 @@ class DesignPanel(QtWidgets.QWidget):
 
         cmd.save(rec_pdb, rec_obj, state=1)
         if not _save_sel(ref_obj, ref_sdf, state=1):
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite",
+            QtWidgets.QMessageBox.warning(self, "Pynacea",
                 f"Could not save ref ligand '{ref_obj}'.")
             return
         if not _save_sel(lig_obj, lig_sdf, state=-1):
-            QtWidgets.QMessageBox.warning(self, "SBDD Suite",
+            QtWidgets.QMessageBox.warning(self, "Pynacea",
                 f"Could not save design ligand '{lig_obj}'.")
             return
 
@@ -1527,7 +1527,7 @@ class DesignPanel(QtWidgets.QWidget):
 class SBDDDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"SBDD Suite  v{PLUGIN_VERSION}")
+        self.setWindowTitle(f"Pynacea  v{PLUGIN_VERSION}")
         self.setMinimumWidth(560)
         self.setMinimumHeight(720)
         self.setSizeGripEnabled(True)
@@ -1577,7 +1577,7 @@ def run_plugin_gui():
 
 def __init_plugin__(app=None):
     from pymol.plugins import addmenuitemqt
-    addmenuitemqt("SBDD Suite", run_plugin_gui)
+    addmenuitemqt("Pynacea", run_plugin_gui)
 
 
-cmd.extend("sbdd_suite", lambda: run_plugin_gui())
+cmd.extend("pynacea", lambda: run_plugin_gui())
