@@ -1727,6 +1727,21 @@ def _open_gui():
         if _sel_busy[0]:
             return
         selected = {idx.row() for idx in tw_pd.selectionModel().selectedRows()}
+
+        # Ctrl+click on a selected row in compare mode: Qt clears the entire
+        # selection instead of toggling just that row.  Detect the 2→0 case
+        # and re-select whichever row was NOT clicked.
+        if (not selected and len(_sel_order) == 2 and
+                win._pressed_ctrl[0] and win._pressed_row[0] in _sel_order):
+            keep = next(r for r in _sel_order if r != win._pressed_row[0])
+            _sel_order[:] = [keep]
+            _sel_busy[0] = True
+            try:
+                tw_pd.selectRow(keep)
+            finally:
+                _sel_busy[0] = False
+            selected = {keep}
+
         # prune deselected rows then append new arrivals in sorted order
         _sel_order[:] = [r for r in _sel_order if r in selected]
         for r in sorted(selected):
@@ -1993,43 +2008,22 @@ def _open_gui():
 
     tw_pd.itemSelectionChanged.connect(on_selection_changed)
 
-    # Ctrl+click on an already-selected row should deselect just that row and
-    # keep the other selected.  Qt's ExtendedSelection deselects everything
-    # instead, so we intercept the mouse press and handle it ourselves.
-    class _CtrlDeselFilter(QtCore.QObject):
-        def eventFilter(self, obj, event):
-            if (event.type() == QtCore.QEvent.MouseButtonPress and
-                    event.button() == QtCore.Qt.LeftButton and
-                    event.modifiers() & QtCore.Qt.ControlModifier):
-                row = tw_pd.rowAt(event.pos().y())
-                if row >= 0 and row in _sel_order:
-                    _sel_order.remove(row)
-                    _sel_busy[0] = True
-                    try:
-                        tw_pd.selectionModel().select(
-                            tw_pd.model().index(row, 0),
-                            QtCore.QItemSelectionModel.Deselect |
-                            QtCore.QItemSelectionModel.Rows)
-                    finally:
-                        _sel_busy[0] = False
-                    pose_indices = []
-                    for r in _sel_order:
-                        item0 = tw_pd.item(r, 0)
-                        if item0 is not None:
-                            pi = item0.data(QtCore.Qt.UserRole)
-                            if pi is not None:
-                                pose_indices.append(pi)
-                    if len(pose_indices) == 1:
-                        ci_goto(pose_indices[0])
-                        update_ui()
-                    elif len(pose_indices) == 0:
-                        _stepper._cleanup_cmp()
-                        update_ui()
-                    return True  # event consumed
-            return False
+    # Track which row was pressed (and whether Ctrl was held) before Qt updates
+    # the selection.  on_selection_changed uses this to restore the non-clicked
+    # row when Ctrl+clicking a selected row causes Qt to clear both selections.
+    win._pressed_row  = [-1]
+    win._pressed_ctrl = [False]
 
-    win._ctrl_desel_filter = _CtrlDeselFilter(tw_pd)
-    tw_pd.viewport().installEventFilter(win._ctrl_desel_filter)
+    class _RowPressTracker(QtCore.QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QtCore.QEvent.MouseButtonPress:
+                win._pressed_row[0]  = tw_pd.rowAt(event.pos().y())
+                win._pressed_ctrl[0] = bool(
+                    event.modifiers() & QtCore.Qt.ControlModifier)
+            return False  # never consume — just observe
+
+    win._row_press_tracker = _RowPressTracker()
+    tw_pd.viewport().installEventFilter(win._row_press_tracker)
 
     g_pd.toggled.connect(lambda checked: update_ui())
 
