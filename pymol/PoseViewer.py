@@ -1892,9 +1892,9 @@ def _open_gui():
     def do_go():
         ci_goto(sp.value() - 1); update_ui()
 
-    def _tog(cb, attr, group_en):
+    def _tog(cb, attr):
         def h(state):
-            setattr(_stepper, attr, group_en.isChecked() and cb.isChecked())
+            setattr(_stepper, attr, cb.isChecked())
             ci_update(); update_ui()
         return h
 
@@ -1920,15 +1920,15 @@ def _open_gui():
     b_go.clicked.connect(do_go)
 
 
-    cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds",     g1_en))
-    cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen",    g1_en))
-    cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt",       g1_en))
-    cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb",    g1_en))
-    cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi",       g2_en))
-    cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation",  g2_en))
-    cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good", g3_en))
-    cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad",  g3_en))
-    cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly", g3_en))
+    cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds"))
+    cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen"))
+    cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt"))
+    cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb"))
+    cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi"))
+    cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation"))
+    cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good"))
+    cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad"))
+    cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly"))
     cb_zoom.stateChanged.connect(lambda s: setattr(_stepper, "auto_zoom", cb_zoom.isChecked()))
 
     g1_en.stateChanged.connect(_group_tog(g1_en, [
