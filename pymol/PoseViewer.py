@@ -1901,7 +1901,10 @@ def _open_gui():
     def _group_tog(group_en, cb_attr_pairs):
         def h(checked):
             for cb, attr in cb_attr_pairs:
-                setattr(_stepper, attr, checked and cb.isChecked())
+                cb.blockSignals(True)
+                cb.setChecked(checked)
+                cb.blockSignals(False)
+                setattr(_stepper, attr, checked)
             ci_update(); update_ui()
         return h
 
@@ -1957,8 +1960,13 @@ def _open_gui():
     cb_rlbl.stateChanged.connect(do_toggle_rlbl)
 
     def do_disp_group_tog(checked):
-        _stepper.show_labels = checked and cb_lb.isChecked()
-        _stepper.show_lig_h  = checked and cb_lig_h.isChecked()
+        for cb in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h):
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+        _stepper.show_labels = checked
+        _stepper.show_lig_h  = checked
+        _stepper.auto_zoom   = checked
         do_toggle_surf()
         do_toggle_rlbl()
         ci_update(); update_ui()
