@@ -1999,6 +1999,42 @@ def _open_gui():
         sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), win)
         sc.activated.connect(fn)
 
+    # Detect external PyMOL state changes (built-in slider / play buttons / ci_next from CLI).
+    # IMPORTANT: timer must be stored on `win` (not as a local variable) so that
+    # neither the QTimer C++ object nor its Python wrapper are garbage-collected
+    # when _open_gui() returns.  Passing `win` as parent also lets Qt stop and
+    # destroy the timer automatically when the window is closed.
+    def _sync_if_external_change():
+        if _stepper._in_compare or not _stepper.poses:
+            return
+        try:
+            pymol_st = cmd.get_state()
+        except Exception:
+            return
+        cur_obj, cur_st = _stepper.poses[_stepper.current_index]
+        if cur_st == pymol_st:
+            return  # Already in sync
+        if _stepper.mode == "states":
+            for i, (o, s) in enumerate(_stepper.poses):
+                if s == pymol_st:
+                    _stepper.current_index = i
+                    _stepper._update(o, state=s)
+                    update_ui()
+                    break
+        else:
+            # Objects mode: sync within the currently active object
+            for i, (o, s) in enumerate(_stepper.poses):
+                if o == cur_obj and s == pymol_st:
+                    _stepper.current_index = i
+                    _stepper._update(o, state=s)
+                    update_ui()
+                    break
+
+    win._sync_timer = QtCore.QTimer(win)
+    win._sync_timer.setInterval(250)
+    win._sync_timer.timeout.connect(_sync_if_external_change)
+    win._sync_timer.start()
+
     win.show(); win.raise_()
 
 
