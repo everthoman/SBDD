@@ -1727,21 +1727,6 @@ def _open_gui():
         if _sel_busy[0]:
             return
         selected = {idx.row() for idx in tw_pd.selectionModel().selectedRows()}
-
-        # Ctrl+click on a selected row in compare mode: Qt clears the entire
-        # selection instead of toggling just that row.  Detect the 2→0 case
-        # and re-select whichever row was NOT clicked.
-        if (not selected and len(_sel_order) == 2 and
-                win._pressed_ctrl[0] and win._pressed_row[0] in _sel_order):
-            keep = next(r for r in _sel_order if r != win._pressed_row[0])
-            _sel_order[:] = [keep]
-            _sel_busy[0] = True
-            try:
-                tw_pd.selectRow(keep)
-            finally:
-                _sel_busy[0] = False
-            selected = {keep}
-
         # prune deselected rows then append new arrivals in sorted order
         _sel_order[:] = [r for r in _sel_order if r in selected]
         for r in sorted(selected):
@@ -2007,23 +1992,6 @@ def _open_gui():
     cb_cmp_hb.stateChanged.connect(on_cmp_hb)
 
     tw_pd.itemSelectionChanged.connect(on_selection_changed)
-
-    # Track which row was pressed (and whether Ctrl was held) before Qt updates
-    # the selection.  on_selection_changed uses this to restore the non-clicked
-    # row when Ctrl+clicking a selected row causes Qt to clear both selections.
-    win._pressed_row  = [-1]
-    win._pressed_ctrl = [False]
-
-    class _RowPressTracker(QtCore.QObject):
-        def eventFilter(self, obj, event):
-            if event.type() == QtCore.QEvent.MouseButtonPress:
-                win._pressed_row[0]  = tw_pd.rowAt(event.pos().y())
-                win._pressed_ctrl[0] = bool(
-                    event.modifiers() & QtCore.Qt.ControlModifier)
-            return False  # never consume — just observe
-
-    win._row_press_tracker = _RowPressTracker()
-    tw_pd.viewport().installEventFilter(win._row_press_tracker)
 
     g_pd.toggled.connect(lambda checked: update_ui())
 
