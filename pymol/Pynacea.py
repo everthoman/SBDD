@@ -818,15 +818,47 @@ class FpocketPanel(QtWidgets.QWidget):
         # Input protein
         prot_grp = QtWidgets.QGroupBox("Protein")
         pl = QtWidgets.QVBoxLayout(prot_grp)
-        hl = QtWidgets.QHBoxLayout()
+
+        mode_row = QtWidgets.QHBoxLayout()
+        self._rb_obj  = QtWidgets.QRadioButton("PyMOL object")
+        self._rb_file = QtWidgets.QRadioButton("PDB file")
+        self._rb_obj.setChecked(True)
+        mode_row.addWidget(self._rb_obj)
+        mode_row.addWidget(self._rb_file)
+        mode_row.addStretch()
+        pl.addLayout(mode_row)
+
+        self._prot_stack = QtWidgets.QStackedWidget()
+
+        # Page 0 — PyMOL object
+        obj_page = QtWidgets.QWidget()
+        obj_row  = QtWidgets.QHBoxLayout(obj_page)
+        obj_row.setContentsMargins(0, 0, 0, 0)
         self._prot_combo = QtWidgets.QComboBox()
         self._prot_combo.setMinimumWidth(160)
         ref_btn = QtWidgets.QPushButton("Refresh")
         ref_btn.setMaximumWidth(64)
         ref_btn.clicked.connect(self._refresh_objects)
-        hl.addWidget(self._prot_combo, 1)
-        hl.addWidget(ref_btn)
-        pl.addLayout(hl)
+        obj_row.addWidget(self._prot_combo, 1)
+        obj_row.addWidget(ref_btn)
+        self._prot_stack.addWidget(obj_page)
+
+        # Page 1 — PDB file on disk
+        file_page = QtWidgets.QWidget()
+        file_row  = QtWidgets.QHBoxLayout(file_page)
+        file_row.setContentsMargins(0, 0, 0, 0)
+        self._pdb_file_edit = QtWidgets.QLineEdit()
+        self._pdb_file_edit.setPlaceholderText("path/to/protein.pdb")
+        pdb_browse_btn = QtWidgets.QPushButton("…")
+        pdb_browse_btn.setMaximumWidth(28)
+        pdb_browse_btn.clicked.connect(self._browse_pdb_file)
+        file_row.addWidget(self._pdb_file_edit, 1)
+        file_row.addWidget(pdb_browse_btn)
+        self._prot_stack.addWidget(file_page)
+
+        self._rb_obj.toggled.connect(
+            lambda on: self._prot_stack.setCurrentIndex(0 if on else 1))
+        pl.addWidget(self._prot_stack)
         root.addWidget(prot_grp)
 
         # Run
@@ -854,7 +886,7 @@ class FpocketPanel(QtWidgets.QWidget):
         rl.addWidget(self._table)
 
         load_row = QtWidgets.QHBoxLayout()
-        self._load_btn = QtWidgets.QPushButton("Load pocket into PyMOL")
+        self._load_btn = QtWidgets.QPushButton("Load pocket spheres into PyMOL")
         self._load_btn.setEnabled(False)
         load_row.addWidget(self._load_btn)
         self._load_btn.clicked.connect(self._load_pocket)
@@ -879,23 +911,37 @@ class FpocketPanel(QtWidgets.QWidget):
             self._prot_combo.setCurrentIndex(idx)
         self._prot_combo.blockSignals(False)
 
+    def _browse_pdb_file(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select PDB file", "", "PDB (*.pdb *.ent);;All (*)")
+        if p:
+            self._pdb_file_edit.setText(p)
+
     def _run(self):
         fpocket = self._fp_edit.path()
         if not fpocket:
             QtWidgets.QMessageBox.warning(self, "Pynacea", "Set the fpocket path first.")
             return
-        prot = self._prot_combo.currentText()
-        if not prot:
-            QtWidgets.QMessageBox.warning(self, "Pynacea", "Select a protein object first.")
-            return
 
-        pdb_path = os.path.join(self._tmpdir, f"{prot}.pdb")
-        if not _save_sel(prot, pdb_path):
-            QtWidgets.QMessageBox.warning(self, "Pynacea", f"Could not save '{prot}' as PDB.")
-            return
+        if self._rb_file.isChecked():
+            pdb_path = self._pdb_file_edit.text().strip()
+            if not pdb_path or not os.path.exists(pdb_path):
+                QtWidgets.QMessageBox.warning(self, "Pynacea", "Select a valid PDB file.")
+                return
+            label = os.path.basename(pdb_path)
+        else:
+            prot = self._prot_combo.currentText()
+            if not prot:
+                QtWidgets.QMessageBox.warning(self, "Pynacea", "Select a protein object first.")
+                return
+            pdb_path = os.path.join(self._tmpdir, f"{prot}.pdb")
+            if not _save_sel(prot, pdb_path):
+                QtWidgets.QMessageBox.warning(self, "Pynacea", f"Could not save '{prot}' as PDB.")
+                return
+            label = prot
 
         self._log.clear()
-        self._log.appendPlainText(f"Running fpocket on '{prot}'…")
+        self._log.appendPlainText(f"Running fpocket on '{label}'…")
         self._run_btn.setEnabled(False)
         self._load_btn.setEnabled(False)
         self._table.setRowCount(0)
@@ -951,19 +997,22 @@ class FpocketPanel(QtWidgets.QWidget):
             return
         r      = rows[0].row()
         pocket = self._pockets[r]
-        n      = pocket["Pocket"]
-        pdb    = os.path.join(self._out_dir, "pockets", f"{self._stem}_pocket{n}_atm.pdb")
-        if not os.path.exists(pdb):
-            # fallback: older fpocket naming
-            pdb = os.path.join(self._out_dir, "pockets", f"pocket{n}_atm.pdb")
-        if not os.path.exists(pdb):
-            QtWidgets.QMessageBox.warning(self, "Pynacea", f"Pocket {n} PDB not found:\n{pdb}")
+        n      = int(pocket["Pocket"])
+        pockets_dir = os.path.join(self._out_dir, "pockets")
+        vert = os.path.join(pockets_dir, f"pocket{n}_vert.pqr")
+
+        if not os.path.exists(vert):
+            QtWidgets.QMessageBox.warning(
+                self, "Pynacea", f"Pocket {n} vertex file not found:\n{vert}")
             return
-        obj_name = f"pocket{n}"
-        cmd.load(pdb, obj_name)
-        cmd.show("spheres", obj_name)
-        cmd.set("sphere_scale", 0.4, obj_name)
-        self._log.appendPlainText(f"✓ Loaded pocket {n} as '{obj_name}'")
+
+        sph_name = f"pocket{n}_spheres"
+        cmd.load(vert, sph_name)
+        cmd.hide("everything", sph_name)
+        cmd.show("spheres", sph_name)
+        cmd.set("sphere_scale", 1.0, sph_name)
+        cmd.color("yellow", sph_name)
+        self._log.appendPlainText(f"✓ Loaded pocket {n} alpha spheres as '{sph_name}'")
 
     def cleanup(self):
         if self._worker and self._worker.isRunning():
