@@ -2031,10 +2031,12 @@ def _open_gui():
                 deleted = pose_objs & removed
                 if deleted:
                     _stepper.poses = [(o, s) for o, s in _stepper.poses if o not in deleted]
+                    _stepper.current_index = min(_stepper.current_index, max(0, len(_stepper.poses) - 1))
                     if not _stepper.poses:
+                        _stepper._cleanup_cmp()
+                        _clear_contacts()
                         update_ui()
                         return
-                    _stepper.current_index = min(_stepper.current_index, len(_stepper.poses) - 1)
                     _stepper._build_obj_colors()
                     _stepper._prefetch_all_properties()
                     _stepper._show_current()
