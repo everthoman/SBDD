@@ -1626,9 +1626,9 @@ def _open_gui():
 
     # Contacts / clashes (disabled + collapsed by default)
     g3, g3_en, _g3b, l3 = _section("Contacts / Clashes", enabled=False, expanded=False)
-    cb_cg = _cb(l3, "Good",  "#33cc33", checked=True)
-    cb_cb = _cb(l3, "Bad",   "#ff9900", checked=True)
-    cb_cu = _cb(l3, "Ugly",  "#ff2626", checked=True)
+    cb_cg = _cb(l3, "Good",  "#33cc33", checked=False)
+    cb_cb = _cb(l3, "Bad",   "#ff9900", checked=False)
+    cb_cu = _cb(l3, "Ugly",  "#ff2626", checked=False)
     bot_l.addWidget(g3)
 
     # Display options — collapsible + group enable (hides all display effects when off)
