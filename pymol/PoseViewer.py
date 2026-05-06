@@ -2035,11 +2035,13 @@ def _open_gui():
                     if not _stepper.poses:
                         _stepper._cleanup_cmp()
                         _clear_contacts()
+                        _populate_ref_combo()
                         update_ui()
                         return
                     _stepper._build_obj_colors()
                     _stepper._prefetch_all_properties()
                     _stepper._show_current()
+                    _populate_ref_combo()
                     update_ui()
                     rebuild_table()
                     return
@@ -2063,13 +2065,39 @@ def _open_gui():
                     _stepper._prefetch_all_properties()
                     update_ui()
                     rebuild_table()
+                _populate_ref_combo()
 
             elif _stepper.mode == "states":
                 if _stepper.state_object in removed:
                     _stepper.poses = []
+                    _populate_ref_combo()
                     update_ui()
                     return
+                _populate_ref_combo()
 
+        # --- States-count sync: detect states added/removed from the tracked object ---
+        if _stepper.mode == "states" and _stepper.state_object and _stepper.poses:
+            try:
+                n_states = cmd.count_states(_stepper.state_object)
+            except Exception:
+                n_states = len(_stepper.poses)
+            if n_states != len(_stepper.poses):
+                _stepper.poses = [(_stepper.state_object, st)
+                                  for st in range(1, n_states + 1)]
+                if not _stepper.poses:
+                    _clear_contacts()
+                    update_ui()
+                    return
+                new_idx = min(_stepper.current_index, n_states - 1)
+                if new_idx != _stepper.current_index:
+                    _stepper.current_index = new_idx
+                    _stepper._show_current()
+                _stepper._prefetch_all_properties()
+                update_ui()
+                rebuild_table()
+
+        if not _stepper.poses:
+            return
         cur_obj, cur_st = _stepper.poses[_stepper.current_index]
 
         if _stepper.mode == "objects":
