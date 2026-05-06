@@ -5,9 +5,11 @@ Structure-Based Drug Design workflow plugin for PyMOL.  Four tabs follow
 the standard pipeline:
 
   1. Protein Prep   — clean, fix, protonate, minimize receptor (protprep.py)
-  2. Ligand Prep    — protonate + 3-D embed ligands from SMILES or SDF (obabel)
-  3. Docking        — GNINA docking: receptor + ref ligand → ranked pose table
-  4. Design         — load a pose, edit in PyMOL builder, minimize & rescore
+  2. Pocket Detect  — fpocket binding-site detection, load pockets into PyMOL
+  3. Ligand Prep    — protonate + 3-D embed ligands from SMILES or SDF (obabel)
+  4. Docking        — GNINA docking: receptor + ref ligand → ranked pose table
+  5. Pose Viewer    — interaction visualisation (H-bonds, pi, salt bridges…)
+  6. Design         — load a pose, edit in PyMOL builder, minimize & rescore
 
 Requirements
 ------------
@@ -61,6 +63,7 @@ _DEFAULTS: Dict[str, str] = {
     "protprep_script": os.environ.get("PROTPREP_SCRIPT", ""),
     "openmmdl_python": os.environ.get("OPENMMDL_PYTHON", ""),
     "obabel_path":     os.environ.get("OBABEL_PATH", shutil.which("obabel") or "obabel"),
+    "fpocket_path":    os.environ.get("FPOCKET_PATH", shutil.which("fpocket") or "fpocket"),
 }
 
 # ─── Persistent config ────────────────────────────────────────────────────────
@@ -101,7 +104,7 @@ def _save_sel(sel: str, path: str, state: int = -1) -> bool:
 
 def _sanitize_obj_name(name: str) -> str:
     """Return a PyMOL-safe object name (alphanumeric + underscores only)."""
-    name = re.sub(r"[^A-Za-z0-9_]", "_", name.strip())
+    name = re.sub(r"[^A-Za-z0-9_.+-]", "_", name.strip())
     if name and name[0].isdigit():
         name = "mol_" + name
     return name or "mol"
@@ -693,7 +696,282 @@ class ProtprepPanel(QtWidgets.QWidget):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
-# ─── Tab 2: Ligand Preparation ────────────────────────────────────────────────
+# ─── Tab 2: Pocket Detection ─────────────────────────────────────────────────
+
+_FPOCKET_COL_MAP = {
+    "score":                                 "Score",
+    "druggability score":                    "Druggability Score",
+    "number of alpha spheres":               "Number of Alpha Spheres",
+    "total sasa":                            "Total SASA",
+    "polar sasa":                            "Polar SASA",
+    "apolar sasa":                           "Apolar SASA",
+    "volume":                                "Volume",
+    "mean local hydrophobic density":        "Mean local hydrophobic density",
+    "mean alpha sphere radius":              "Mean alpha sphere radius",
+    "mean alp. sph. solvent access":         "Mean alp. sph. solvent access",
+    "apolar alpha sphere proportion":        "Apolar alpha sphere proportion",
+    "hydrophobicity score":                  "Hydrophobicity score",
+    "volume score":                          "Volume score",
+    "polarity score":                        "Polarity score",
+    "charge score":                          "Charge score",
+    "proportion of polar atoms":             "Proportion of polar atoms",
+    "alpha sphere density":                  "Alpha sphere density",
+    "cent. of mass - alpha sphere max dist": "Cent. of mass - Alpha Sphere max dist",
+    "flexibility":                           "Flexibility",
+}
+
+_FPOCKET_COLS = ["Pocket"] + list(_FPOCKET_COL_MAP.values())
+
+
+class _NumericItem(QtWidgets.QTableWidgetItem):
+    """QTableWidgetItem that sorts numerically."""
+    def __lt__(self, other):
+        try:
+            return float(self.text()) < float(other.text())
+        except (ValueError, TypeError):
+            return self.text() < other.text()
+
+
+def _parse_fpocket_info(info_path: str) -> List[Dict[str, Any]]:
+    """Parse fpocket *_info.txt into a list of pocket dicts."""
+    pockets: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+    with open(info_path) as fh:
+        for line in fh:
+            line = line.strip()
+            m = re.match(r"^Pocket\s+(\d+)\s*:", line, re.IGNORECASE)
+            if m:
+                if cur is not None:
+                    pockets.append(cur)
+                cur = {"Pocket": int(m.group(1))}
+                continue
+            if cur is not None and ":" in line:
+                raw_k, _, raw_v = line.partition(":")
+                k_low = raw_k.strip().lower()
+                col = _FPOCKET_COL_MAP.get(k_low)
+                if col:
+                    try:
+                        cur[col] = float(raw_v.strip())
+                    except ValueError:
+                        pass
+    if cur is not None:
+        pockets.append(cur)
+    return pockets
+
+
+class FpocketWorker(QtCore.QThread):
+    log_line = QtCore.Signal(str)
+    finished = QtCore.Signal(str, str)   # out_dir, stem
+    failed   = QtCore.Signal(str)
+
+    def __init__(self, fpocket: str, pdb_path: str):
+        super().__init__()
+        self._fpocket  = fpocket
+        self._pdb_path = pdb_path
+
+    def run(self):
+        try:
+            stem    = Path(self._pdb_path).stem
+            out_dir = Path(self._pdb_path).parent / f"{stem}_out"
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            proc = subprocess.Popen(
+                [self._fpocket, "-f", self._pdb_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            for line in proc.stdout:
+                self.log_line.emit(line.rstrip())
+            proc.wait()
+            if proc.returncode == 0 and out_dir.exists():
+                self.finished.emit(str(out_dir), stem)
+            else:
+                self.failed.emit(f"fpocket exited with code {proc.returncode}")
+        except FileNotFoundError:
+            self.failed.emit(f"fpocket binary not found: {self._fpocket}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class FpocketPanel(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tmpdir = tempfile.mkdtemp(prefix="pynacea_fpocket_")
+        self._worker: Optional[FpocketWorker] = None
+        self._out_dir = ""
+        self._stem    = ""
+        self._pockets: List[Dict[str, Any]] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # Paths
+        path_grp = QtWidgets.QGroupBox("fpocket")
+        ol = QtWidgets.QFormLayout(path_grp)
+        ol.setLabelAlignment(QtCore.Qt.AlignRight)
+        self._fp_edit = _PathEdit("fpocket_path", "fpocket")
+        ol.addRow("fpocket:", self._fp_edit)
+        root.addWidget(path_grp)
+
+        # Input protein
+        prot_grp = QtWidgets.QGroupBox("Protein")
+        pl = QtWidgets.QVBoxLayout(prot_grp)
+        hl = QtWidgets.QHBoxLayout()
+        self._prot_combo = QtWidgets.QComboBox()
+        self._prot_combo.setMinimumWidth(160)
+        ref_btn = QtWidgets.QPushButton("Refresh")
+        ref_btn.setMaximumWidth(64)
+        ref_btn.clicked.connect(self._refresh_objects)
+        hl.addWidget(self._prot_combo, 1)
+        hl.addWidget(ref_btn)
+        pl.addLayout(hl)
+        root.addWidget(prot_grp)
+
+        # Run
+        btn_row = QtWidgets.QHBoxLayout()
+        self._run_btn = QtWidgets.QPushButton("Detect Pockets")
+        btn_row.addWidget(self._run_btn)
+        self._run_btn.clicked.connect(self._run)
+        root.addLayout(btn_row)
+
+        self._progress = _progress_bar()
+        root.addWidget(self._progress)
+
+        # Results table
+        res_grp = QtWidgets.QGroupBox("Detected pockets")
+        rl = QtWidgets.QVBoxLayout(res_grp)
+        self._table = QtWidgets.QTableWidget(0, len(_FPOCKET_COLS))
+        self._table.setHorizontalHeaderLabels(_FPOCKET_COLS)
+        self._table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalHeader().setDefaultSectionSize(18)
+        self._table.setAlternatingRowColors(True)
+        self._table.setSortingEnabled(True)
+        rl.addWidget(self._table)
+
+        load_row = QtWidgets.QHBoxLayout()
+        self._load_btn = QtWidgets.QPushButton("Load pocket into PyMOL")
+        self._load_btn.setEnabled(False)
+        load_row.addWidget(self._load_btn)
+        self._load_btn.clicked.connect(self._load_pocket)
+        rl.addLayout(load_row)
+        root.addWidget(res_grp)
+
+        self._log = _log_widget()
+        root.addWidget(self._log)
+
+        self._refresh_objects()
+        self._table.itemSelectionChanged.connect(
+            lambda: self._load_btn.setEnabled(bool(self._table.selectedItems())))
+
+    def _refresh_objects(self):
+        prev = self._prot_combo.currentText()
+        self._prot_combo.blockSignals(True)
+        self._prot_combo.clear()
+        for n in _pymol_objects():
+            self._prot_combo.addItem(n)
+        idx = self._prot_combo.findText(prev)
+        if idx >= 0:
+            self._prot_combo.setCurrentIndex(idx)
+        self._prot_combo.blockSignals(False)
+
+    def _run(self):
+        fpocket = self._fp_edit.path()
+        if not fpocket:
+            QtWidgets.QMessageBox.warning(self, "Pynacea", "Set the fpocket path first.")
+            return
+        prot = self._prot_combo.currentText()
+        if not prot:
+            QtWidgets.QMessageBox.warning(self, "Pynacea", "Select a protein object first.")
+            return
+
+        pdb_path = os.path.join(self._tmpdir, f"{prot}.pdb")
+        if not _save_sel(prot, pdb_path):
+            QtWidgets.QMessageBox.warning(self, "Pynacea", f"Could not save '{prot}' as PDB.")
+            return
+
+        self._log.clear()
+        self._log.appendPlainText(f"Running fpocket on '{prot}'…")
+        self._run_btn.setEnabled(False)
+        self._load_btn.setEnabled(False)
+        self._table.setRowCount(0)
+        self._pockets.clear()
+        self._progress.setRange(0, 0)
+        self._progress.setVisible(True)
+
+        self._worker = FpocketWorker(fpocket, pdb_path)
+        self._worker.log_line.connect(self._log.appendPlainText)
+        self._worker.finished.connect(self._done)
+        self._worker.failed.connect(self._fail)
+        self._worker.start()
+
+    def _done(self, out_dir: str, stem: str):
+        self._run_btn.setEnabled(True)
+        self._progress.setVisible(False)
+        self._out_dir = out_dir
+        self._stem = stem
+        info_path = os.path.join(out_dir, f"{stem}_info.txt")
+        if not os.path.exists(info_path):
+            self._log.appendPlainText(f"✗ Info file not found: {info_path}")
+            return
+        self._pockets = _parse_fpocket_info(info_path)
+        self._log.appendPlainText(f"✓ {len(self._pockets)} pocket(s) detected")
+        self._fill_table()
+
+    def _fail(self, msg: str):
+        self._run_btn.setEnabled(True)
+        self._progress.setVisible(False)
+        self._log.appendPlainText(f"\n✗ {msg}")
+        QtWidgets.QMessageBox.critical(self, "Pocket detection failed", msg)
+
+    def _fill_table(self):
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(self._pockets))
+        for r, p in enumerate(self._pockets):
+            for c, col in enumerate(_FPOCKET_COLS):
+                v = p.get(col, "")
+                if col == "Pocket":
+                    txt = str(int(v)) if isinstance(v, (int, float)) else str(v)
+                else:
+                    txt = _fmt(v) if isinstance(v, float) else ("" if v == "" else str(v))
+                item = _NumericItem(txt)
+                if c > 0:
+                    item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                self._table.setItem(r, c, item)
+        self._table.resizeColumnsToContents()
+        self._table.setSortingEnabled(True)
+
+    def _load_pocket(self):
+        rows = self._table.selectionModel().selectedRows()
+        if not rows or not self._out_dir:
+            return
+        r      = rows[0].row()
+        pocket = self._pockets[r]
+        n      = pocket["Pocket"]
+        pdb    = os.path.join(self._out_dir, "pockets", f"{self._stem}_pocket{n}_atm.pdb")
+        if not os.path.exists(pdb):
+            # fallback: older fpocket naming
+            pdb = os.path.join(self._out_dir, "pockets", f"pocket{n}_atm.pdb")
+        if not os.path.exists(pdb):
+            QtWidgets.QMessageBox.warning(self, "Pynacea", f"Pocket {n} PDB not found:\n{pdb}")
+            return
+        obj_name = f"pocket{n}"
+        cmd.load(pdb, obj_name)
+        cmd.show("spheres", obj_name)
+        cmd.set("sphere_scale", 0.4, obj_name)
+        self._log.appendPlainText(f"✓ Loaded pocket {n} as '{obj_name}'")
+
+    def cleanup(self):
+        if self._worker and self._worker.isRunning():
+            self._worker.terminate(); self._worker.wait()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
+# ─── Tab 3: Ligand Preparation ────────────────────────────────────────────────
 
 class LigprepWorker(QtCore.QThread):
     """Prepare ligands from SMILES using obabel (2-step: protonate → 3D)."""
@@ -888,12 +1166,12 @@ class LigprepPanel(QtWidgets.QWidget):
         # Run
         btn_row = QtWidgets.QHBoxLayout()
         self._run_btn  = QtWidgets.QPushButton("Prepare Ligands")
-        self._open_btn = QtWidgets.QPushButton("Open Output SDF…")
-        self._open_btn.setEnabled(False)
+        self._save_btn = QtWidgets.QPushButton("Save SDF…")
+        self._save_btn.setEnabled(False)
         self._run_btn.clicked.connect(self._run)
-        self._open_btn.clicked.connect(self._open_output)
+        self._save_btn.clicked.connect(self._save_output)
         btn_row.addWidget(self._run_btn)
-        btn_row.addWidget(self._open_btn)
+        btn_row.addWidget(self._save_btn)
         root.addLayout(btn_row)
 
         self._progress = _progress_bar()
@@ -957,7 +1235,7 @@ class LigprepPanel(QtWidgets.QWidget):
         self._log.appendPlainText(f"Preparing {len(entries)} ligand(s) at pH {self._ph_sp.value()}")
         self._log.appendPlainText("─" * 60)
         self._run_btn.setEnabled(False)
-        self._open_btn.setEnabled(False)
+        self._save_btn.setEnabled(False)
         self._progress.setRange(0, len(entries))
         self._progress.setValue(0)
         self._progress.setVisible(True)
@@ -976,7 +1254,7 @@ class LigprepPanel(QtWidgets.QWidget):
     def _done(self, sdf_path: str):
         self._run_btn.setEnabled(True)
         self._progress.setVisible(False)
-        self._open_btn.setEnabled(True)
+        self._save_btn.setEnabled(True)
         n = sdf_path and sum(1 for l in open(sdf_path) if l.strip() == "$$$$")
         self._log.appendPlainText(f"\n✓ {n} ligand(s) written to {sdf_path}")
         if self._load_chk.isChecked():
@@ -994,11 +1272,16 @@ class LigprepPanel(QtWidgets.QWidget):
         self._log.appendPlainText(f"\n✗ {msg}")
         QtWidgets.QMessageBox.critical(self, "Ligand preparation failed", msg)
 
-    def _open_output(self):
-        if self._out_sdf and os.path.exists(self._out_sdf):
-            QtWidgets.QDesktopServices.openUrl(
-                QtCore.QUrl.fromLocalFile(self._out_sdf)
-            )
+    def _save_output(self):
+        if not (self._out_sdf and os.path.exists(self._out_sdf)):
+            return
+        dest, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save prepared ligands", "prepared_ligands.sdf",
+            "SDF (*.sdf);;All (*)"
+        )
+        if dest:
+            shutil.copy2(self._out_sdf, dest)
+            self._log.appendPlainText(f"✓ Saved to {dest}")
 
     def cleanup(self):
         if self._worker and self._worker.isRunning():
@@ -1006,7 +1289,7 @@ class LigprepPanel(QtWidgets.QWidget):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
-# ─── Tab 3: Docking ───────────────────────────────────────────────────────────
+# ─── Tab 4: Docking ───────────────────────────────────────────────────────────
 
 class DockingPanel(QtWidgets.QWidget):
     pose_loaded = QtCore.Signal(str)
@@ -1291,7 +1574,585 @@ class DockingPanel(QtWidgets.QWidget):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
-# ─── Tab 4: Interactive Design ────────────────────────────────────────────────
+# ─── Tab 5: Pose Viewer ──────────────────────────────────────────────────────
+
+def _import_poseviewer():
+    """Import PoseViewer from the same directory as this file. Cached after first call."""
+    name = "PoseViewer"
+    if name in sys.modules:
+        return sys.modules[name]
+    here = Path(__file__).parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import importlib
+    return importlib.import_module(name)
+
+
+class PoseViewerPanel(QtWidgets.QWidget):
+    """Embedding of PoseViewer interaction viewer as a Pynacea tab."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pv = None           # PoseViewer module, loaded lazily
+        self._sel_order: list = []
+        self._sel_busy  = [False]
+        self._build_ui()
+
+    # ── UI construction ────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setSpacing(5)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        root.addWidget(splitter)
+
+        top_w = QtWidgets.QWidget()
+        top_l = QtWidgets.QVBoxLayout(top_w)
+        top_l.setContentsMargins(0, 0, 0, 0); top_l.setSpacing(5)
+        splitter.addWidget(top_w)
+
+        bot_w = QtWidgets.QWidget()
+        bot_l = QtWidgets.QVBoxLayout(bot_w)
+        bot_l.setContentsMargins(0, 0, 0, 0); bot_l.setSpacing(5)
+        splitter.addWidget(bot_w)
+
+        # Setup
+        g_s = QtWidgets.QGroupBox("Setup")
+        l_s = QtWidgets.QGridLayout(g_s)
+        l_s.addWidget(QtWidgets.QLabel("Protein:"), 0, 0)
+        self._e_prot = QtWidgets.QLineEdit("polymer.protein")
+        l_s.addWidget(self._e_prot, 0, 1)
+        l_s.addWidget(QtWidgets.QLabel("Ligand(s):"), 1, 0)
+        self._e_lig = QtWidgets.QLineEdit("organic")
+        l_s.addWidget(self._e_lig, 1, 1)
+
+        hl_m = QtWidgets.QHBoxLayout()
+        hl_m.addWidget(QtWidgets.QLabel("Mode:"))
+        self._bg_m = QtWidgets.QButtonGroup(self)
+        self._rb_m: Dict[str, QtWidgets.QRadioButton] = {}
+        for m in ("auto", "objects", "states"):
+            rb = QtWidgets.QRadioButton(m)
+            if m == "auto": rb.setChecked(True)
+            self._bg_m.addButton(rb); self._rb_m[m] = rb; hl_m.addWidget(rb)
+        hl_m.addStretch()
+        l_s.addLayout(hl_m, 2, 0, 1, 2)
+
+        l_s.addWidget(QtWidgets.QLabel("Scores (SDF):"), 3, 0)
+        hl_sf = QtWidgets.QHBoxLayout()
+        self._e_scores = QtWidgets.QLineEdit()
+        self._e_scores.setPlaceholderText("optional")
+        b_browse = QtWidgets.QPushButton("…"); b_browse.setFixedWidth(26)
+        b_browse.clicked.connect(self._do_browse)
+        hl_sf.addWidget(self._e_scores); hl_sf.addWidget(b_browse)
+        l_s.addLayout(hl_sf, 3, 1)
+
+        hl_b = QtWidgets.QHBoxLayout()
+        b_setup = QtWidgets.QPushButton("Setup")
+        b_clear = QtWidgets.QPushButton("Clear")
+        b_setup.clicked.connect(self._do_setup)
+        b_clear.clicked.connect(self._do_clear)
+        hl_b.addWidget(b_setup); hl_b.addWidget(b_clear)
+        l_s.addLayout(hl_b, 4, 0, 1, 2)
+        top_l.addWidget(g_s)
+
+        # Navigate
+        g_n = QtWidgets.QGroupBox("Navigate")
+        l_n = QtWidgets.QVBoxLayout(g_n)
+        self._lbl = QtWidgets.QLabel("Ready — click Setup")
+        self._lbl.setAlignment(QtCore.Qt.AlignCenter)
+        f = self._lbl.font(); f.setBold(True); f.setPointSize(f.pointSize() + 1)
+        self._lbl.setFont(f)
+        l_n.addWidget(self._lbl)
+
+        hl_pn = QtWidgets.QHBoxLayout()
+        b_prev    = QtWidgets.QPushButton("<  Prev")
+        b_refresh = QtWidgets.QPushButton("Refresh")
+        b_next    = QtWidgets.QPushButton("Next  >")
+        b_prev.clicked.connect(self._do_prev)
+        b_refresh.clicked.connect(self._do_refresh)
+        b_next.clicked.connect(self._do_next)
+        hl_pn.addWidget(b_prev); hl_pn.addWidget(b_refresh); hl_pn.addWidget(b_next)
+        l_n.addLayout(hl_pn)
+
+        hl_j = QtWidgets.QHBoxLayout()
+        hl_j.addWidget(QtWidgets.QLabel("Go to #:"))
+        self._sp = QtWidgets.QSpinBox()
+        self._sp.setMinimum(1); self._sp.setMaximum(99999); self._sp.setFixedWidth(70)
+        hl_j.addWidget(self._sp)
+        b_go = QtWidgets.QPushButton("Go"); b_go.setFixedWidth(50)
+        b_go.clicked.connect(self._do_go)
+        hl_j.addWidget(b_go); hl_j.addStretch()
+        l_n.addLayout(hl_j)
+
+        self._cb_cmp_hb = QtWidgets.QCheckBox("H-bonds in compare mode")
+        self._cb_cmp_hb.setChecked(False)
+        self._cb_cmp_hb.stateChanged.connect(self._on_cmp_hb)
+        l_n.addWidget(self._cb_cmp_hb)
+        top_l.addWidget(g_n)
+
+        # Reference ligand
+        g_ref = QtWidgets.QGroupBox("Reference ligand")
+        l_ref = QtWidgets.QHBoxLayout(g_ref)
+        l_ref.addWidget(QtWidgets.QLabel("Object:"))
+        self._ref_combo = QtWidgets.QComboBox(); self._ref_combo.addItem("(none)")
+        self._ref_combo.setMinimumWidth(100)
+        l_ref.addWidget(self._ref_combo, 1)
+        self._cb_show_ref  = QtWidgets.QCheckBox("Show ref");  self._cb_show_ref.setChecked(True)
+        self._cb_show_pose = QtWidgets.QCheckBox("Show pose"); self._cb_show_pose.setChecked(True)
+        l_ref.addWidget(self._cb_show_ref)
+        l_ref.addWidget(self._cb_show_pose)
+        self._ref_combo.currentTextChanged.connect(self._on_ref_changed)
+        self._cb_show_ref.stateChanged.connect(self._on_show_ref)
+        self._cb_show_pose.stateChanged.connect(self._on_show_pose)
+        top_l.addWidget(g_ref)
+
+        # Pose Data table
+        g_pd = QtWidgets.QGroupBox("Pose Data")
+        g_pd.setCheckable(True); g_pd.setChecked(True)
+        l_pd = QtWidgets.QVBoxLayout(g_pd)
+
+        class _SortItem(QtWidgets.QTableWidgetItem):
+            def __lt__(self, other):
+                a = self.data(QtCore.Qt.UserRole + 1)
+                b = other.data(QtCore.Qt.UserRole + 1)
+                if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                    return a < b
+                return self.text() < other.text()
+
+        self._SortItem = _SortItem
+        self._tw_pd = QtWidgets.QTableWidget(0, 0)
+        self._tw_pd.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._tw_pd.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self._tw_pd.setMinimumHeight(80)
+        self._tw_pd.horizontalHeader().setStretchLastSection(True)
+        self._tw_pd.horizontalHeader().setSectionsMovable(True)
+        self._tw_pd.verticalHeader().setDefaultSectionSize(18)
+        self._tw_pd.setAlternatingRowColors(True)
+        self._tw_pd.itemSelectionChanged.connect(self._on_selection_changed)
+        l_pd.addWidget(self._tw_pd)
+        g_pd.toggled.connect(lambda _: self._update_ui())
+        top_l.addWidget(g_pd, 1)
+        self._g_pd = g_pd
+
+        # Interaction controls
+        def _cb(lay, text, hex_color, checked=True):
+            row = QtWidgets.QHBoxLayout()
+            sw = QtWidgets.QLabel(); sw.setFixedSize(14, 14)
+            sw.setStyleSheet(f"background-color: {hex_color}; border: none;")
+            row.addWidget(sw)
+            cb = QtWidgets.QCheckBox(text); cb.setChecked(checked)
+            row.addWidget(cb); row.addStretch()
+            lay.addLayout(row)
+            return cb
+
+        def _section(title, enabled=True, expanded=False, show_enable=True):
+            g = QtWidgets.QGroupBox()
+            gl = QtWidgets.QVBoxLayout(g)
+            gl.setContentsMargins(6, 4, 6, 6); gl.setSpacing(2)
+            hl = QtWidgets.QHBoxLayout()
+            if show_enable:
+                en = QtWidgets.QCheckBox(title); en.setChecked(enabled)
+                _f = en.font(); _f.setBold(True); en.setFont(_f)
+                hl.addWidget(en)
+            else:
+                lbl = QtWidgets.QLabel(title)
+                _f = lbl.font(); _f.setBold(True); lbl.setFont(_f)
+                hl.addWidget(lbl); en = None
+            hl.addStretch()
+            btn_col = QtWidgets.QToolButton()
+            btn_col.setCheckable(True); btn_col.setChecked(expanded)
+            btn_col.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+            btn_col.setAutoRaise(True)
+            hl.addWidget(btn_col)
+            gl.addLayout(hl)
+            body = QtWidgets.QWidget()
+            bl = QtWidgets.QVBoxLayout(body)
+            bl.setContentsMargins(0, 2, 0, 0); bl.setSpacing(2)
+            body.setVisible(expanded)
+            gl.addWidget(body)
+            def _toggle(checked):
+                body.setVisible(checked)
+                btn_col.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
+            btn_col.toggled.connect(_toggle)
+            return g, en, body, bl
+
+        g1, g1_en, _g1b, l1 = _section("Non-covalent bonds", enabled=True)
+        cb_hb = _cb(l1, "Hydrogen bonds",  "#ffd900")
+        cb_xb = _cb(l1, "Halogen bonds",   "#9933e6")
+        cb_sb = _cb(l1, "Salt bridges",    "#e633e6")
+        cb_ah = _cb(l1, "Aromatic H-Bond", "#4dd97f")
+        bot_l.addWidget(g1)
+
+        g2, g2_en, _g2b, l2 = _section("Pi interactions", enabled=True)
+        cb_pp = _cb(l2, "Pi-pi stacking", "#4dc0ff")
+        cb_pc = _cb(l2, "Pi-cation",      "#33cc33")
+        bot_l.addWidget(g2)
+
+        g3, g3_en, _g3b, l3 = _section("Contacts / Clashes", enabled=False)
+        cb_cg = _cb(l3, "Good",  "#33cc33")
+        cb_cb_ = _cb(l3, "Bad",  "#ff9900")
+        cb_cu = _cb(l3, "Ugly",  "#ff2626")
+        bot_l.addWidget(g3)
+
+        g_disp, g_disp_en, _gdb, l_disp = _section("Display", enabled=True, show_enable=True)
+        self._cb_lb   = QtWidgets.QCheckBox("Show distance labels"); self._cb_lb.setChecked(True)
+        self._cb_surf = QtWidgets.QCheckBox("Show surface");         self._cb_surf.setChecked(True)
+        self._cb_rlbl = QtWidgets.QCheckBox("Show residue labels");  self._cb_rlbl.setChecked(True)
+        self._cb_zoom = QtWidgets.QCheckBox("Auto-zoom to pose");    self._cb_zoom.setChecked(True)
+        self._cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); self._cb_lig_h.setChecked(False)
+        for _w in (self._cb_lb, self._cb_surf, self._cb_rlbl, self._cb_zoom, self._cb_lig_h):
+            l_disp.addWidget(_w)
+        bot_l.addWidget(g_disp)
+        bot_l.addStretch()
+
+        splitter.setSizes([460, 200])
+
+        # Wire interaction toggles — deferred until _pv is loaded
+        self._g1_en = g1_en; self._g2_en = g2_en; self._g3_en = g3_en
+        self._g_disp_en = g_disp_en
+        self._cb_hb = cb_hb; self._cb_xb = cb_xb; self._cb_sb = cb_sb; self._cb_ah = cb_ah
+        self._cb_pp = cb_pp; self._cb_pc = cb_pc
+        self._cb_cg = cb_cg; self._cb_cb_ = cb_cb_; self._cb_cu = cb_cu
+
+        def _defer(cb, attr, g_en):
+            cb.stateChanged.connect(lambda _: self._tog(attr, g_en))
+        _defer(cb_hb, "show_hbonds",     g1_en); _defer(cb_xb, "show_halogen",  g1_en)
+        _defer(cb_sb, "show_salt",       g1_en); _defer(cb_ah, "show_arom_hb",  g1_en)
+        _defer(cb_pp, "show_pipi",       g2_en); _defer(cb_pc, "show_pi_cation", g2_en)
+        _defer(cb_cg, "show_clash_good", g3_en); _defer(cb_cb_, "show_clash_bad", g3_en)
+        _defer(cb_cu, "show_clash_ugly", g3_en)
+
+        def _grp_defer(g_en, pairs):
+            g_en.stateChanged.connect(lambda _: self._group_tog(g_en, pairs))
+        _grp_defer(g1_en, [(cb_hb,"show_hbonds"),(cb_xb,"show_halogen"),
+                            (cb_sb,"show_salt"),  (cb_ah,"show_arom_hb")])
+        _grp_defer(g2_en, [(cb_pp,"show_pipi"),(cb_pc,"show_pi_cation")])
+        _grp_defer(g3_en, [(cb_cg,"show_clash_good"),(cb_cb_,"show_clash_bad"),
+                            (cb_cu,"show_clash_ugly")])
+
+        self._cb_zoom.stateChanged.connect(lambda _: self._set_attr("auto_zoom", self._cb_zoom.isChecked()))
+        self._cb_lb.stateChanged.connect(  lambda _: self._set_attr_disp("show_labels", g_disp_en, self._cb_lb))
+        self._cb_lig_h.stateChanged.connect(lambda _: self._set_attr_disp("show_lig_h", g_disp_en, self._cb_lig_h))
+        self._cb_surf.stateChanged.connect(lambda _: self._do_toggle_surf())
+        self._cb_rlbl.stateChanged.connect(lambda _: self._do_toggle_rlbl())
+        g_disp_en.stateChanged.connect(lambda _: self._do_disp_group_tog())
+
+    # ── PoseViewer module access ───────────────────────────────────────────────
+
+    def _pv_or_warn(self):
+        if self._pv is None:
+            try:
+                self._pv = _import_poseviewer()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(
+                    self, "Pynacea", f"Could not load PoseViewer:\n{e}")
+                return None
+        return self._pv
+
+    def _set_attr(self, attr, val):
+        pv = self._pv
+        if pv is not None:
+            setattr(pv._stepper, attr, val)
+            pv.ci_update(); self._update_ui()
+
+    def _set_attr_disp(self, attr, g_en, cb):
+        pv = self._pv
+        if pv is not None:
+            setattr(pv._stepper, attr, g_en.isChecked() and cb.isChecked())
+            pv.ci_update(); self._update_ui()
+
+    def _tog(self, attr, g_en):
+        pv = self._pv
+        if pv is None: return
+        cb = getattr(self, f"_cb_{attr.replace('show_','')}", None)
+        val = g_en.isChecked() and (cb.isChecked() if cb else True)
+        setattr(pv._stepper, attr, val)
+        pv.ci_update(); self._update_ui()
+
+    def _group_tog(self, g_en, pairs):
+        pv = self._pv
+        if pv is None: return
+        checked = g_en.isChecked()
+        for cb, attr in pairs:
+            setattr(pv._stepper, attr, checked and cb.isChecked())
+        pv.ci_update(); self._update_ui()
+
+    # ── Setup / navigation ────────────────────────────────────────────────────
+
+    def _do_browse(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select scores SDF", "", "SDF files (*.sdf *.SDF);;All files (*)")
+        if path:
+            self._e_scores.setText(path)
+
+    def _do_setup(self):
+        pv = self._pv_or_warn()
+        if pv is None: return
+        mode = next(m for m, rb in self._rb_m.items() if rb.isChecked())
+        sf = self._e_scores.text().strip()
+        if sf:
+            pv.ci_load_scores(sf)
+        else:
+            pv._stepper.sdf_records = []
+        pv.ci_setup(protein=self._e_prot.text(), ligands=self._e_lig.text(), mode=mode)
+        self._populate_ref_combo()
+        self._update_ui()
+        self._rebuild_table()
+
+    def _do_clear(self):
+        pv = self._pv
+        if pv is None: return
+        pv.ci_clear()
+        pv._stepper.sdf_records = []
+        pv._stepper.all_properties = []
+        pv._stepper.ref_ligand = None
+        self._sel_order.clear()
+        self._ref_combo.blockSignals(True)
+        self._ref_combo.clear(); self._ref_combo.addItem("(none)")
+        self._ref_combo.blockSignals(False)
+        self._lbl.setText("Ready — click Setup")
+        self._tw_pd.setSortingEnabled(False)
+        self._tw_pd.clearContents()
+        self._tw_pd.setRowCount(0); self._tw_pd.setColumnCount(0)
+
+    def _do_prev(self):    self._table_adjacent(-1)
+    def _do_next(self):    self._table_adjacent(1)
+    def _do_refresh(self):
+        pv = self._pv
+        if pv: pv.ci_refresh(); self._update_ui()
+    def _do_go(self):
+        pv = self._pv
+        if pv: pv.ci_goto(self._sp.value() - 1); self._update_ui()
+
+    def _table_adjacent(self, delta):
+        pv = self._pv
+        if pv is None: return
+        n_rows = self._tw_pd.rowCount()
+        if n_rows == 0:
+            if delta > 0: pv.ci_next()
+            else:          pv.ci_prev()
+            self._update_ui(); return
+        cur = pv._stepper.current_index
+        cur_row = -1
+        for r in range(n_rows):
+            item0 = self._tw_pd.item(r, 0)
+            if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
+                cur_row = r; break
+        next_row = (cur_row + delta) % n_rows
+        item0 = self._tw_pd.item(next_row, 0)
+        if item0 is not None:
+            pi = item0.data(QtCore.Qt.UserRole)
+            if pi is not None:
+                pv.ci_goto(pi)
+        self._update_ui()
+
+    # ── Reference ligand ──────────────────────────────────────────────────────
+
+    def _populate_ref_combo(self):
+        pv = self._pv
+        if pv is None: return
+        prev = self._ref_combo.currentText()
+        self._ref_combo.blockSignals(True)
+        self._ref_combo.clear(); self._ref_combo.addItem("(none)")
+        for n in cmd.get_names("objects"):
+            if n.startswith("_ci_") or n in (
+                    pv._OBJ_PTS, pv._OBJ_REF_PTS, pv._OBJ_SURF):
+                continue
+            try:
+                if (cmd.count_atoms(f"{n} and organic") > 0 and
+                        cmd.count_atoms(f"{n} and ({pv._stepper.protein_sel or 'polymer.protein'})") == 0):
+                    self._ref_combo.addItem(n)
+            except Exception:
+                pass
+        target = pv._stepper.ref_ligand or prev
+        idx = self._ref_combo.findText(target) if target else -1
+        self._ref_combo.setCurrentIndex(max(idx, 0))
+        self._ref_combo.blockSignals(False)
+
+    def _on_ref_changed(self, text):
+        pv = self._pv
+        if pv is None: return
+        prev = pv._stepper.ref_ligand
+        pv._stepper.ref_ligand = None if text == "(none)" else text
+        if pv._stepper.ref_ligand:
+            pv._color_ref_ligand(pv._stepper.ref_ligand)
+            pv._stepper.show_ref = True
+            self._cb_show_ref.blockSignals(True); self._cb_show_ref.setChecked(True)
+            self._cb_show_ref.blockSignals(False)
+        else:
+            if prev:
+                try: cmd.disable(prev)
+                except Exception: pass
+            if pv._OBJ_REF_PTS in pv._created_objects:
+                try:
+                    cmd.delete(pv._OBJ_REF_PTS)
+                    pv._created_objects.discard(pv._OBJ_REF_PTS)
+                except Exception: pass
+            pv._stepper.show_ref = False
+            self._cb_show_ref.blockSignals(True); self._cb_show_ref.setChecked(False)
+            self._cb_show_ref.blockSignals(False)
+        pv.ci_update(); self._update_ui()
+
+    def _on_show_ref(self, _):
+        pv = self._pv
+        if pv: pv._stepper.show_ref = self._cb_show_ref.isChecked(); pv.ci_update(); self._update_ui()
+
+    def _on_show_pose(self, _):
+        pv = self._pv
+        if pv: pv._stepper.show_pose = self._cb_show_pose.isChecked(); pv.ci_update(); self._update_ui()
+
+    # ── Pose data table ───────────────────────────────────────────────────────
+
+    def _rebuild_table(self):
+        pv = self._pv
+        if pv is None: return
+        tw = self._tw_pd
+        tw.setSortingEnabled(False); tw.clearContents(); tw.setRowCount(0)
+        all_props = pv._stepper.all_properties
+        if not all_props:
+            tw.setColumnCount(0); return
+        seen: dict = {}
+        for p in all_props:
+            for k in p:
+                if k not in seen: seen[k] = None
+        cols = list(seen.keys())
+        cols = (["_name"] if "_name" in cols else []) + [
+            c for c in cols if c != "_name" and "rank" not in c.lower()]
+        tw.setColumnCount(len(cols))
+        headers = ["Ligand_ID" if c == "_name" else c for c in cols]
+        tw.setHorizontalHeaderLabels(headers)
+        tw.setRowCount(len(all_props))
+        for r, props in enumerate(all_props):
+            for c, key in enumerate(cols):
+                val = props.get(key, "")
+                display = (f"{val:.2f}" if isinstance(val, float)
+                           else str(val) if val != "" else "")
+                item = self._SortItem(display)
+                item.setData(QtCore.Qt.UserRole, r)
+                if isinstance(val, (int, float)):
+                    item.setData(QtCore.Qt.UserRole + 1, val)
+                    item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                tw.setItem(r, c, item)
+        tw.resizeColumnsToContents(); tw.setSortingEnabled(True)
+        self._sel_order.clear(); self._highlight_current_row()
+
+    def _highlight_current_row(self):
+        pv = self._pv
+        if pv is None or pv._stepper._in_compare: return
+        cur = pv._stepper.current_index
+        tw = self._tw_pd
+        tw.blockSignals(True)
+        try:
+            self._sel_order.clear()
+            for r in range(tw.rowCount()):
+                item0 = tw.item(r, 0)
+                if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
+                    tw.selectRow(r); self._sel_order.append(r)
+                    tw.scrollToItem(item0, QtWidgets.QAbstractItemView.PositionAtCenter)
+                    return
+            tw.clearSelection()
+        finally:
+            tw.blockSignals(False)
+
+    def _on_selection_changed(self):
+        pv = self._pv
+        if pv is None or self._sel_busy[0]: return
+        selected = {idx.row() for idx in self._tw_pd.selectionModel().selectedRows()}
+        self._sel_order[:] = [r for r in self._sel_order if r in selected]
+        for r in sorted(selected):
+            if r not in self._sel_order: self._sel_order.append(r)
+        if len(self._sel_order) > 2:
+            oldest = self._sel_order.pop(0)
+            self._sel_busy[0] = True
+            try:
+                self._tw_pd.selectionModel().select(
+                    self._tw_pd.model().index(oldest, 0),
+                    QtCore.QItemSelectionModel.Deselect | QtCore.QItemSelectionModel.Rows)
+            finally:
+                self._sel_busy[0] = False
+        pose_indices = []
+        for r in self._sel_order:
+            item0 = self._tw_pd.item(r, 0)
+            if item0 is not None:
+                pi = item0.data(QtCore.Qt.UserRole)
+                if pi is not None: pose_indices.append(pi)
+        if len(pose_indices) == 2:
+            pv._stepper.show_comparison(pose_indices); self._update_ui()
+        elif len(pose_indices) == 1:
+            pv.ci_goto(pose_indices[0]); self._update_ui()
+
+    # ── Display toggles ───────────────────────────────────────────────────────
+
+    def _do_toggle_surf(self):
+        pv = self._pv
+        if pv is None: return
+        if pv._OBJ_SURF in pv._created_objects:
+            if self._g_disp_en.isChecked() and self._cb_surf.isChecked():
+                cmd.show("surface", pv._OBJ_SURF)
+            else:
+                cmd.hide("surface", pv._OBJ_SURF)
+
+    def _do_toggle_rlbl(self):
+        pv = self._pv
+        if pv is None: return
+        if pv._shell_sel is not None:
+            sel = f"({pv._shell_sel}) and name CA"
+            if self._g_disp_en.isChecked() and self._cb_rlbl.isChecked():
+                cmd.show("labels", sel)
+            else:
+                cmd.hide("labels", sel)
+
+    def _do_disp_group_tog(self):
+        pv = self._pv
+        if pv is None: return
+        checked = self._g_disp_en.isChecked()
+        pv._stepper.show_labels = checked and self._cb_lb.isChecked()
+        pv._stepper.show_lig_h  = checked and self._cb_lig_h.isChecked()
+        self._do_toggle_surf(); self._do_toggle_rlbl()
+        pv.ci_update(); self._update_ui()
+
+    def _on_cmp_hb(self, _):
+        pv = self._pv
+        if pv is None: return
+        pv._stepper.show_cmp_hbonds = self._cb_cmp_hb.isChecked()
+        if pv._stepper._in_compare:
+            pv._stepper.show_comparison(pv._stepper._cmp_indices)
+            self._update_ui()
+
+    # ── Status label ──────────────────────────────────────────────────────────
+
+    def _update_ui(self):
+        pv = self._pv
+        if pv is None: return
+        c = pv._stepper._count()
+        if c > 0:
+            if pv._stepper._in_compare:
+                self._lbl.setText(pv._stepper.compare_label())
+            else:
+                self._lbl.setText(f"{pv._stepper._label()}  "
+                                   f"({pv._stepper.current_index + 1}/{c})")
+            self._sp.setMaximum(c)
+            self._sp.setValue(pv._stepper.current_index + 1)
+        else:
+            self._lbl.setText("Ready — click Setup")
+        if self._g_pd.isChecked() and pv and not pv._stepper._in_compare:
+            self._highlight_current_row()
+
+    # ── Called from docking tab when a pose is loaded ─────────────────────────
+
+    def prime(self, protein_sel: str, ligand_sel: str):
+        """Pre-fill Setup fields with docking result selections."""
+        self._e_prot.setText(protein_sel)
+        self._e_lig.setText(ligand_sel)
+
+    def cleanup(self):
+        pass
+
+
+# ─── Tab 6: Interactive Design ────────────────────────────────────────────────
 
 class _HistEntry:
     __slots__ = ("iteration", "smiles", "scores", "sdf_path")
@@ -1532,31 +2393,37 @@ class SBDDDialog(QtWidgets.QDialog):
         self.setMinimumHeight(720)
         self.setSizeGripEnabled(True)
 
-        self._protprep = ProtprepPanel()
-        self._ligprep  = LigprepPanel()
-        self._docking  = DockingPanel()
-        self._design   = DesignPanel()
+        self._protprep    = ProtprepPanel()
+        self._fpocket     = FpocketPanel()
+        self._ligprep     = LigprepPanel()
+        self._docking     = DockingPanel()
+        self._poseviewer  = PoseViewerPanel()
+        self._design      = DesignPanel()
 
         self._tabs = QtWidgets.QTabWidget()
-        self._tabs.addTab(self._protprep, "1 · Protein Prep")
-        self._tabs.addTab(self._ligprep,  "2 · Ligand Prep")
-        self._tabs.addTab(self._docking,  "3 · Docking")
-        self._tabs.addTab(self._design,   "4 · Design")
+        self._tabs.addTab(self._protprep,   "1 · Protein Prep")
+        self._tabs.addTab(self._fpocket,    "2 · Pockets")
+        self._tabs.addTab(self._ligprep,    "3 · Ligand Prep")
+        self._tabs.addTab(self._docking,    "4 · Docking")
+        self._tabs.addTab(self._poseviewer, "5 · Pose Viewer")
+        self._tabs.addTab(self._design,     "6 · Design")
 
         # After ligprep loads objects, refresh the docking ligand list
         self._ligprep.objects_loaded.connect(lambda _: self._docking.refresh())
-        # Loading a docked pose auto-selects it in the Design tab
+        # Loading a docked pose primes Pose Viewer and switches to Design
         self._docking.pose_loaded.connect(self._on_pose_loaded)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._tabs)
 
     def _on_pose_loaded(self, name: str):
+        self._poseviewer.prime("polymer.protein", name)
         self._design.refresh(preselect=name)
         self._tabs.setCurrentWidget(self._design)
 
     def closeEvent(self, event):
-        for panel in (self._protprep, self._ligprep, self._docking, self._design):
+        for panel in (self._protprep, self._fpocket, self._ligprep,
+                      self._docking, self._poseviewer, self._design):
             panel.cleanup()
         super().closeEvent(event)
 
@@ -1568,8 +2435,13 @@ _dialog: Optional[SBDDDialog] = None
 
 def run_plugin_gui():
     global _dialog
-    if _dialog is None or not _dialog.isVisible():
-        _dialog = SBDDDialog()
+    if _dialog is not None:
+        try:
+            _dialog.close()
+        except RuntimeError:
+            pass
+        _dialog = None
+    _dialog = SBDDDialog()
     _dialog.show()
     _dialog.raise_()
     _dialog.activateWindow()
