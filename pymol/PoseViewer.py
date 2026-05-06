@@ -2000,11 +2000,14 @@ def _open_gui():
         sc.activated.connect(fn)
 
     # Detect external PyMOL state/object changes (built-in slider / play buttons /
-    # ci_next from CLI / clicking enable on a different object in the panel).
+    # ci_next from CLI / clicking enable on a different object in the panel /
+    # objects added or deleted from the session).
     # IMPORTANT: timer must be stored on `win` (not as a local variable) so that
     # neither the QTimer C++ object nor its Python wrapper are garbage-collected
     # when _open_gui() returns.  Passing `win` as parent also lets Qt stop and
     # destroy the timer automatically when the window is closed.
+    win._known_pymol_objs = set(cmd.get_names("objects"))
+
     def _sync_if_external_change():
         if _stepper._in_compare or not _stepper.poses:
             return
@@ -2012,6 +2015,59 @@ def _open_gui():
             pymol_st = cmd.get_state()
         except Exception:
             return
+
+        # --- Object list change detection (cheap set diff; atom-counting only on change) ---
+        try:
+            current_objs = set(cmd.get_names("objects"))
+        except Exception:
+            current_objs = win._known_pymol_objs
+        if current_objs != win._known_pymol_objs:
+            removed = win._known_pymol_objs - current_objs
+            added   = current_objs - win._known_pymol_objs
+            win._known_pymol_objs = current_objs
+
+            if _stepper.mode == "objects":
+                pose_objs = {o for o, _ in _stepper.poses}
+                deleted = pose_objs & removed
+                if deleted:
+                    _stepper.poses = [(o, s) for o, s in _stepper.poses if o not in deleted]
+                    if not _stepper.poses:
+                        update_ui()
+                        return
+                    _stepper.current_index = min(_stepper.current_index, len(_stepper.poses) - 1)
+                    _stepper._build_obj_colors()
+                    _stepper._prefetch_all_properties()
+                    _stepper._show_current()
+                    update_ui()
+                    rebuild_table()
+                    return
+
+                new_ligs = []
+                for n in sorted(added):
+                    if n in _created_objects:
+                        continue
+                    try:
+                        if (cmd.count_atoms(f"{n} and organic") > 0 and
+                                cmd.count_atoms(
+                                    f"{n} and ({_stepper.protein_sel or 'polymer.protein'})") == 0):
+                            new_ligs.append(n)
+                    except Exception:
+                        pass
+                if new_ligs:
+                    for n in new_ligs:
+                        for st in range(1, max(1, cmd.count_states(n)) + 1):
+                            _stepper.poses.append((n, st))
+                    _stepper._build_obj_colors()
+                    _stepper._prefetch_all_properties()
+                    update_ui()
+                    rebuild_table()
+
+            elif _stepper.mode == "states":
+                if _stepper.state_object in removed:
+                    _stepper.poses = []
+                    update_ui()
+                    return
+
         cur_obj, cur_st = _stepper.poses[_stepper.current_index]
 
         if _stepper.mode == "objects":
