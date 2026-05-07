@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 import time
 from io import StringIO
@@ -23,6 +24,56 @@ try:
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
+
+try:
+    from rich_argparse import RawDescriptionRichHelpFormatter as HelpFormatter
+except ImportError:
+    HelpFormatter = argparse.RawDescriptionHelpFormatter
+
+
+_CAS_RE = re.compile(r"^\d{2,7}-\d{2}-\d$")
+
+
+def _fetch_preferred_name(cid: int, delay: float) -> str:
+    """Return the PubChem Title (preferred name) for a CID, or "" on failure."""
+    try:
+        url = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid"
+            f"/{cid}/property/Title/JSON"
+        )
+        resp = requests.get(url, timeout=15)
+        time.sleep(delay)
+        if resp.status_code == 200:
+            props = resp.json().get("PropertyTable", {}).get("Properties", [])
+            if props:
+                return props[0].get("Title", "")
+    except Exception:
+        pass
+    return ""
+
+
+def _fetch_cas(cid: int, delay: float) -> str:
+    """Return the first CAS registry number from PubChem synonyms, or "" on failure."""
+    try:
+        url = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid"
+            f"/{cid}/synonyms/JSON"
+        )
+        resp = requests.get(url, timeout=15)
+        time.sleep(delay)
+        if resp.status_code == 200:
+            synonyms = (
+                resp.json()
+                .get("InformationList", {})
+                .get("Information", [{}])[0]
+                .get("Synonym", [])
+            )
+            for syn in synonyms:
+                if _CAS_RE.match(str(syn)):
+                    return str(syn)
+    except Exception:
+        pass
+    return ""
 
 
 def _regularized_tpi(active: int, tested: int, prior_n: int = 100) -> float:
@@ -59,9 +110,13 @@ def _cid_url_smiles(smiles: str) -> tuple[str, str]:
     return url, ""
 
 
-def query_compound(identifier: str, id_type: str, delay: float, prior_n: int = 100) -> dict:
-    result = {
-        "PubChem_CID": "None",
+def query_compound(identifier: str, id_type: str, delay: float, prior_n: int = 100, fetch_name: bool = False, fetch_cas: bool = False) -> dict:
+    result = {"PubChem_CID": "None"}
+    if fetch_name:
+        result["PubChem_PreferredName"] = ""
+    if fetch_cas:
+        result["PubChem_CAS"] = ""
+    result.update({
         "Total_Assays": np.nan,
         "Active_Assays": np.nan,
         "Unique_Targets_Tested": np.nan,
@@ -70,7 +125,7 @@ def query_compound(identifier: str, id_type: str, delay: float, prior_n: int = 1
         "List_Targets_Tested": "",
         "List_Targets_Active": "",
         "PubChem_Status": "",
-    }
+    })
 
     if id_type == "inchikey":
         cid_url, invalid_msg = _cid_url_inchikey(identifier)
@@ -90,6 +145,13 @@ def query_compound(identifier: str, id_type: str, delay: float, prior_n: int = 1
 
         cid = cid_resp.json()["IdentifierList"]["CID"][0]
         result["PubChem_CID"] = str(cid)
+
+        if fetch_name or fetch_cas:
+            time.sleep(delay)
+            if fetch_name:
+                result["PubChem_PreferredName"] = _fetch_preferred_name(cid, delay)
+            if fetch_cas:
+                result["PubChem_CAS"] = _fetch_cas(cid, delay)
 
         activity_url = (
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid"
@@ -168,7 +230,8 @@ def query_compound(identifier: str, id_type: str, delay: float, prior_n: int = 1
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Assess compound promiscuity using PubChem bioassay data."
+        description="Assess compound promiscuity using PubChem bioassay data.",
+        formatter_class=HelpFormatter,
     )
     parser.add_argument("input", help="Input CSV file")
     parser.add_argument("-o", "--output", required=True, help="Output CSV file")
@@ -212,6 +275,18 @@ def main():
         "--failed-output",
         default=None,
         help="CSV for rows that errored (network failures etc.); auto-derived from --output if omitted",
+    )
+    parser.add_argument(
+        "--name",
+        action="store_true",
+        default=False,
+        help="Also fetch the preferred name (PubChem Title) for each compound",
+    )
+    parser.add_argument(
+        "--cas",
+        action="store_true",
+        default=False,
+        help="Also fetch the CAS registry number for each compound",
     )
     args = parser.parse_args()
 
@@ -277,7 +352,7 @@ def main():
             iterator = identifiers
 
         for i, identifier in enumerate(iterator):
-            result = query_compound(identifier, id_type, args.delay, args.prior_n)
+            result = query_compound(identifier, id_type, args.delay, args.prior_n, fetch_name=args.name, fetch_cas=args.cas)
             rows.append(result)
             if not HAS_TQDM and (i + 1) % 10 == 0:
                 print(f"  {i + 1}/{len(identifiers)} done")
