@@ -1649,6 +1649,259 @@ def _import_poseviewer():
     return importlib.import_module(name)
 
 
+class _InteractionView(QtWidgets.QWidget):
+    """Reusable interaction-toggle panel, shared by PoseViewerPanel and DesignPanel."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pv = None
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setSpacing(5); root.setContentsMargins(0, 0, 0, 0)
+
+        # Reference ligand
+        g_ref = QtWidgets.QGroupBox("Reference ligand")
+        l_ref = QtWidgets.QHBoxLayout(g_ref)
+        l_ref.addWidget(QtWidgets.QLabel("Object:"))
+        self._ref_combo = QtWidgets.QComboBox(); self._ref_combo.addItem("(none)")
+        self._ref_combo.setMinimumWidth(100)
+        l_ref.addWidget(self._ref_combo, 1)
+        self._cb_show_ref  = QtWidgets.QCheckBox("Show ref");  self._cb_show_ref.setChecked(True)
+        self._cb_show_pose = QtWidgets.QCheckBox("Show pose"); self._cb_show_pose.setChecked(True)
+        l_ref.addWidget(self._cb_show_ref); l_ref.addWidget(self._cb_show_pose)
+        self._ref_combo.currentTextChanged.connect(self._on_ref_changed)
+        self._cb_show_ref.stateChanged.connect(self._on_show_ref)
+        self._cb_show_pose.stateChanged.connect(self._on_show_pose)
+        root.addWidget(g_ref)
+
+        def _cb(lay, text, hex_color, checked=True):
+            row = QtWidgets.QHBoxLayout()
+            sw = QtWidgets.QLabel(); sw.setFixedSize(14, 14)
+            sw.setStyleSheet(f"background-color: {hex_color}; border: none;")
+            row.addWidget(sw)
+            cb = QtWidgets.QCheckBox(text); cb.setChecked(checked)
+            row.addWidget(cb); row.addStretch()
+            lay.addLayout(row)
+            return cb
+
+        def _section(title, enabled=True, expanded=False, show_enable=True):
+            g = QtWidgets.QGroupBox()
+            gl = QtWidgets.QVBoxLayout(g)
+            gl.setContentsMargins(6, 4, 6, 6); gl.setSpacing(2)
+            hl = QtWidgets.QHBoxLayout()
+            if show_enable:
+                en = QtWidgets.QCheckBox(title); en.setChecked(enabled)
+                _f = en.font(); _f.setBold(True); en.setFont(_f)
+                hl.addWidget(en)
+            else:
+                lbl = QtWidgets.QLabel(title)
+                _f = lbl.font(); _f.setBold(True); lbl.setFont(_f)
+                hl.addWidget(lbl); en = None
+            hl.addStretch()
+            btn_col = QtWidgets.QToolButton()
+            btn_col.setCheckable(True); btn_col.setChecked(expanded)
+            btn_col.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+            btn_col.setAutoRaise(True)
+            hl.addWidget(btn_col)
+            gl.addLayout(hl)
+            body = QtWidgets.QWidget()
+            bl = QtWidgets.QVBoxLayout(body)
+            bl.setContentsMargins(0, 2, 0, 0); bl.setSpacing(2)
+            body.setVisible(expanded)
+            gl.addWidget(body)
+            def _toggle(checked):
+                body.setVisible(checked)
+                btn_col.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
+            btn_col.toggled.connect(_toggle)
+            return g, en, body, bl
+
+        g1, g1_en, _g1b, l1 = _section("Non-covalent bonds", enabled=True)
+        cb_hb = _cb(l1, "Hydrogen bonds",  "#ffd900")
+        cb_xb = _cb(l1, "Halogen bonds",   "#9933e6")
+        cb_sb = _cb(l1, "Salt bridges",    "#e633e6")
+        cb_ah = _cb(l1, "Aromatic H-Bond", "#4dd97f")
+        root.addWidget(g1)
+
+        g2, g2_en, _g2b, l2 = _section("Pi interactions", enabled=True)
+        cb_pp = _cb(l2, "Pi-pi stacking", "#4dc0ff")
+        cb_pc = _cb(l2, "Pi-cation",      "#33cc33")
+        root.addWidget(g2)
+
+        g3, g3_en, _g3b, l3 = _section("Contacts / Clashes", enabled=False)
+        cb_cg  = _cb(l3, "Good", "#33cc33")
+        cb_cb_ = _cb(l3, "Bad",  "#ff9900")
+        cb_cu  = _cb(l3, "Ugly", "#ff2626")
+        root.addWidget(g3)
+
+        g_disp, g_disp_en, _gdb, l_disp = _section("Display", enabled=True, show_enable=True)
+        self._cb_lb    = QtWidgets.QCheckBox("Show distance labels"); self._cb_lb.setChecked(True)
+        self._cb_surf  = QtWidgets.QCheckBox("Show surface");         self._cb_surf.setChecked(True)
+        self._cb_rlbl  = QtWidgets.QCheckBox("Show residue labels");  self._cb_rlbl.setChecked(True)
+        self._cb_zoom  = QtWidgets.QCheckBox("Auto-zoom to pose");    self._cb_zoom.setChecked(True)
+        self._cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); self._cb_lig_h.setChecked(False)
+        for _w in (self._cb_lb, self._cb_surf, self._cb_rlbl, self._cb_zoom, self._cb_lig_h):
+            l_disp.addWidget(_w)
+        root.addWidget(g_disp)
+        root.addStretch()
+
+        self._g1_en = g1_en; self._g2_en = g2_en; self._g3_en = g3_en
+        self._g_disp_en = g_disp_en
+        self._cb_hb = cb_hb; self._cb_xb = cb_xb; self._cb_sb = cb_sb; self._cb_ah = cb_ah
+        self._cb_pp = cb_pp; self._cb_pc = cb_pc
+        self._cb_cg = cb_cg; self._cb_cb_ = cb_cb_; self._cb_cu = cb_cu
+
+        def _defer(cb, attr, g_en):
+            cb.stateChanged.connect(lambda _: self._tog(attr, g_en))
+        _defer(cb_hb, "show_hbonds",      g1_en); _defer(cb_xb, "show_halogen",   g1_en)
+        _defer(cb_sb, "show_salt",        g1_en); _defer(cb_ah, "show_arom_hb",   g1_en)
+        _defer(cb_pp, "show_pipi",        g2_en); _defer(cb_pc, "show_pi_cation", g2_en)
+        _defer(cb_cg, "show_clash_good",  g3_en); _defer(cb_cb_, "show_clash_bad", g3_en)
+        _defer(cb_cu, "show_clash_ugly",  g3_en)
+
+        def _grp_defer(g_en, pairs):
+            g_en.stateChanged.connect(lambda _: self._group_tog(g_en, pairs))
+        _grp_defer(g1_en, [(cb_hb,"show_hbonds"),(cb_xb,"show_halogen"),
+                            (cb_sb,"show_salt"),  (cb_ah,"show_arom_hb")])
+        _grp_defer(g2_en, [(cb_pp,"show_pipi"),(cb_pc,"show_pi_cation")])
+        _grp_defer(g3_en, [(cb_cg,"show_clash_good"),(cb_cb_,"show_clash_bad"),
+                            (cb_cu,"show_clash_ugly")])
+
+        self._cb_zoom.stateChanged.connect( lambda _: self._set_attr("auto_zoom", self._cb_zoom.isChecked()))
+        self._cb_lb.stateChanged.connect(   lambda _: self._set_attr_disp("show_labels", g_disp_en, self._cb_lb))
+        self._cb_lig_h.stateChanged.connect(lambda _: self._set_attr_disp("show_lig_h",  g_disp_en, self._cb_lig_h))
+        self._cb_surf.stateChanged.connect( lambda _: self._do_toggle_surf())
+        self._cb_rlbl.stateChanged.connect( lambda _: self._do_toggle_rlbl())
+        g_disp_en.stateChanged.connect(     lambda _: self._do_disp_group_tog())
+
+    # ── Bind / unbind ──────────────────────────────────────────────────────────
+
+    def bind(self, pv_module):
+        """Attach to a loaded PoseViewer module after ci_setup has been called."""
+        self._pv = pv_module
+        self._ref_combo.blockSignals(True)
+        self._ref_combo.clear(); self._ref_combo.addItem("(none)")
+        self._ref_combo.blockSignals(False)
+        if pv_module is not None:
+            self._populate_ref_combo()
+
+    # ── Reference ligand ──────────────────────────────────────────────────────
+
+    def _populate_ref_combo(self):
+        pv = self._pv
+        if pv is None: return
+        prev = self._ref_combo.currentText()
+        self._ref_combo.blockSignals(True)
+        self._ref_combo.clear(); self._ref_combo.addItem("(none)")
+        for n in cmd.get_names("objects"):
+            if n.startswith("_ci_") or n in (
+                    pv._OBJ_PTS, pv._OBJ_REF_PTS, pv._OBJ_SURF):
+                continue
+            try:
+                if (cmd.count_atoms(f"{n} and organic") > 0 and
+                        cmd.count_atoms(f"{n} and ({pv._stepper.protein_sel or 'polymer.protein'})") == 0):
+                    self._ref_combo.addItem(n)
+            except Exception:
+                pass
+        target = pv._stepper.ref_ligand or prev
+        idx = self._ref_combo.findText(target) if target else -1
+        self._ref_combo.setCurrentIndex(max(idx, 0))
+        self._ref_combo.blockSignals(False)
+
+    def _on_ref_changed(self, text):
+        pv = self._pv
+        if pv is None: return
+        prev = pv._stepper.ref_ligand
+        pv._stepper.ref_ligand = None if text == "(none)" else text
+        if pv._stepper.ref_ligand:
+            pv._color_ref_ligand(pv._stepper.ref_ligand)
+            pv._stepper.show_ref = True
+            self._cb_show_ref.blockSignals(True); self._cb_show_ref.setChecked(True)
+            self._cb_show_ref.blockSignals(False)
+        else:
+            if prev:
+                try: cmd.disable(prev)
+                except Exception: pass
+            if pv._OBJ_REF_PTS in pv._created_objects:
+                try:
+                    cmd.delete(pv._OBJ_REF_PTS)
+                    pv._created_objects.discard(pv._OBJ_REF_PTS)
+                except Exception: pass
+            pv._stepper.show_ref = False
+            self._cb_show_ref.blockSignals(True); self._cb_show_ref.setChecked(False)
+            self._cb_show_ref.blockSignals(False)
+        pv.ci_update()
+
+    def _on_show_ref(self, _):
+        pv = self._pv
+        if pv: pv._stepper.show_ref = self._cb_show_ref.isChecked(); pv.ci_update()
+
+    def _on_show_pose(self, _):
+        pv = self._pv
+        if pv: pv._stepper.show_pose = self._cb_show_pose.isChecked(); pv.ci_update()
+
+    # ── Interaction toggles ───────────────────────────────────────────────────
+
+    def _set_attr(self, attr, val):
+        pv = self._pv
+        if pv is not None:
+            setattr(pv._stepper, attr, val)
+            pv.ci_update()
+
+    def _set_attr_disp(self, attr, g_en, cb):
+        pv = self._pv
+        if pv is not None:
+            setattr(pv._stepper, attr, g_en.isChecked() and cb.isChecked())
+            pv.ci_update()
+
+    def _tog(self, attr, g_en):
+        pv = self._pv
+        if pv is None: return
+        cb = getattr(self, f"_cb_{attr.replace('show_','')}", None)
+        val = g_en.isChecked() and (cb.isChecked() if cb else True)
+        setattr(pv._stepper, attr, val)
+        pv.ci_update()
+
+    def _group_tog(self, g_en, pairs):
+        pv = self._pv
+        if pv is None: return
+        checked = g_en.isChecked()
+        for cb, attr in pairs:
+            setattr(pv._stepper, attr, checked and cb.isChecked())
+        pv.ci_update()
+
+    # ── Display toggles ───────────────────────────────────────────────────────
+
+    def _do_toggle_surf(self):
+        pv = self._pv
+        if pv is None: return
+        if pv._OBJ_SURF in pv._created_objects:
+            if self._g_disp_en.isChecked() and self._cb_surf.isChecked():
+                cmd.show("surface", pv._OBJ_SURF)
+            else:
+                cmd.hide("surface", pv._OBJ_SURF)
+
+    def _do_toggle_rlbl(self):
+        pv = self._pv
+        if pv is None: return
+        if pv._shell_sel is not None:
+            sel = f"({pv._shell_sel}) and name CA"
+            if self._g_disp_en.isChecked() and self._cb_rlbl.isChecked():
+                cmd.show("labels", sel)
+            else:
+                cmd.hide("labels", sel)
+
+    def _do_disp_group_tog(self):
+        pv = self._pv
+        if pv is None: return
+        checked = self._g_disp_en.isChecked()
+        pv._stepper.show_labels = checked and self._cb_lb.isChecked()
+        pv._stepper.show_lig_h  = checked and self._cb_lig_h.isChecked()
+        self._do_toggle_surf(); self._do_toggle_rlbl()
+        pv.ci_update()
+
+
 class PoseViewerPanel(QtWidgets.QWidget):
     """Embedding of PoseViewer interaction viewer as a Pynacea tab."""
 
@@ -1753,22 +2006,6 @@ class PoseViewerPanel(QtWidgets.QWidget):
         l_n.addWidget(self._cb_cmp_hb)
         top_l.addWidget(g_n)
 
-        # Reference ligand
-        g_ref = QtWidgets.QGroupBox("Reference ligand")
-        l_ref = QtWidgets.QHBoxLayout(g_ref)
-        l_ref.addWidget(QtWidgets.QLabel("Object:"))
-        self._ref_combo = QtWidgets.QComboBox(); self._ref_combo.addItem("(none)")
-        self._ref_combo.setMinimumWidth(100)
-        l_ref.addWidget(self._ref_combo, 1)
-        self._cb_show_ref  = QtWidgets.QCheckBox("Show ref");  self._cb_show_ref.setChecked(True)
-        self._cb_show_pose = QtWidgets.QCheckBox("Show pose"); self._cb_show_pose.setChecked(True)
-        l_ref.addWidget(self._cb_show_ref)
-        l_ref.addWidget(self._cb_show_pose)
-        self._ref_combo.currentTextChanged.connect(self._on_ref_changed)
-        self._cb_show_ref.stateChanged.connect(self._on_show_ref)
-        self._cb_show_pose.stateChanged.connect(self._on_show_pose)
-        top_l.addWidget(g_ref)
-
         # Pose Data table
         g_pd = QtWidgets.QGroupBox("Pose Data")
         g_pd.setCheckable(True); g_pd.setChecked(True)
@@ -1798,108 +2035,10 @@ class PoseViewerPanel(QtWidgets.QWidget):
         top_l.addWidget(g_pd, 1)
         self._g_pd = g_pd
 
-        # Interaction controls
-        def _cb(lay, text, hex_color, checked=True):
-            row = QtWidgets.QHBoxLayout()
-            sw = QtWidgets.QLabel(); sw.setFixedSize(14, 14)
-            sw.setStyleSheet(f"background-color: {hex_color}; border: none;")
-            row.addWidget(sw)
-            cb = QtWidgets.QCheckBox(text); cb.setChecked(checked)
-            row.addWidget(cb); row.addStretch()
-            lay.addLayout(row)
-            return cb
-
-        def _section(title, enabled=True, expanded=False, show_enable=True):
-            g = QtWidgets.QGroupBox()
-            gl = QtWidgets.QVBoxLayout(g)
-            gl.setContentsMargins(6, 4, 6, 6); gl.setSpacing(2)
-            hl = QtWidgets.QHBoxLayout()
-            if show_enable:
-                en = QtWidgets.QCheckBox(title); en.setChecked(enabled)
-                _f = en.font(); _f.setBold(True); en.setFont(_f)
-                hl.addWidget(en)
-            else:
-                lbl = QtWidgets.QLabel(title)
-                _f = lbl.font(); _f.setBold(True); lbl.setFont(_f)
-                hl.addWidget(lbl); en = None
-            hl.addStretch()
-            btn_col = QtWidgets.QToolButton()
-            btn_col.setCheckable(True); btn_col.setChecked(expanded)
-            btn_col.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
-            btn_col.setAutoRaise(True)
-            hl.addWidget(btn_col)
-            gl.addLayout(hl)
-            body = QtWidgets.QWidget()
-            bl = QtWidgets.QVBoxLayout(body)
-            bl.setContentsMargins(0, 2, 0, 0); bl.setSpacing(2)
-            body.setVisible(expanded)
-            gl.addWidget(body)
-            def _toggle(checked):
-                body.setVisible(checked)
-                btn_col.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
-            btn_col.toggled.connect(_toggle)
-            return g, en, body, bl
-
-        g1, g1_en, _g1b, l1 = _section("Non-covalent bonds", enabled=True)
-        cb_hb = _cb(l1, "Hydrogen bonds",  "#ffd900")
-        cb_xb = _cb(l1, "Halogen bonds",   "#9933e6")
-        cb_sb = _cb(l1, "Salt bridges",    "#e633e6")
-        cb_ah = _cb(l1, "Aromatic H-Bond", "#4dd97f")
-        bot_l.addWidget(g1)
-
-        g2, g2_en, _g2b, l2 = _section("Pi interactions", enabled=True)
-        cb_pp = _cb(l2, "Pi-pi stacking", "#4dc0ff")
-        cb_pc = _cb(l2, "Pi-cation",      "#33cc33")
-        bot_l.addWidget(g2)
-
-        g3, g3_en, _g3b, l3 = _section("Contacts / Clashes", enabled=False)
-        cb_cg = _cb(l3, "Good",  "#33cc33")
-        cb_cb_ = _cb(l3, "Bad",  "#ff9900")
-        cb_cu = _cb(l3, "Ugly",  "#ff2626")
-        bot_l.addWidget(g3)
-
-        g_disp, g_disp_en, _gdb, l_disp = _section("Display", enabled=True, show_enable=True)
-        self._cb_lb   = QtWidgets.QCheckBox("Show distance labels"); self._cb_lb.setChecked(True)
-        self._cb_surf = QtWidgets.QCheckBox("Show surface");         self._cb_surf.setChecked(True)
-        self._cb_rlbl = QtWidgets.QCheckBox("Show residue labels");  self._cb_rlbl.setChecked(True)
-        self._cb_zoom = QtWidgets.QCheckBox("Auto-zoom to pose");    self._cb_zoom.setChecked(True)
-        self._cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); self._cb_lig_h.setChecked(False)
-        for _w in (self._cb_lb, self._cb_surf, self._cb_rlbl, self._cb_zoom, self._cb_lig_h):
-            l_disp.addWidget(_w)
-        bot_l.addWidget(g_disp)
-        bot_l.addStretch()
+        self._iv = _InteractionView()
+        bot_l.addWidget(self._iv)
 
         splitter.setSizes([460, 200])
-
-        # Wire interaction toggles — deferred until _pv is loaded
-        self._g1_en = g1_en; self._g2_en = g2_en; self._g3_en = g3_en
-        self._g_disp_en = g_disp_en
-        self._cb_hb = cb_hb; self._cb_xb = cb_xb; self._cb_sb = cb_sb; self._cb_ah = cb_ah
-        self._cb_pp = cb_pp; self._cb_pc = cb_pc
-        self._cb_cg = cb_cg; self._cb_cb_ = cb_cb_; self._cb_cu = cb_cu
-
-        def _defer(cb, attr, g_en):
-            cb.stateChanged.connect(lambda _: self._tog(attr, g_en))
-        _defer(cb_hb, "show_hbonds",     g1_en); _defer(cb_xb, "show_halogen",  g1_en)
-        _defer(cb_sb, "show_salt",       g1_en); _defer(cb_ah, "show_arom_hb",  g1_en)
-        _defer(cb_pp, "show_pipi",       g2_en); _defer(cb_pc, "show_pi_cation", g2_en)
-        _defer(cb_cg, "show_clash_good", g3_en); _defer(cb_cb_, "show_clash_bad", g3_en)
-        _defer(cb_cu, "show_clash_ugly", g3_en)
-
-        def _grp_defer(g_en, pairs):
-            g_en.stateChanged.connect(lambda _: self._group_tog(g_en, pairs))
-        _grp_defer(g1_en, [(cb_hb,"show_hbonds"),(cb_xb,"show_halogen"),
-                            (cb_sb,"show_salt"),  (cb_ah,"show_arom_hb")])
-        _grp_defer(g2_en, [(cb_pp,"show_pipi"),(cb_pc,"show_pi_cation")])
-        _grp_defer(g3_en, [(cb_cg,"show_clash_good"),(cb_cb_,"show_clash_bad"),
-                            (cb_cu,"show_clash_ugly")])
-
-        self._cb_zoom.stateChanged.connect(lambda _: self._set_attr("auto_zoom", self._cb_zoom.isChecked()))
-        self._cb_lb.stateChanged.connect(  lambda _: self._set_attr_disp("show_labels", g_disp_en, self._cb_lb))
-        self._cb_lig_h.stateChanged.connect(lambda _: self._set_attr_disp("show_lig_h", g_disp_en, self._cb_lig_h))
-        self._cb_surf.stateChanged.connect(lambda _: self._do_toggle_surf())
-        self._cb_rlbl.stateChanged.connect(lambda _: self._do_toggle_rlbl())
-        g_disp_en.stateChanged.connect(lambda _: self._do_disp_group_tog())
 
     # ── PoseViewer module access ───────────────────────────────────────────────
 
@@ -1912,34 +2051,6 @@ class PoseViewerPanel(QtWidgets.QWidget):
                     self, "Pynacea", f"Could not load PoseViewer:\n{e}")
                 return None
         return self._pv
-
-    def _set_attr(self, attr, val):
-        pv = self._pv
-        if pv is not None:
-            setattr(pv._stepper, attr, val)
-            pv.ci_update(); self._update_ui()
-
-    def _set_attr_disp(self, attr, g_en, cb):
-        pv = self._pv
-        if pv is not None:
-            setattr(pv._stepper, attr, g_en.isChecked() and cb.isChecked())
-            pv.ci_update(); self._update_ui()
-
-    def _tog(self, attr, g_en):
-        pv = self._pv
-        if pv is None: return
-        cb = getattr(self, f"_cb_{attr.replace('show_','')}", None)
-        val = g_en.isChecked() and (cb.isChecked() if cb else True)
-        setattr(pv._stepper, attr, val)
-        pv.ci_update(); self._update_ui()
-
-    def _group_tog(self, g_en, pairs):
-        pv = self._pv
-        if pv is None: return
-        checked = g_en.isChecked()
-        for cb, attr in pairs:
-            setattr(pv._stepper, attr, checked and cb.isChecked())
-        pv.ci_update(); self._update_ui()
 
     # ── Setup / navigation ────────────────────────────────────────────────────
 
@@ -1959,7 +2070,7 @@ class PoseViewerPanel(QtWidgets.QWidget):
         else:
             pv._stepper.sdf_records = []
         pv.ci_setup(protein=self._e_prot.text(), ligands=self._e_lig.text(), mode=mode)
-        self._populate_ref_combo()
+        self._iv.bind(pv)
         self._update_ui()
         self._rebuild_table()
 
@@ -1970,10 +2081,8 @@ class PoseViewerPanel(QtWidgets.QWidget):
         pv._stepper.sdf_records = []
         pv._stepper.all_properties = []
         pv._stepper.ref_ligand = None
+        self._iv.bind(None)
         self._sel_order.clear()
-        self._ref_combo.blockSignals(True)
-        self._ref_combo.clear(); self._ref_combo.addItem("(none)")
-        self._ref_combo.blockSignals(False)
         self._lbl.setText("Ready — click Setup")
         self._tw_pd.setSortingEnabled(False)
         self._tw_pd.clearContents()
@@ -2009,61 +2118,6 @@ class PoseViewerPanel(QtWidgets.QWidget):
             if pi is not None:
                 pv.ci_goto(pi)
         self._update_ui()
-
-    # ── Reference ligand ──────────────────────────────────────────────────────
-
-    def _populate_ref_combo(self):
-        pv = self._pv
-        if pv is None: return
-        prev = self._ref_combo.currentText()
-        self._ref_combo.blockSignals(True)
-        self._ref_combo.clear(); self._ref_combo.addItem("(none)")
-        for n in cmd.get_names("objects"):
-            if n.startswith("_ci_") or n in (
-                    pv._OBJ_PTS, pv._OBJ_REF_PTS, pv._OBJ_SURF):
-                continue
-            try:
-                if (cmd.count_atoms(f"{n} and organic") > 0 and
-                        cmd.count_atoms(f"{n} and ({pv._stepper.protein_sel or 'polymer.protein'})") == 0):
-                    self._ref_combo.addItem(n)
-            except Exception:
-                pass
-        target = pv._stepper.ref_ligand or prev
-        idx = self._ref_combo.findText(target) if target else -1
-        self._ref_combo.setCurrentIndex(max(idx, 0))
-        self._ref_combo.blockSignals(False)
-
-    def _on_ref_changed(self, text):
-        pv = self._pv
-        if pv is None: return
-        prev = pv._stepper.ref_ligand
-        pv._stepper.ref_ligand = None if text == "(none)" else text
-        if pv._stepper.ref_ligand:
-            pv._color_ref_ligand(pv._stepper.ref_ligand)
-            pv._stepper.show_ref = True
-            self._cb_show_ref.blockSignals(True); self._cb_show_ref.setChecked(True)
-            self._cb_show_ref.blockSignals(False)
-        else:
-            if prev:
-                try: cmd.disable(prev)
-                except Exception: pass
-            if pv._OBJ_REF_PTS in pv._created_objects:
-                try:
-                    cmd.delete(pv._OBJ_REF_PTS)
-                    pv._created_objects.discard(pv._OBJ_REF_PTS)
-                except Exception: pass
-            pv._stepper.show_ref = False
-            self._cb_show_ref.blockSignals(True); self._cb_show_ref.setChecked(False)
-            self._cb_show_ref.blockSignals(False)
-        pv.ci_update(); self._update_ui()
-
-    def _on_show_ref(self, _):
-        pv = self._pv
-        if pv: pv._stepper.show_ref = self._cb_show_ref.isChecked(); pv.ci_update(); self._update_ui()
-
-    def _on_show_pose(self, _):
-        pv = self._pv
-        if pv: pv._stepper.show_pose = self._cb_show_pose.isChecked(); pv.ci_update(); self._update_ui()
 
     # ── Pose data table ───────────────────────────────────────────────────────
 
@@ -2144,36 +2198,6 @@ class PoseViewerPanel(QtWidgets.QWidget):
             pv._stepper.show_comparison(pose_indices); self._update_ui()
         elif len(pose_indices) == 1:
             pv.ci_goto(pose_indices[0]); self._update_ui()
-
-    # ── Display toggles ───────────────────────────────────────────────────────
-
-    def _do_toggle_surf(self):
-        pv = self._pv
-        if pv is None: return
-        if pv._OBJ_SURF in pv._created_objects:
-            if self._g_disp_en.isChecked() and self._cb_surf.isChecked():
-                cmd.show("surface", pv._OBJ_SURF)
-            else:
-                cmd.hide("surface", pv._OBJ_SURF)
-
-    def _do_toggle_rlbl(self):
-        pv = self._pv
-        if pv is None: return
-        if pv._shell_sel is not None:
-            sel = f"({pv._shell_sel}) and name CA"
-            if self._g_disp_en.isChecked() and self._cb_rlbl.isChecked():
-                cmd.show("labels", sel)
-            else:
-                cmd.hide("labels", sel)
-
-    def _do_disp_group_tog(self):
-        pv = self._pv
-        if pv is None: return
-        checked = self._g_disp_en.isChecked()
-        pv._stepper.show_labels = checked and self._cb_lb.isChecked()
-        pv._stepper.show_lig_h  = checked and self._cb_lig_h.isChecked()
-        self._do_toggle_surf(); self._do_toggle_rlbl()
-        pv.ci_update(); self._update_ui()
 
     def _on_cmp_hb(self, _):
         pv = self._pv
@@ -2271,6 +2295,11 @@ class DesignPanel(QtWidgets.QWidget):
                         self.exhaus_sp.setVisible(not on))
         )
 
+        self._prep_ph_sp = QtWidgets.QDoubleSpinBox()
+        self._prep_ph_sp.setRange(0, 14); self._prep_ph_sp.setValue(7.4)
+        self._prep_ph_sp.setSingleStep(0.1); self._prep_ph_sp.setDecimals(1)
+        form.addRow("Prep pH:", self._prep_ph_sp)
+
         self.gnina_path = _GninaPath()
         form.addRow("GNINA:", self.gnina_path)
         root.addLayout(form)
@@ -2319,6 +2348,9 @@ class DesignPanel(QtWidgets.QWidget):
         self._log.setMaximumHeight(120)
         root.addWidget(self._log)
 
+        self._iv = _InteractionView()
+        root.addWidget(self._iv)
+
         self.refresh()
 
     def _score_lbl(self, title: str) -> QtWidgets.QLabel:
@@ -2366,8 +2398,28 @@ class DesignPanel(QtWidgets.QWidget):
                 f"Could not save design ligand '{lig_obj}'.")
             return
 
+        # Reprotonation + in-place FF cleanup via obabel (fast, keeps 3D coords)
+        obabel  = _cfg.get("obabel_path", "obabel")
+        lig_prep = os.path.join(self._tmpdir, f"prep_{self._iter}.sdf")
+        ph       = self._prep_ph_sp.value()
+        try:
+            r = subprocess.run(
+                _wrap_wsl([obabel, lig_sdf, "-O", lig_prep,
+                           "-p", str(ph), "--minimize", "--ff", "MMFF94s",
+                           "--crit", "1e-6", "--sd"]),
+                capture_output=True, text=True, timeout=60
+            )
+            gnina_lig = lig_prep if (os.path.exists(lig_prep) and
+                                     os.path.getsize(lig_prep) > 50) else lig_sdf
+        except Exception:
+            gnina_lig = lig_sdf
+        if gnina_lig == lig_sdf:
+            self._log.appendPlainText("⚠ obabel prep failed — using raw PyMOL export")
+        else:
+            self._log.appendPlainText(f"  obabel prep pH {ph:.1f} ✓")
+
         args = [gnina,
-                "--receptor", rec_pdb, "--ligand", lig_sdf,
+                "--receptor", rec_pdb, "--ligand", gnina_lig,
                 "--autobox_ligand", ref_sdf,
                 "--autobox_add", str(self.pad_sp.value()),
                 "--out", out_sdf,
@@ -2409,6 +2461,13 @@ class DesignPanel(QtWidgets.QWidget):
             f"[iter {self._iter}]  CNNaff={_fmt(scores.get('CNNaffinity'))}  "
             f"CNNsc={_fmt(scores.get('CNNscore'))}  Vina={_fmt(scores.get('Vina'))}"
         )
+        try:
+            pv = _import_poseviewer()
+            pv.ci_setup(protein=self.rec_box.currentText(),
+                        ligands=lig_obj, mode="objects")
+            self._iv.bind(pv)
+        except Exception:
+            pass
         entry = _HistEntry(self._iter, smiles, scores, sdf_path)
         self._history.append(entry)
         r = self.hist.rowCount()
