@@ -1915,7 +1915,150 @@ class _InteractionView(QtWidgets.QWidget):
 class PoseViewerPanel:
     """Removed — interaction visualization is now embedded in the Docking tab."""
 
-# ─── Tab 6: Interactive Design ────────────────────────────────────────────────
+# ─── Tab 5: Interactive Design ────────────────────────────────────────────────
+
+# JSME 2-D molecular editor, loaded from CDN inside a QWebEngineView.
+_JSME_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #fff; }
+  #status { color: #888; padding: 8px; font-family: sans-serif; font-size: 12px; }
+</style>
+</head>
+<body>
+<p id="status">Loading JSME sketcher…</p>
+<div id="jsme_container"></div>
+<script>
+function jsmeOnLoad() {
+    try {
+        window._jsme = new JSApplet.JSME(
+            "jsme_container", "100%", "420px",
+            {"options": "query,depict,rSMARTS"});
+        document.getElementById("status").style.display = "none";
+    } catch(e) {
+        document.getElementById("status").textContent =
+            "JSME could not initialise (" + e + "). Check internet access.";
+    }
+}
+</script>
+<script src="https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"></script>
+</body>
+</html>"""
+
+
+def _smiles_from_sdf(sdf_path: str, obabel: str) -> str:
+    """Return the canonical SMILES for the first molecule in an SDF file."""
+    tmp = sdf_path + "._smi"
+    try:
+        subprocess.run(_wrap_wsl([obabel, sdf_path, "-O", tmp]),
+                       capture_output=True, timeout=15)
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            with open(tmp) as fh:
+                line = fh.readline().strip()
+            return line.split()[0] if line else ""
+    except Exception:
+        pass
+    finally:
+        try: os.unlink(tmp)
+        except Exception: pass
+    return ""
+
+
+class _StructureEditor(QtWidgets.QDialog):
+    """SMILES text field + optional embedded JSME 2-D sketcher."""
+
+    def __init__(self, smiles: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Structure")
+        self.setMinimumSize(640, 540)
+        self._smiles    = smiles
+        self._has_jsme  = False
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setSpacing(6)
+
+        # SMILES text row (always present)
+        smi_row = QtWidgets.QHBoxLayout()
+        smi_row.addWidget(QtWidgets.QLabel("SMILES:"))
+        self._smi_edit = QtWidgets.QLineEdit(self._smiles)
+        self._smi_edit.setFont(_monofont())
+        smi_row.addWidget(self._smi_edit, 1)
+        root.addLayout(smi_row)
+
+        # Try to embed JSME via QWebEngineView
+        try:
+            from pymol.Qt import QtWebEngineWidgets  # noqa: F401 — test import only
+            from pymol.Qt import QtWebEngineWidgets as _qwev
+            self._view = _qwev.QWebEngineView()
+            self._view.setMinimumHeight(400)
+            self._view.loadFinished.connect(self._on_load)
+            self._view.page().setHtml(_JSME_HTML)
+            root.addWidget(self._view, 1)
+            self._has_jsme = True
+
+            sync_row = QtWidgets.QHBoxLayout()
+            push_btn = QtWidgets.QPushButton("Send SMILES → sketcher")
+            pull_btn = QtWidgets.QPushButton("Get SMILES ← sketcher")
+            push_btn.clicked.connect(self._push_smiles)
+            pull_btn.clicked.connect(self._pull_smiles)
+            sync_row.addWidget(push_btn); sync_row.addWidget(pull_btn)
+            sync_row.addStretch()
+            root.addLayout(sync_row)
+        except Exception:
+            root.addWidget(QtWidgets.QLabel(
+                "ℹ QtWebEngine not available — edit SMILES directly in the field above."))
+
+        # OK / Cancel
+        btn_row = QtWidgets.QHBoxLayout()
+        apply_btn  = QtWidgets.QPushButton("Apply")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        apply_btn.setDefault(True)
+        apply_btn.clicked.connect(self._on_apply)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(apply_btn); btn_row.addWidget(cancel_btn)
+        root.addLayout(btn_row)
+
+    # ── JSME bridge ───────────────────────────────────────────────────────────
+
+    def _on_load(self, ok):
+        if ok and self._smiles:
+            QtCore.QTimer.singleShot(900, self._push_smiles)
+
+    def _push_smiles(self):
+        smi = self._smi_edit.text().strip()
+        if smi and self._has_jsme:
+            js = f"if(window._jsme) window._jsme.readGenericMolecularInput({json.dumps(smi)});"
+            self._view.page().runJavaScript(js)
+
+    def _pull_smiles(self):
+        if not self._has_jsme: return
+        self._view.page().runJavaScript(
+            "window._jsme ? window._jsme.smiles() : ''",
+            lambda s: self._smi_edit.setText((s or "").strip()))
+
+    def _on_apply(self):
+        if self._has_jsme:
+            self._view.page().runJavaScript(
+                "window._jsme ? window._jsme.smiles() : ''",
+                self._finish)
+        else:
+            self._finish("")
+
+    def _finish(self, jsme_smiles: str):
+        smi = (jsme_smiles or "").strip() or self._smi_edit.text().strip()
+        self._smiles = smi
+        self._smi_edit.setText(smi)
+        self.accept()
+
+    def smiles(self) -> str:
+        return self._smiles
+
 
 class _HistEntry:
     __slots__ = ("iteration", "smiles", "scores", "sdf_path")
@@ -1927,8 +2070,9 @@ class _HistEntry:
 class DesignPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tmpdir = tempfile.mkdtemp(prefix="pynacea_design_")
+        self._tmpdir      = tempfile.mkdtemp(prefix="pynacea_design_")
         self._worker: Optional[GninaWorker] = None
+        self._prep_worker: Optional[LigprepWorker] = None
         self._history: List[_HistEntry] = []
         self._iter = 0
         self._build_ui()
@@ -1988,13 +2132,15 @@ class DesignPanel(QtWidgets.QWidget):
         btn_w = QtWidgets.QWidget()
         btn_r = QtWidgets.QHBoxLayout(btn_w); btn_r.setContentsMargins(0,0,0,0)
         self.refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.edit_btn    = QtWidgets.QPushButton("Edit Structure…")
         self.score_btn   = QtWidgets.QPushButton("Minimize && Score")
         self.restore_btn = QtWidgets.QPushButton("Restore Selected")
         self.restore_btn.setEnabled(False)
         self.refresh_btn.clicked.connect(self.refresh)
+        self.edit_btn.clicked.connect(self._edit_structure)
         self.score_btn.clicked.connect(self._run)
         self.restore_btn.clicked.connect(self._restore)
-        for b in (self.refresh_btn, self.score_btn, self.restore_btn):
+        for b in (self.refresh_btn, self.edit_btn, self.score_btn, self.restore_btn):
             btn_r.addWidget(b)
         root.addWidget(btn_w)
 
@@ -2049,6 +2195,56 @@ class DesignPanel(QtWidgets.QWidget):
         name = _sanitize_obj_name(Path(path).stem)
         cmd.load(path, name)
         self.refresh(preselect=name)
+
+    def _edit_structure(self):
+        lig_obj = self.lig_box.currentText()
+        if not lig_obj:
+            QtWidgets.QMessageBox.warning(self, "Pynacea",
+                "Select a design ligand first.")
+            return
+        obabel  = _cfg.get("obabel_path", "obabel")
+        tmp_sdf = os.path.join(self._tmpdir, "edit_in.sdf")
+        _save_sel(lig_obj, tmp_sdf, state=-1)
+        smiles  = _smiles_from_sdf(tmp_sdf, obabel) if os.path.exists(tmp_sdf) else ""
+
+        dlg = _StructureEditor(smiles, parent=self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        new_smiles = dlg.smiles()
+        if not new_smiles:
+            QtWidgets.QMessageBox.warning(self, "Pynacea", "No SMILES returned.")
+            return
+
+        existing = [o for o in _pymol_objects() if o.startswith(lig_obj + "_edit")]
+        new_name = f"{lig_obj}_edit{len(existing) + 1}"
+        out_sdf  = os.path.join(self._tmpdir, f"{new_name}.sdf")
+
+        self._log.appendPlainText(f"\nPreparing '{new_name}' from edited SMILES…")
+        self.score_btn.setEnabled(False)
+        self.edit_btn.setEnabled(False)
+        self._prep_worker = LigprepWorker(
+            obabel=obabel,
+            entries=[(new_smiles, new_name)],
+            out_sdf=out_sdf,
+            ph=self._prep_ph_sp.value(),
+            tmpdir=self._tmpdir,
+        )
+        self._prep_worker.log_line.connect(self._log.appendPlainText)
+        self._prep_worker.finished.connect(lambda p: self._edit_done(p, new_name))
+        self._prep_worker.failed.connect(self._edit_fail)
+        self._prep_worker.start()
+
+    def _edit_done(self, sdf_path: str, name: str):
+        self.score_btn.setEnabled(True)
+        self.edit_btn.setEnabled(True)
+        cmd.load(sdf_path, name)
+        self.refresh(preselect=name)
+        self._log.appendPlainText(f"✓ '{name}' ready — click Minimize & Score")
+
+    def _edit_fail(self, msg: str):
+        self.score_btn.setEnabled(True)
+        self.edit_btn.setEnabled(True)
+        self._log.appendPlainText(f"✗ Ligand prep failed: {msg}")
 
     def refresh(self, preselect: str = ""):
         objs = _pymol_objects()
