@@ -1875,7 +1875,10 @@ class _InteractionView(QtWidgets.QWidget):
         if pv is None: return
         checked = g_en.isChecked()
         for cb, attr in pairs:
-            setattr(pv._stepper, attr, checked and cb.isChecked())
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+            setattr(pv._stepper, attr, checked)
         pv.ci_update()
 
     # ── Display toggles ───────────────────────────────────────────────────────
@@ -1941,7 +1944,14 @@ class DesignPanel(QtWidgets.QWidget):
         self.lig_box = QtWidgets.QComboBox()
         form.addRow("Receptor:", self.rec_box)
         form.addRow("Ref ligand (box):", self.ref_box)
-        form.addRow("Design ligand:", self.lig_box)
+
+        lig_w = QtWidgets.QWidget()
+        lig_r = QtWidgets.QHBoxLayout(lig_w); lig_r.setContentsMargins(0, 0, 0, 0)
+        lig_r.addWidget(self.lig_box, 1)
+        lig_load_btn = QtWidgets.QPushButton("Load SDF…"); lig_load_btn.setMaximumWidth(80)
+        lig_load_btn.clicked.connect(self._load_lig_sdf)
+        lig_r.addWidget(lig_load_btn)
+        form.addRow("Design ligand:", lig_w)
 
         self.pad_sp = QtWidgets.QDoubleSpinBox()
         self.pad_sp.setRange(0, 20); self.pad_sp.setValue(4.0); self.pad_sp.setSuffix(" Å")
@@ -2030,6 +2040,15 @@ class DesignPanel(QtWidgets.QWidget):
         lbl.setFrameStyle(QtWidgets.QFrame.Panel | QtWidgets.QFrame.Sunken)
         lbl.setMinimumWidth(110); lbl.setMinimumHeight(44)
         return lbl
+
+    def _load_lig_sdf(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Design Ligand", "", "SDF (*.sdf *.SDF);;All (*)")
+        if not path:
+            return
+        name = _sanitize_obj_name(Path(path).stem)
+        cmd.load(path, name)
+        self.refresh(preselect=name)
 
     def refresh(self, preselect: str = ""):
         objs = _pymol_objects()
