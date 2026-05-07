@@ -1990,28 +1990,41 @@ class _StructureEditor(QtWidgets.QDialog):
         smi_row.addWidget(self._smi_edit, 1)
         root.addLayout(smi_row)
 
-        # Try to embed JSME via QWebEngineView
-        try:
-            from pymol.Qt import QtWebEngineWidgets  # noqa: F401 — test import only
-            from pymol.Qt import QtWebEngineWidgets as _qwev
-            self._view = _qwev.QWebEngineView()
-            self._view.setMinimumHeight(400)
-            self._view.loadFinished.connect(self._on_load)
-            self._view.page().setHtml(_JSME_HTML)
-            root.addWidget(self._view, 1)
-            self._has_jsme = True
+        # Try to embed JSME via QWebEngineView (probe multiple Qt bindings)
+        wev_mod = self._try_get_webengine()
+        if wev_mod is not None:
+            try:
+                self._view = wev_mod.QWebEngineView()
+                self._view.setMinimumHeight(400)
+                self._view.loadFinished.connect(self._on_load)
+                self._view.page().setHtml(_JSME_HTML)
+                root.addWidget(self._view, 1)
+                self._has_jsme = True
 
-            sync_row = QtWidgets.QHBoxLayout()
-            push_btn = QtWidgets.QPushButton("Send SMILES → sketcher")
-            pull_btn = QtWidgets.QPushButton("Get SMILES ← sketcher")
-            push_btn.clicked.connect(self._push_smiles)
-            pull_btn.clicked.connect(self._pull_smiles)
-            sync_row.addWidget(push_btn); sync_row.addWidget(pull_btn)
-            sync_row.addStretch()
-            root.addLayout(sync_row)
-        except Exception:
-            root.addWidget(QtWidgets.QLabel(
-                "ℹ QtWebEngine not available — edit SMILES directly in the field above."))
+                sync_row = QtWidgets.QHBoxLayout()
+                push_btn = QtWidgets.QPushButton("Send SMILES → sketcher")
+                pull_btn = QtWidgets.QPushButton("Get SMILES ← sketcher")
+                push_btn.clicked.connect(self._push_smiles)
+                pull_btn.clicked.connect(self._pull_smiles)
+                sync_row.addWidget(push_btn); sync_row.addWidget(pull_btn)
+                sync_row.addStretch()
+                root.addLayout(sync_row)
+            except Exception:
+                pass
+
+        if not self._has_jsme:
+            if _RDKIT:
+                self._preview_lbl = QtWidgets.QLabel()
+                self._preview_lbl.setAlignment(QtCore.Qt.AlignCenter)
+                self._preview_lbl.setMinimumHeight(300)
+                self._preview_lbl.setStyleSheet(
+                    "border: 1px solid #aaa; background: white;")
+                root.addWidget(self._preview_lbl, 1)
+                self._smi_edit.textChanged.connect(self._update_preview)
+                self._update_preview(self._smiles)
+            else:
+                root.addWidget(QtWidgets.QLabel(
+                    "ℹ No 2D sketcher — edit SMILES in the field above."))
 
         # OK / Cancel
         btn_row = QtWidgets.QHBoxLayout()
@@ -2023,6 +2036,49 @@ class _StructureEditor(QtWidgets.QDialog):
         btn_row.addStretch()
         btn_row.addWidget(apply_btn); btn_row.addWidget(cancel_btn)
         root.addLayout(btn_row)
+
+    # ── WebEngine probe ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _try_get_webengine():
+        for pkg in ("pymol.Qt", "PyQt5", "PySide2", "PyQt6", "PySide6"):
+            try:
+                mod = __import__(f"{pkg}.QtWebEngineWidgets",
+                                 fromlist=["QWebEngineView"])
+                if hasattr(mod, "QWebEngineView"):
+                    return mod
+            except Exception:
+                continue
+        return None
+
+    # ── RDKit live preview ────────────────────────────────────────────────────
+
+    def _update_preview(self, smiles: str = ""):
+        if not hasattr(self, "_preview_lbl"):
+            return
+        import io
+        from rdkit import Chem
+        from rdkit.Chem import Draw
+        smi = smiles if isinstance(smiles, str) else self._smi_edit.text().strip()
+        mol = Chem.MolFromSmiles(smi) if smi else None
+        if mol is None:
+            self._preview_lbl.setText("(invalid SMILES)" if smi else "")
+            return
+        try:
+            img = Draw.MolToImage(mol, size=(400, 300))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            qimg = QtGui.QImage()
+            qimg.loadFromData(buf.getvalue())
+            pix = QtGui.QPixmap.fromImage(qimg)
+            w = self._preview_lbl.width() or 400
+            h = self._preview_lbl.height() or 300
+            self._preview_lbl.setPixmap(pix.scaled(
+                w, h,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation))
+        except Exception as exc:
+            self._preview_lbl.setText(f"(preview error: {exc})")
 
     # ── JSME bridge ───────────────────────────────────────────────────────────
 
