@@ -1345,8 +1345,7 @@ class LigprepPanel(QtWidgets.QWidget):
 # ─── Tab 4: Docking ───────────────────────────────────────────────────────────
 
 class DockingPanel(QtWidgets.QWidget):
-    pose_loaded      = QtCore.Signal(str)
-    docking_finished = QtCore.Signal(str)   # emits SDF path on completion
+    pose_loaded = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1470,6 +1469,9 @@ class DockingPanel(QtWidgets.QWidget):
         self._log = _log_widget()
         root.addWidget(self._log)
 
+        self._iv = _InteractionView()
+        root.addWidget(self._iv)
+
         self.refresh()
 
     def refresh(self):
@@ -1583,7 +1585,6 @@ class DockingPanel(QtWidgets.QWidget):
             f"\n✓ {n} poses" if n else "\n✓ Done (install RDKit to populate table)"
         )
         self._log.appendPlainText("Double-click a row or click 'Load Selected Pose'")
-        self.docking_finished.emit(sdf_path)
 
     def _fail(self, msg: str):
         self.run_btn.setEnabled(True)
@@ -1627,6 +1628,12 @@ class DockingPanel(QtWidgets.QWidget):
         else:
             cmd.load(self._out_sdf, name)
         self._log.appendPlainText(f"Loaded pose {r['pose']} as '{name}'")
+        try:
+            pv = _import_poseviewer()
+            pv.ci_setup(protein=self.rec_box.currentText(), ligands=name, mode="objects")
+            self._iv.bind(pv)
+        except Exception:
+            pass
         self.pose_loaded.emit(name)
 
     def cleanup(self):
@@ -1635,7 +1642,7 @@ class DockingPanel(QtWidgets.QWidget):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
-# ─── Tab 5: Pose Viewer ──────────────────────────────────────────────────────
+# ─── Shared: PoseViewer import ───────────────────────────────────────────────
 
 def _import_poseviewer():
     """Import PoseViewer from the same directory as this file. Cached after first call."""
@@ -1650,7 +1657,7 @@ def _import_poseviewer():
 
 
 class _InteractionView(QtWidgets.QWidget):
-    """Reusable interaction-toggle panel, shared by PoseViewerPanel and DesignPanel."""
+    """Reusable interaction-toggle panel, shared by DockingPanel and DesignPanel."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1902,344 +1909,8 @@ class _InteractionView(QtWidgets.QWidget):
         pv.ci_update()
 
 
-class PoseViewerPanel(QtWidgets.QWidget):
-    """Embedding of PoseViewer interaction viewer as a Pynacea tab."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._pv = None           # PoseViewer module, loaded lazily
-        self._sel_order: list = []
-        self._sel_busy  = [False]
-        self._build_ui()
-
-    # ── UI construction ────────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        root = QtWidgets.QVBoxLayout(self)
-        root.setSpacing(5)
-        root.setContentsMargins(8, 8, 8, 8)
-
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        root.addWidget(splitter)
-
-        top_w = QtWidgets.QWidget()
-        top_l = QtWidgets.QVBoxLayout(top_w)
-        top_l.setContentsMargins(0, 0, 0, 0); top_l.setSpacing(5)
-        splitter.addWidget(top_w)
-
-        bot_w = QtWidgets.QWidget()
-        bot_l = QtWidgets.QVBoxLayout(bot_w)
-        bot_l.setContentsMargins(0, 0, 0, 0); bot_l.setSpacing(5)
-        splitter.addWidget(bot_w)
-
-        # Setup
-        g_s = QtWidgets.QGroupBox("Setup")
-        l_s = QtWidgets.QGridLayout(g_s)
-        l_s.addWidget(QtWidgets.QLabel("Protein:"), 0, 0)
-        self._e_prot = QtWidgets.QLineEdit("polymer.protein")
-        l_s.addWidget(self._e_prot, 0, 1)
-        l_s.addWidget(QtWidgets.QLabel("Ligand(s):"), 1, 0)
-        self._e_lig = QtWidgets.QLineEdit("organic")
-        l_s.addWidget(self._e_lig, 1, 1)
-
-        hl_m = QtWidgets.QHBoxLayout()
-        hl_m.addWidget(QtWidgets.QLabel("Mode:"))
-        self._bg_m = QtWidgets.QButtonGroup(self)
-        self._rb_m: Dict[str, QtWidgets.QRadioButton] = {}
-        for m in ("auto", "objects", "states"):
-            rb = QtWidgets.QRadioButton(m)
-            if m == "auto": rb.setChecked(True)
-            self._bg_m.addButton(rb); self._rb_m[m] = rb; hl_m.addWidget(rb)
-        hl_m.addStretch()
-        l_s.addLayout(hl_m, 2, 0, 1, 2)
-
-        l_s.addWidget(QtWidgets.QLabel("Scores (SDF):"), 3, 0)
-        hl_sf = QtWidgets.QHBoxLayout()
-        self._e_scores = QtWidgets.QLineEdit()
-        self._e_scores.setPlaceholderText("optional")
-        b_browse = QtWidgets.QPushButton("…"); b_browse.setFixedWidth(26)
-        b_browse.clicked.connect(self._do_browse)
-        hl_sf.addWidget(self._e_scores); hl_sf.addWidget(b_browse)
-        l_s.addLayout(hl_sf, 3, 1)
-
-        hl_b = QtWidgets.QHBoxLayout()
-        b_setup = QtWidgets.QPushButton("Setup")
-        b_clear = QtWidgets.QPushButton("Clear")
-        b_setup.clicked.connect(self._do_setup)
-        b_clear.clicked.connect(self._do_clear)
-        hl_b.addWidget(b_setup); hl_b.addWidget(b_clear)
-        l_s.addLayout(hl_b, 4, 0, 1, 2)
-        top_l.addWidget(g_s)
-
-        # Navigate
-        g_n = QtWidgets.QGroupBox("Navigate")
-        l_n = QtWidgets.QVBoxLayout(g_n)
-        self._lbl = QtWidgets.QLabel("Ready — click Setup")
-        self._lbl.setAlignment(QtCore.Qt.AlignCenter)
-        f = self._lbl.font(); f.setBold(True); f.setPointSize(f.pointSize() + 1)
-        self._lbl.setFont(f)
-        l_n.addWidget(self._lbl)
-
-        hl_pn = QtWidgets.QHBoxLayout()
-        b_prev    = QtWidgets.QPushButton("<  Prev")
-        b_refresh = QtWidgets.QPushButton("Refresh")
-        b_next    = QtWidgets.QPushButton("Next  >")
-        b_prev.clicked.connect(self._do_prev)
-        b_refresh.clicked.connect(self._do_refresh)
-        b_next.clicked.connect(self._do_next)
-        hl_pn.addWidget(b_prev); hl_pn.addWidget(b_refresh); hl_pn.addWidget(b_next)
-        l_n.addLayout(hl_pn)
-
-        hl_j = QtWidgets.QHBoxLayout()
-        hl_j.addWidget(QtWidgets.QLabel("Go to #:"))
-        self._sp = QtWidgets.QSpinBox()
-        self._sp.setMinimum(1); self._sp.setMaximum(99999); self._sp.setFixedWidth(70)
-        hl_j.addWidget(self._sp)
-        b_go = QtWidgets.QPushButton("Go"); b_go.setFixedWidth(50)
-        b_go.clicked.connect(self._do_go)
-        hl_j.addWidget(b_go); hl_j.addStretch()
-        l_n.addLayout(hl_j)
-
-        self._cb_cmp_hb = QtWidgets.QCheckBox("H-bonds in compare mode")
-        self._cb_cmp_hb.setChecked(False)
-        self._cb_cmp_hb.stateChanged.connect(self._on_cmp_hb)
-        l_n.addWidget(self._cb_cmp_hb)
-        top_l.addWidget(g_n)
-
-        # Pose Data table
-        g_pd = QtWidgets.QGroupBox("Pose Data")
-        g_pd.setCheckable(True); g_pd.setChecked(True)
-        l_pd = QtWidgets.QVBoxLayout(g_pd)
-
-        class _SortItem(QtWidgets.QTableWidgetItem):
-            def __lt__(self, other):
-                a = self.data(QtCore.Qt.UserRole + 1)
-                b = other.data(QtCore.Qt.UserRole + 1)
-                if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                    return a < b
-                return self.text() < other.text()
-
-        self._SortItem = _SortItem
-        self._tw_pd = QtWidgets.QTableWidget(0, 0)
-        self._tw_pd.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self._tw_pd.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self._tw_pd.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self._tw_pd.setMinimumHeight(80)
-        self._tw_pd.horizontalHeader().setStretchLastSection(True)
-        self._tw_pd.horizontalHeader().setSectionsMovable(True)
-        self._tw_pd.verticalHeader().setDefaultSectionSize(18)
-        self._tw_pd.setAlternatingRowColors(True)
-        self._tw_pd.itemSelectionChanged.connect(self._on_selection_changed)
-        l_pd.addWidget(self._tw_pd)
-        g_pd.toggled.connect(lambda _: self._update_ui())
-        top_l.addWidget(g_pd, 1)
-        self._g_pd = g_pd
-
-        self._iv = _InteractionView()
-        bot_l.addWidget(self._iv)
-
-        splitter.setSizes([460, 200])
-
-    # ── PoseViewer module access ───────────────────────────────────────────────
-
-    def _pv_or_warn(self):
-        if self._pv is None:
-            try:
-                self._pv = _import_poseviewer()
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(
-                    self, "Pynacea", f"Could not load PoseViewer:\n{e}")
-                return None
-        return self._pv
-
-    # ── Setup / navigation ────────────────────────────────────────────────────
-
-    def _do_browse(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select scores SDF", "", "SDF files (*.sdf *.SDF);;All files (*)")
-        if path:
-            self._e_scores.setText(path)
-
-    def _do_setup(self):
-        pv = self._pv_or_warn()
-        if pv is None: return
-        mode = next(m for m, rb in self._rb_m.items() if rb.isChecked())
-        sf = self._e_scores.text().strip()
-        if sf:
-            pv.ci_load_scores(sf)
-        else:
-            pv._stepper.sdf_records = []
-        pv.ci_setup(protein=self._e_prot.text(), ligands=self._e_lig.text(), mode=mode)
-        self._iv.bind(pv)
-        self._update_ui()
-        self._rebuild_table()
-
-    def _do_clear(self):
-        pv = self._pv
-        if pv is None: return
-        pv.ci_clear()
-        pv._stepper.sdf_records = []
-        pv._stepper.all_properties = []
-        pv._stepper.ref_ligand = None
-        self._iv.bind(None)
-        self._sel_order.clear()
-        self._lbl.setText("Ready — click Setup")
-        self._tw_pd.setSortingEnabled(False)
-        self._tw_pd.clearContents()
-        self._tw_pd.setRowCount(0); self._tw_pd.setColumnCount(0)
-
-    def _do_prev(self):    self._table_adjacent(-1)
-    def _do_next(self):    self._table_adjacent(1)
-    def _do_refresh(self):
-        pv = self._pv
-        if pv: pv.ci_refresh(); self._update_ui()
-    def _do_go(self):
-        pv = self._pv
-        if pv: pv.ci_goto(self._sp.value() - 1); self._update_ui()
-
-    def _table_adjacent(self, delta):
-        pv = self._pv
-        if pv is None: return
-        n_rows = self._tw_pd.rowCount()
-        if n_rows == 0:
-            if delta > 0: pv.ci_next()
-            else:          pv.ci_prev()
-            self._update_ui(); return
-        cur = pv._stepper.current_index
-        cur_row = -1
-        for r in range(n_rows):
-            item0 = self._tw_pd.item(r, 0)
-            if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
-                cur_row = r; break
-        next_row = (cur_row + delta) % n_rows
-        item0 = self._tw_pd.item(next_row, 0)
-        if item0 is not None:
-            pi = item0.data(QtCore.Qt.UserRole)
-            if pi is not None:
-                pv.ci_goto(pi)
-        self._update_ui()
-
-    # ── Pose data table ───────────────────────────────────────────────────────
-
-    def _rebuild_table(self):
-        pv = self._pv
-        if pv is None: return
-        tw = self._tw_pd
-        tw.setSortingEnabled(False); tw.clearContents(); tw.setRowCount(0)
-        all_props = pv._stepper.all_properties
-        if not all_props:
-            tw.setColumnCount(0); return
-        seen: dict = {}
-        for p in all_props:
-            for k in p:
-                if k not in seen: seen[k] = None
-        cols = list(seen.keys())
-        cols = (["_name"] if "_name" in cols else []) + [
-            c for c in cols if c != "_name" and "rank" not in c.lower()]
-        tw.setColumnCount(len(cols))
-        headers = ["Ligand_ID" if c == "_name" else c for c in cols]
-        tw.setHorizontalHeaderLabels(headers)
-        tw.setRowCount(len(all_props))
-        for r, props in enumerate(all_props):
-            for c, key in enumerate(cols):
-                val = props.get(key, "")
-                display = (f"{val:.2f}" if isinstance(val, float)
-                           else str(val) if val != "" else "")
-                item = self._SortItem(display)
-                item.setData(QtCore.Qt.UserRole, r)
-                if isinstance(val, (int, float)):
-                    item.setData(QtCore.Qt.UserRole + 1, val)
-                    item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-                tw.setItem(r, c, item)
-        tw.resizeColumnsToContents(); tw.setSortingEnabled(True)
-        self._sel_order.clear(); self._highlight_current_row()
-
-    def _highlight_current_row(self):
-        pv = self._pv
-        if pv is None or pv._stepper._in_compare: return
-        cur = pv._stepper.current_index
-        tw = self._tw_pd
-        tw.blockSignals(True)
-        try:
-            self._sel_order.clear()
-            for r in range(tw.rowCount()):
-                item0 = tw.item(r, 0)
-                if item0 is not None and item0.data(QtCore.Qt.UserRole) == cur:
-                    tw.selectRow(r); self._sel_order.append(r)
-                    tw.scrollToItem(item0, QtWidgets.QAbstractItemView.PositionAtCenter)
-                    return
-            tw.clearSelection()
-        finally:
-            tw.blockSignals(False)
-
-    def _on_selection_changed(self):
-        pv = self._pv
-        if pv is None or self._sel_busy[0]: return
-        selected = {idx.row() for idx in self._tw_pd.selectionModel().selectedRows()}
-        self._sel_order[:] = [r for r in self._sel_order if r in selected]
-        for r in sorted(selected):
-            if r not in self._sel_order: self._sel_order.append(r)
-        if len(self._sel_order) > 2:
-            oldest = self._sel_order.pop(0)
-            self._sel_busy[0] = True
-            try:
-                self._tw_pd.selectionModel().select(
-                    self._tw_pd.model().index(oldest, 0),
-                    QtCore.QItemSelectionModel.Deselect | QtCore.QItemSelectionModel.Rows)
-            finally:
-                self._sel_busy[0] = False
-        pose_indices = []
-        for r in self._sel_order:
-            item0 = self._tw_pd.item(r, 0)
-            if item0 is not None:
-                pi = item0.data(QtCore.Qt.UserRole)
-                if pi is not None: pose_indices.append(pi)
-        if len(pose_indices) == 2:
-            pv._stepper.show_comparison(pose_indices); self._update_ui()
-        elif len(pose_indices) == 1:
-            pv.ci_goto(pose_indices[0]); self._update_ui()
-
-    def _on_cmp_hb(self, _):
-        pv = self._pv
-        if pv is None: return
-        pv._stepper.show_cmp_hbonds = self._cb_cmp_hb.isChecked()
-        if pv._stepper._in_compare:
-            pv._stepper.show_comparison(pv._stepper._cmp_indices)
-            self._update_ui()
-
-    # ── Status label ──────────────────────────────────────────────────────────
-
-    def _update_ui(self):
-        pv = self._pv
-        if pv is None: return
-        c = pv._stepper._count()
-        if c > 0:
-            if pv._stepper._in_compare:
-                self._lbl.setText(pv._stepper.compare_label())
-            else:
-                self._lbl.setText(f"{pv._stepper._label()}  "
-                                   f"({pv._stepper.current_index + 1}/{c})")
-            self._sp.setMaximum(c)
-            self._sp.setValue(pv._stepper.current_index + 1)
-        else:
-            self._lbl.setText("Ready — click Setup")
-        if self._g_pd.isChecked() and pv and not pv._stepper._in_compare:
-            self._highlight_current_row()
-
-    # ── Called from docking tab when a pose is loaded ─────────────────────────
-
-    def prime(self, protein_sel: str, ligand_sel: str):
-        """Pre-fill Setup fields with docking result selections."""
-        self._e_prot.setText(protein_sel)
-        self._e_lig.setText(ligand_sel)
-
-    def set_scores_sdf(self, path: str):
-        """Auto-populate the scores SDF field from docking output."""
-        self._e_scores.setText(path)
-
-    def cleanup(self):
-        pass
-
+class PoseViewerPanel:
+    """Removed — interaction visualization is now embedded in the Docking tab."""
 
 # ─── Tab 6: Interactive Design ────────────────────────────────────────────────
 
@@ -2517,39 +2188,30 @@ class SBDDDialog(QtWidgets.QDialog):
         self.setMinimumHeight(720)
         self.setSizeGripEnabled(True)
 
-        self._protprep    = ProtprepPanel()
-        self._fpocket     = FpocketPanel()
-        self._ligprep     = LigprepPanel()
-        self._docking     = DockingPanel()
-        self._poseviewer  = PoseViewerPanel()
-        self._design      = DesignPanel()
+        self._protprep = ProtprepPanel()
+        self._fpocket  = FpocketPanel()
+        self._ligprep  = LigprepPanel()
+        self._docking  = DockingPanel()
+        self._design   = DesignPanel()
 
         self._tabs = QtWidgets.QTabWidget()
-        self._tabs.addTab(self._protprep,   "1 · Protein Prep")
-        self._tabs.addTab(self._fpocket,    "2 · Pockets")
-        self._tabs.addTab(self._ligprep,    "3 · Ligand Prep")
-        self._tabs.addTab(self._docking,    "4 · Docking")
-        self._tabs.addTab(self._poseviewer, "5 · Pose Viewer")
-        self._tabs.addTab(self._design,     "6 · Design")
+        self._tabs.addTab(self._protprep, "1 · Protein Prep")
+        self._tabs.addTab(self._fpocket,  "2 · Pockets")
+        self._tabs.addTab(self._ligprep,  "3 · Ligand Prep")
+        self._tabs.addTab(self._docking,  "4 · Docking")
+        self._tabs.addTab(self._design,   "5 · Design")
 
         # After ligprep loads objects, refresh the docking ligand list
         self._ligprep.objects_loaded.connect(lambda _: self._docking.refresh())
-        # When docking finishes, pre-fill the Pose Viewer scores SDF
-        self._docking.docking_finished.connect(self._poseviewer.set_scores_sdf)
-        # Loading a docked pose primes Pose Viewer and switches to Design
-        self._docking.pose_loaded.connect(self._on_pose_loaded)
+        # Loading a docked pose refreshes the Design ligand list
+        self._docking.pose_loaded.connect(lambda name: self._design.refresh(preselect=name))
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._tabs)
 
-    def _on_pose_loaded(self, name: str):
-        self._poseviewer.prime("polymer.protein", name)
-        self._design.refresh(preselect=name)
-        self._tabs.setCurrentWidget(self._design)
-
     def closeEvent(self, event):
         for panel in (self._protprep, self._fpocket, self._ligprep,
-                      self._docking, self._poseviewer, self._design):
+                      self._docking, self._design):
             panel.cleanup()
         super().closeEvent(event)
 
