@@ -1015,7 +1015,7 @@ class FpocketPanel(QtWidgets.QWidget):
         cmd.show("spheres", sph_name)
         cmd.set("sphere_scale", 0.3, sph_name)
         cmd.set("sphere_transparency", 0.1, sph_name)
-        cmd.color("yellow", sph_name)
+        cmd.color(n + 1, sph_name)
         self._log.appendPlainText(f"✓ Loaded pocket {n} alpha spheres as '{sph_name}'")
 
     def cleanup(self):
@@ -1462,6 +1462,7 @@ class DockingPanel(QtWidgets.QWidget):
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setMaximumHeight(180)
+        self.table.setSortingEnabled(True)
         self.table.doubleClicked.connect(self._load_pose)
         root.addWidget(self.table)
 
@@ -1589,27 +1590,32 @@ class DockingPanel(QtWidgets.QWidget):
         QtWidgets.QMessageBox.critical(self, "Docking failed", msg)
 
     def _populate_table(self):
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self._results))
         for r, row in enumerate(self._results):
-            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(row.get("name", "")))
-            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(row["pose"])))
-            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(_fmt(row.get("minimizedAffinity"))))
-            self.table.setItem(r, 3, QtWidgets.QTableWidgetItem(_fmt(row.get("CNNscore"))))
-            self.table.setItem(r, 4, QtWidgets.QTableWidgetItem(_fmt(row.get("CNNaffinity"))))
-            self.table.setItem(r, 5, QtWidgets.QTableWidgetItem(_fmt(row.get("CNN_VS"))))
-            self.table.setItem(r, 6, QtWidgets.QTableWidgetItem(_fmt(row.get("CNNaffinity_variance"))))
+            name_item = QtWidgets.QTableWidgetItem(row.get("name", ""))
+            name_item.setData(QtCore.Qt.UserRole, r)
+            self.table.setItem(r, 0, name_item)
+            self.table.setItem(r, 1, _NumericItem(str(row["pose"])))
+            self.table.setItem(r, 2, _NumericItem(_fmt(row.get("minimizedAffinity"))))
+            self.table.setItem(r, 3, _NumericItem(_fmt(row.get("CNNscore"))))
+            self.table.setItem(r, 4, _NumericItem(_fmt(row.get("CNNaffinity"))))
+            self.table.setItem(r, 5, _NumericItem(_fmt(row.get("CNN_VS"))))
+            self.table.setItem(r, 6, _NumericItem(_fmt(row.get("CNNaffinity_variance"))))
         self.table.resizeColumnsToContents()
+        self.table.setSortingEnabled(True)
 
     def _load_pose(self):
-        row_idx = self.table.currentRow()
-        out_nm  = self.out_edit.text().strip() or "docking_out"
-        if not self._results or row_idx < 0:
+        visual_row = self.table.currentRow()
+        out_nm     = self.out_edit.text().strip() or "docking_out"
+        if not self._results or visual_row < 0:
             if self._out_sdf and os.path.exists(self._out_sdf):
                 cmd.load(self._out_sdf, out_nm)
                 self._log.appendPlainText(f"Loaded all poses as '{out_nm}'")
                 self.pose_loaded.emit(out_nm)
             return
-        r    = self._results[row_idx]
+        orig_idx = self.table.item(visual_row, 0).data(QtCore.Qt.UserRole)
+        r        = self._results[orig_idx]
         name = f"{out_nm}_p{r['pose']}"
         tmp  = os.path.join(self._tmpdir, f"pose_{r['pose']}.sdf")
         if "mol_block" in r:
