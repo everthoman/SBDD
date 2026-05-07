@@ -678,6 +678,7 @@ class ProtprepPanel(QtWidgets.QWidget):
         self._progress.setVisible(False)
         stem = Path(pdb_path).stem
         cmd.load(pdb_path, stem)
+        cmd.spectrum("count", "rainbow", f"{stem} and elem C")
         self._log.appendPlainText(f"\n✓ Loaded '{stem}' into PyMOL")
         if sdf_path:
             ref_stem = Path(sdf_path).stem
@@ -990,6 +991,8 @@ class FpocketPanel(QtWidgets.QWidget):
                 self._table.setItem(r, c, item)
         self._table.resizeColumnsToContents()
         self._table.setSortingEnabled(True)
+        score_col = _FPOCKET_COLS.index("Score")
+        self._table.sortByColumn(score_col, QtCore.Qt.DescendingOrder)
 
     def _load_pocket(self):
         rows = self._table.selectionModel().selectedRows()
@@ -1010,7 +1013,8 @@ class FpocketPanel(QtWidgets.QWidget):
         cmd.load(vert, sph_name)
         cmd.hide("everything", sph_name)
         cmd.show("spheres", sph_name)
-        cmd.set("sphere_scale", 1.0, sph_name)
+        cmd.set("sphere_scale", 0.3, sph_name)
+        cmd.set("sphere_transparency", 0.1, sph_name)
         cmd.color("yellow", sph_name)
         self._log.appendPlainText(f"✓ Loaded pocket {n} alpha spheres as '{sph_name}'")
 
