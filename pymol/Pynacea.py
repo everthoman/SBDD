@@ -1345,7 +1345,8 @@ class LigprepPanel(QtWidgets.QWidget):
 # ─── Tab 4: Docking ───────────────────────────────────────────────────────────
 
 class DockingPanel(QtWidgets.QWidget):
-    pose_loaded = QtCore.Signal(str)
+    pose_loaded      = QtCore.Signal(str)
+    docking_finished = QtCore.Signal(str)   # emits SDF path on completion
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1582,6 +1583,7 @@ class DockingPanel(QtWidgets.QWidget):
             f"\n✓ {n} poses" if n else "\n✓ Done (install RDKit to populate table)"
         )
         self._log.appendPlainText("Double-click a row or click 'Load Selected Pose'")
+        self.docking_finished.emit(sdf_path)
 
     def _fail(self, msg: str):
         self.run_btn.setEnabled(True)
@@ -2207,6 +2209,10 @@ class PoseViewerPanel(QtWidgets.QWidget):
         self._e_prot.setText(protein_sel)
         self._e_lig.setText(ligand_sel)
 
+    def set_scores_sdf(self, path: str):
+        """Auto-populate the scores SDF field from docking output."""
+        self._e_scores.setText(path)
+
     def cleanup(self):
         pass
 
@@ -2469,6 +2475,8 @@ class SBDDDialog(QtWidgets.QDialog):
 
         # After ligprep loads objects, refresh the docking ligand list
         self._ligprep.objects_loaded.connect(lambda _: self._docking.refresh())
+        # When docking finishes, pre-fill the Pose Viewer scores SDF
+        self._docking.docking_finished.connect(self._poseviewer.set_scores_sdf)
         # Loading a docked pose primes Pose Viewer and switches to Design
         self._docking.pose_loaded.connect(self._on_pose_loaded)
 
