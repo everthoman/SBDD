@@ -1918,6 +1918,65 @@ class PoseViewerPanel:
 # ─── Tab 5: Interactive Design ────────────────────────────────────────────────
 
 # JSME 2-D molecular editor, loaded from CDN inside a QWebEngineView.
+def _jsme_browser_html(initial_smiles: str = "") -> str:
+    """Return a standalone HTML page with JSME pre-loaded with *initial_smiles*."""
+    smi_js = initial_smiles.replace("\\", "\\\\").replace('"', '\\"')
+    return f"""\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JSME Molecular Editor</title>
+<style>
+  body {{ margin: 0; padding: 8px; font-family: sans-serif; background: #f5f5f5; }}
+  #toolbar {{ margin-bottom: 6px; display: flex; gap: 8px; align-items: center; }}
+  #smi_out {{ font-family: monospace; font-size: 13px; flex: 1;
+               padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; }}
+  button {{ padding: 4px 12px; font-size: 13px; cursor: pointer; }}
+  #status {{ color: #888; font-size: 12px; margin-top: 4px; }}
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <button onclick="getSmiles()">Get SMILES</button>
+  <input id="smi_out" type="text" readonly placeholder="click Get SMILES…">
+  <button onclick="copySmiles()">Copy</button>
+</div>
+<div id="jsme_container"></div>
+<p id="status">Loading JSME…</p>
+<script>
+var _initSmi = "{smi_js}";
+function jsmeOnLoad() {{
+  try {{
+    window._jsme = new JSApplet.JSME("jsme_container", "100%", "520px",
+        {{"options": "query,depict,rSMARTS"}});
+    document.getElementById("status").style.display = "none";
+    if (_initSmi) {{
+      setTimeout(function() {{
+        window._jsme.readGenericMolecularInput(_initSmi);
+      }}, 800);
+    }}
+  }} catch(e) {{
+    document.getElementById("status").textContent = "JSME error: " + e;
+  }}
+}}
+function getSmiles() {{
+  var s = window._jsme ? window._jsme.smiles() : "";
+  document.getElementById("smi_out").value = s;
+}}
+function copySmiles() {{
+  getSmiles();
+  var el = document.getElementById("smi_out");
+  el.select(); el.setSelectionRange(0, 99999);
+  navigator.clipboard ? navigator.clipboard.writeText(el.value)
+                      : document.execCommand("copy");
+}}
+</script>
+<script src="https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"></script>
+</body>
+</html>"""
+
+
 _JSME_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -1951,6 +2010,19 @@ function jsmeOnLoad() {
 
 def _smiles_from_sdf(sdf_path: str, obabel: str) -> str:
     """Return the canonical SMILES for the first molecule in an SDF file."""
+    if _RDKIT:
+        try:
+            from rdkit import Chem
+            suppl = Chem.SDMolSupplier(sdf_path, removeHs=False)
+            mol = next((m for m in suppl if m is not None), None)
+            if mol is not None:
+                mol_noh = Chem.RemoveHs(mol, sanitize=False)
+                Chem.SanitizeMol(mol_noh)
+                smi = Chem.MolToSmiles(mol_noh)
+                if smi:
+                    return smi
+        except Exception:
+            pass
     tmp = sdf_path + "._smi"
     try:
         subprocess.run(_wrap_wsl([obabel, sdf_path, "-O", tmp]),
@@ -2013,6 +2085,21 @@ class _StructureEditor(QtWidgets.QDialog):
                 pass
 
         if not self._has_jsme:
+            # Browser-launch row (always available as fallback sketcher)
+            browser_row = QtWidgets.QHBoxLayout()
+            open_btn  = QtWidgets.QPushButton("Open in Browser…")
+            paste_btn = QtWidgets.QPushButton("Paste SMILES from clipboard")
+            open_btn.setToolTip(
+                "Opens JSME molecular editor in your default browser\n"
+                "pre-loaded with the current SMILES.\n"
+                "Draw/edit, click 'Copy', then click 'Paste from clipboard'.")
+            open_btn.clicked.connect(self._open_in_browser)
+            paste_btn.clicked.connect(self._paste_clipboard)
+            browser_row.addWidget(open_btn)
+            browser_row.addWidget(paste_btn)
+            browser_row.addStretch()
+            root.addLayout(browser_row)
+
             if _RDKIT:
                 self._preview_lbl = QtWidgets.QLabel()
                 self._preview_lbl.setAlignment(QtCore.Qt.AlignCenter)
@@ -2024,7 +2111,7 @@ class _StructureEditor(QtWidgets.QDialog):
                 self._update_preview(self._smiles)
             else:
                 root.addWidget(QtWidgets.QLabel(
-                    "ℹ No 2D sketcher — edit SMILES in the field above."))
+                    "ℹ No 2D preview — edit SMILES in the field above."))
 
         # OK / Cancel
         btn_row = QtWidgets.QHBoxLayout()
@@ -2036,6 +2123,30 @@ class _StructureEditor(QtWidgets.QDialog):
         btn_row.addStretch()
         btn_row.addWidget(apply_btn); btn_row.addWidget(cancel_btn)
         root.addLayout(btn_row)
+
+    # ── Browser / clipboard helpers ───────────────────────────────────────────
+
+    def _open_in_browser(self):
+        import webbrowser, tempfile as _tf
+        smi = self._smi_edit.text().strip()
+        html = _jsme_browser_html(smi)
+        fd, path = _tf.mkstemp(suffix=".html", prefix="pynacea_jsme_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            webbrowser.open(f"file://{path}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Pynacea", f"Could not open browser:\n{exc}")
+
+    def _paste_clipboard(self):
+        cb = QtWidgets.QApplication.clipboard()
+        smi = (cb.text() or "").strip()
+        if smi:
+            self._smi_edit.setText(smi)
+        else:
+            QtWidgets.QMessageBox.information(
+                self, "Pynacea", "Clipboard is empty — copy SMILES from the browser first.")
 
     # ── WebEngine probe ───────────────────────────────────────────────────────
 
