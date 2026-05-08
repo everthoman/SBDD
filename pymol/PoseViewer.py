@@ -1502,9 +1502,9 @@ def _open_gui():
     l_n.addWidget(lbl)
 
     hl_pn = QtWidgets.QHBoxLayout()
-    b_prev = QtWidgets.QPushButton("<  Prev")
+    b_prev = QtWidgets.QPushButton("◀  Prev  [←]")
     b_refresh = QtWidgets.QPushButton("Refresh")
-    b_next = QtWidgets.QPushButton("Next  >")
+    b_next = QtWidgets.QPushButton("[→]  Next  ▶")
     hl_pn.addWidget(b_prev); hl_pn.addWidget(b_refresh); hl_pn.addWidget(b_next)
     l_n.addLayout(hl_pn)
 
@@ -1856,8 +1856,8 @@ def _open_gui():
     def _table_adjacent(delta):
         """Navigate to the row delta steps from the current row in table order."""
         n_rows = tw_pd.rowCount()
-        if n_rows == 0:
-            # No table — fall back to poses order
+        if n_rows == 0 or tw_pd.columnCount() == 0:
+            # No table (or table has rows but no columns / items) — fall back to poses order
             if delta > 0:
                 ci_next()
             else:
@@ -2142,6 +2142,7 @@ def _open_gui():
                         _stepper._update(o, state=s)
                         update_ui()
                         break
+
         else:
             # States mode: only state sync matters.
             if cur_st == pymol_st:
