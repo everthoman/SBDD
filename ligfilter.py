@@ -72,6 +72,12 @@ try:
 except ImportError:
     _RDKIT = False
 
+try:
+    from tqdm import tqdm
+    _TQDM = True
+except ImportError:
+    _TQDM = False
+
 # Default filter-file locations (same directory as this script)
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _DEFAULT_PAINS   = _SCRIPT_DIR / 'PAINS.txt'
@@ -412,6 +418,11 @@ def _preprocess(molecules: Iterator[Tuple[Chem.Mol, str]],
     # seen maps canonical SMILES → (mol, name) for the representative entry
     seen: Dict[str, Tuple[Chem.Mol, str]] = {}
     result: List[Tuple[Chem.Mol, str]] = []
+
+    if _TQDM:
+        molecules = tqdm(molecules, desc="  Reading & preprocessing",
+                         unit=" mol", file=sys.stderr,
+                         disable=not sys.stderr.isatty(), leave=False)
 
     for mol, name in molecules:
         # 1. Salt stripping
@@ -1173,7 +1184,10 @@ def main():
     # PropertyPickleOptions preserves all mol properties (including extra input
     # columns stored as string props) across the ToBinary / Chem.Mol round-trip.
     n_jobs = max(1, min(args.jobs, len(molecules)))
-    batch_size = math.ceil(len(molecules) / n_jobs) if molecules else 1
+    # Aim for ~20 batches per worker so the progress bar updates frequently
+    # without ballooning IPC overhead. Cap batch size to keep memory bounded.
+    target_batches = max(n_jobs * 20, 50)
+    batch_size = max(1, min(2000, math.ceil(len(molecules) / target_batches))) if molecules else 1
     batches_binary = [
         [(mol.ToBinary(_PICKLE_PROPS), name) for mol, name in molecules[i:i + batch_size]]
         for i in range(0, len(molecules), batch_size)
@@ -1188,24 +1202,39 @@ def main():
               f"Falling back to --jobs 1.")
         n_jobs = 1
 
-    if n_jobs > 1:
-        with Pool(processes=n_jobs) as pool:
-            all_results = pool.map(_pool_worker, batches_binary)
+    pool = Pool(processes=n_jobs) if n_jobs > 1 else None
+    if pool is not None:
+        result_iter = pool.imap_unordered(_pool_worker, batches_binary)
     else:
-        all_results = [_pool_worker(bb) for bb in batches_binary]
+        result_iter = (_pool_worker(bb) for bb in batches_binary)
 
-    for batch_results in all_results:
-        for mol_b, name, reason, props in batch_results:
-            if reason is None:
-                write_mol(Chem.Mol(mol_b), name)
-                n_pass += 1
-                for prop, val in props.items():
-                    prop_lists.setdefault(prop, []).append(val)
-            else:
-                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-                n_fail += 1
-                for prop, val in props.items():
-                    rej_prop_lists.setdefault(prop, []).append(val)
+    pbar = None
+    if _TQDM:
+        pbar = tqdm(total=len(molecules), desc="  Filtering",
+                    unit=" mol", file=sys.stderr,
+                    disable=not sys.stderr.isatty(), leave=False)
+
+    try:
+        for batch_results in result_iter:
+            for mol_b, name, reason, props in batch_results:
+                if reason is None:
+                    write_mol(Chem.Mol(mol_b), name)
+                    n_pass += 1
+                    for prop, val in props.items():
+                        prop_lists.setdefault(prop, []).append(val)
+                else:
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                    n_fail += 1
+                    for prop, val in props.items():
+                        rej_prop_lists.setdefault(prop, []).append(val)
+            if pbar is not None:
+                pbar.update(len(batch_results))
+    finally:
+        if pbar is not None:
+            pbar.close()
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     close_out()
 
