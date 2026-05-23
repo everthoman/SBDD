@@ -573,7 +573,7 @@ def _read_input(path: Path) -> "tuple[list, list[dict]]":
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="ligprep.py", description=__doc__, formatter_class=_HelpFmt,
+        description=__doc__, formatter_class=_HelpFmt,
     )
     input_arg = p.add_argument(
         "-i", "--input", type=Path, required=True, metavar="FILE",

@@ -474,7 +474,6 @@ def _add_common_args(p):
 
 def make_parser():
     parser = argparse.ArgumentParser(
-        prog="gnina.py",
         description="GNINA docking: htvs (CPU-only) · sp (GPU) · xp (GPU + CNN refinement)",
         formatter_class=RawDescriptionRichHelpFormatter,
         epilog="""

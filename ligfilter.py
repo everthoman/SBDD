@@ -900,7 +900,6 @@ def main():
         _fatal("RDKit is required:  conda install -c conda-forge rdkit")
 
     p = argparse.ArgumentParser(
-        prog='ligfilter.py',
         description=__doc__,
         formatter_class=_HelpFmt,
     )
