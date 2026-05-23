@@ -117,6 +117,35 @@ def format_time(seconds: float) -> str:
 
 # ─── Molecule I/O ─────────────────────────────────────────────────────────────
 
+_HEADER_KEYWORDS = {'smiles', 'smi', 'smile', 'mol', 'structure',
+                    'canonical_smiles', 'cansmi', 'isomeric_smiles'}
+
+
+def _split_smiles_line(line: str) -> List[str]:
+    """Split a SMILES-file line into stripped fields.
+
+    Splits on tab when present (multi-column TSV); otherwise on commas while
+    treating '|...|' CXSMILES enhanced-stereo blocks as a single token so
+    embedded commas (e.g. '|&1:3,7,r|') survive into the SMILES field.
+    """
+    if '\t' in line:
+        return [p.strip() for p in line.split('\t')]
+    if ',' not in line:
+        return [line.strip()]
+    parts, buf, in_cx = [], [], False
+    for ch in line:
+        if ch == '|':
+            in_cx = not in_cx
+            buf.append(ch)
+        elif ch == ',' and not in_cx:
+            parts.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append(''.join(buf).strip())
+    return parts
+
+
 def _detect_smiles_col(path: Path) -> int:
     """Scan the first data rows and return the 0-based index of the SMILES column.
 
@@ -130,7 +159,9 @@ def _detect_smiles_col(path: Path) -> int:
             line = raw.strip()
             if not line or line.startswith('#'):
                 continue
-            parts = [p.strip() for p in line.replace(',', '\t').split('\t')]
+            if line.startswith('==>') and line.endswith('<=='):
+                continue
+            parts = _split_smiles_line(line)
             valid = {i: Chem.MolFromSmiles(v) is not None for i, v in enumerate(parts)}
             if not any(valid.values()):
                 continue  # header or unparseable row
@@ -195,7 +226,11 @@ def _iter_smiles(path: Path, smiles_col=None, name_col=None,
             line = raw.strip()
             if not line or line.startswith('#'):
                 continue
-            parts = [p.strip() for p in line.replace(',', '\t').split('\t')]
+            # `head`/`tail`-concatenation markers — silently skip wherever they appear
+            if line.startswith('==>') and line.endswith('<=='):
+                _info(f"Line {lineno}: skipping marker ({line!r})")
+                continue
+            parts = _split_smiles_line(line)
 
             # ── Header handling ───────────────────────────────────────────
             if not header_consumed:
@@ -214,6 +249,12 @@ def _iter_smiles(path: Path, smiles_col=None, name_col=None,
                         header_consumed = True
                         continue
                     header_consumed = True
+
+            # Repeated column-header row (e.g. from `head`-concatenated files):
+            # silently skip if the SMILES field is a known header keyword.
+            if smi_idx < len(parts) and parts[smi_idx].lower() in _HEADER_KEYWORDS:
+                _info(f"Line {lineno}: skipping column header ({parts[smi_idx]!r})")
+                continue
 
             # ── Auto name column (determined once from first data row) ─────
             if auto_name and nam_idx is None:
@@ -629,9 +670,15 @@ def _make_qed_filter(lo: Optional[float], hi: Optional[float]):
 
 
 def _make_chiral_filter(lo: Optional[float], hi: Optional[float]):
-    """Return a chiral-centre count filter (specified + unspecified stereocenters)."""
+    """Return a chiral-centre count filter (specified + unspecified stereocenters).
+
+    Uses FindMolChiralCenters which handles its own stereo perception — robust
+    after the ToBinary roundtrip used to ship mols to worker processes
+    (CalcNumAtomStereoCenters raises post-roundtrip because the CIP-perception
+    flag is not pickled).
+    """
     def _filt(mol, _args):
-        n = rdMolDescriptors.CalcNumAtomStereoCenters(mol)
+        n = len(Chem.FindMolChiralCenters(mol, includeUnassigned=True))
         if lo is not None and n < lo:
             return f"Chiral {n} < {int(lo)}"
         if hi is not None and n > hi:
@@ -701,7 +748,12 @@ def _make_ha_filter(lo: Optional[float], hi: Optional[float]):
 
 
 def _mol_props(mol: Chem.Mol) -> dict:
-    """Return a dict of calculated properties for a molecule."""
+    """Return a dict of calculated properties for a molecule.
+
+    'Chiral' counts both specified and unspecified stereocentres via
+    FindMolChiralCenters — CalcNumAtomStereoCenters raises after the ToBinary
+    roundtrip used for worker transfer (CIP-perception state is not pickled).
+    """
     return {
         'MW':     Descriptors.MolWt(mol),
         'LogP':   Crippen.MolLogP(mol),
@@ -710,7 +762,7 @@ def _mol_props(mol: Chem.Mol) -> dict:
         'RB':     rdMolDescriptors.CalcNumRotatableBonds(mol),
         'TPSA':   rdMolDescriptors.CalcTPSA(mol),
         'QED':    QED.qed(mol),
-        'Chiral': rdMolDescriptors.CalcNumAtomStereoCenters(mol),
+        'Chiral': len(Chem.FindMolChiralCenters(mol, includeUnassigned=True)),
         'HA':     float(mol.GetNumHeavyAtoms()),
     }
 
