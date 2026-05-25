@@ -123,7 +123,7 @@ _INTERACTION_NAMES = {
     "clash_ugly": "clash_ugly",
 }
 
-_AUTOSPLIT_PREFIX = "lig"
+_AUTOSPLIT_PREFIX = "obj"
 
 def _track(name):
     _created_objects.add(name)
@@ -1315,15 +1315,14 @@ def _auto_split_ligands(ligands_sel):
     existing = set(cmd.get_names("objects"))
     created = []
     info = []
+    next_idx = [1]   # shared counter so each object gets the next free obj## slot
     for i, (chain, resn, resi) in enumerate(unique):
-        # Use sequential numbers only — PyMOL's selection lexer splits on '_',
-        # so a resn like "7C6" between underscores would start with a digit and
-        # break the parser when the object name is used as a selection.
-        name = f"{_AUTOSPLIT_PREFIX}{i + 1}"
-        base, n = name, 0
-        while name in existing and name not in _created_objects:
-            n += 1
-            name = f"{base}_{n}"
+        # Mirror PyMOL's own obj01/obj02/... naming for manually extracted objects.
+        # Scan upward so collisions with existing objects always yield obj## (never obj01_1).
+        while (name := f"{_AUTOSPLIT_PREFIX}{next_idx[0]:02d}") in existing \
+                and name not in _created_objects:
+            next_idx[0] += 1
+        next_idx[0] += 1
         chain_part = f"chain {chain} and " if chain.strip() else ""
         sel = f"({ligands_sel}) and {chain_part}resn {resn} and resi {resi}"
         try:
