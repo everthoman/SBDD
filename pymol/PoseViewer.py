@@ -854,21 +854,43 @@ def _lig_union(ligand_sels):
 # Residue shell
 # ---------------------------------------------------------------------------
 
-_SURF_RESIDUE_COLORS = [
-    ("wheat",     "ALA+VAL+LEU+ILE+MET+PHE+TRP+PRO"),   # hydrophobic
-    ("palegreen", "SER+THR+TYR+CYS+ASN+GLN"),            # polar
-    ("tv_blue",   "ARG+LYS+HIS+HID+HIE+HIP"),            # positive charged
-    ("tv_red",    "ASP+GLU"),                             # negative charged
-]
+# Atom-name-based surface coloring: colors the functional atoms, not whole residues.
+# All C atoms → wheat; specific charged/polar O/N/S atoms get their own color.
+_SURF_POS_N  = ("(resn ARG and name NH1+NH2+NE) or "
+                "(resn LYS and name NZ) or "
+                "(resn HIS+HID+HIE+HIP and name ND1+NE2)")
+
+_SURF_NEG_O  = ("(resn ASP and name OD1+OD2) or "
+                "(resn GLU and name OE1+OE2)")
+
+_SURF_POLAR  = ("(resn SER and name OG) or "
+                "(resn THR and name OG1) or "
+                "(resn TYR and name OH) or "
+                "(resn ASN and name OD1+ND2) or "
+                "(resn GLN and name OE1+NE2) or "
+                "(resn TRP and name NE1) or "
+                "(resn CYS and name SG) or "
+                "name O+N")          # backbone carbonyl O and amide N
+
 
 def _color_surface_by_type(surf_obj):
-    """Color surface atoms by residue type (hydrophobic/polar/charged); grey for others."""
+    """Color surface by local atom chemistry.
+
+    All C atoms → wheat (hydrophobic); charged N → blue; charged O → red;
+    polar O/N/S (hydroxyl, amide, backbone) → palegreen; rest → grey80.
+    Clears any per-object surface_color override so atom colors take effect.
+    """
+    try: cmd.unset("surface_color", surf_obj)
+    except Exception: pass
     cmd.color("grey80", surf_obj)
-    for color, resns in _SURF_RESIDUE_COLORS:
-        try:
-            cmd.color(color, f"({surf_obj}) and resn {resns}")
-        except Exception:
-            pass
+    try: cmd.color("wheat",     f"({surf_obj}) and elem C")
+    except Exception: pass
+    try: cmd.color("palegreen", f"({surf_obj}) and ({_SURF_POLAR})")
+    except Exception: pass
+    try: cmd.color("tv_blue",   f"({surf_obj}) and ({_SURF_POS_N})")
+    except Exception: pass
+    try: cmd.color("tv_red",    f"({surf_obj}) and ({_SURF_NEG_O})")
+    except Exception: pass
 
 
 def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
