@@ -1314,9 +1314,12 @@ def _auto_split_ligands(ligands_sel):
 
     existing = set(cmd.get_names("objects"))
     created = []
-    for chain, resn, resi in unique:
-        safe = f"{resn}_{chain}_{resi}".replace(" ", "").replace("/", "_")
-        name = f"{_AUTOSPLIT_PREFIX}{safe}"
+    info = []
+    for i, (chain, resn, resi) in enumerate(unique):
+        # Use sequential numbers only — PyMOL's selection lexer splits on '_',
+        # so a resn like "7C6" between underscores would start with a digit and
+        # break the parser when the object name is used as a selection.
+        name = f"{_AUTOSPLIT_PREFIX}{i + 1}"
         base, n = name, 0
         while name in existing and name not in _created_objects:
             n += 1
@@ -1328,11 +1331,12 @@ def _auto_split_ligands(ligands_sel):
             _track(name)
             existing.add(name)
             created.append(name)
+            info.append(f"{name}({resn}/{chain}/{resi})")
         except Exception as e:
             print(f"PoseViewer: could not extract '{name}': {e}")
 
     if created:
-        print(f"PoseViewer: auto-split {len(created)} ligand(s): {', '.join(created)}")
+        print(f"PoseViewer: auto-split {len(created)} ligand(s): {', '.join(info)}")
     return created
 
 
