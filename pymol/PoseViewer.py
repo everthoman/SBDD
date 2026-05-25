@@ -1484,9 +1484,7 @@ EXAMPLES
 
 
 def _print_summary():
-    """Print summary to console only when the GUI is not open."""
-    if _gui_window is None:
-        print(_stepper.summary())
+    print(_stepper.summary())
 
 def ci_next():
     _stepper.next(); _print_summary()
