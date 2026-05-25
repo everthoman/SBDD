@@ -123,7 +123,7 @@ _INTERACTION_NAMES = {
     "clash_ugly": "clash_ugly",
 }
 
-_AUTOSPLIT_PREFIX = "pv_lig_"
+_AUTOSPLIT_PREFIX = "lig_"
 
 def _track(name):
     _created_objects.add(name)
