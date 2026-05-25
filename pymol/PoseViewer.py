@@ -339,6 +339,7 @@ def _get_aromatic_ch_atoms(model, rings, adj):
 class InteractionResult:
     def __init__(self):
         self.hbond_count: int = 0   # set by visualize() from cmd.distance return value
+        self.hbonds: List[dict] = []
         self.halogen: List[dict] = []
         self.salt_bridges: List[dict] = []
         self.arom_hbonds: List[dict] = []
@@ -394,6 +395,11 @@ def detect_interactions(
         for pi, pa, pc in prot_atoms:
             pe = _el(pa)
             d = _dist(lc, pc)
+
+            if le in HBOND_ELEMENTS and pe in HBOND_ELEMENTS and d <= 3.5:
+                result.hbonds.append({
+                    "p1": lc, "p2": pc, "dist": d,
+                    "info1": _il(la), "info2": _ip(pa)})
 
             if do_halogen and d <= HALOGEN_DIST_MAX:
                 if ((le in HALOGEN_DONORS and pe in HALOGEN_ACCEPTORS) or
@@ -567,6 +573,7 @@ def detect_interactions(
                 out.append(it)
         return out
 
+    result.hbonds       = _dedup(result.hbonds)
     result.halogen      = _dedup(result.halogen)
     result.salt_bridges = _dedup(result.salt_bridges)
     result.arom_hbonds  = _dedup(result.arom_hbonds)
@@ -1214,9 +1221,7 @@ class LigandStepper:
         lines = [f"=== {self._label()} "
                  f"({self.current_index + 1}/{self._count()}) ==="]
 
-        # H-bond count stored by visualize() from cmd.distance return value
-        if r.hbond_count > 0:
-            lines.append(f"\nH-bonds: {r.hbond_count} (PyMOL polar contacts)")
+        _s("H-bonds", r.hbonds)
 
         def _s(title, items, extra_fn=None):
             if not items: return
@@ -1238,9 +1243,9 @@ class LigandStepper:
         _s("Clash ugly", r.clash_ugly)
 
         total = sum(len(getattr(r, a)) for a in (
-            "halogen","salt_bridges","arom_hbonds",
+            "hbonds","halogen","salt_bridges","arom_hbonds",
             "pipi","pi_cation","clash_good","clash_bad","clash_ugly"))
-        if total == 0 and r.hbond_count == 0:
+        if total == 0:
             lines.append("  No interactions found.")
         return "\n".join(lines)
 
