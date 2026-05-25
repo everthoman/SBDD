@@ -1,4 +1,4 @@
-# PoseViewer v1.3
+# PoseViewer v1.4
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -14,6 +14,9 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Auto-split**: load any PDB with multiple HETATM ligands and PoseViewer automatically separates them into individual objects for per-ligand browsing and per-pocket surface display
 - **Compare mode**: select any two poses simultaneously — including pose #3 of ligand A vs pose #7 of ligand B — to overlay them in the binding site with distinct colors
 - Per-ligand pocket surface: residue shell, CA labels, and transparent surface update to the current ligand's binding site in objects mode
+- **Residue-colored surface**: pocket surface is colored by residue type (hydrophobic/polar/charged) rather than flat grey
+- **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
+- **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks persist across navigation and are visible in the pose table
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
 - Pose data table: sortable, clickable table of docking scores and SD properties per pose
 - Qt GUI panel with collapsible groups and per-type interaction toggles
@@ -27,6 +30,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 | Non-covalent | Halogen bonds | Purple |
 | Non-covalent | Salt bridges | Magenta |
 | Non-covalent | Aromatic H-bonds | Green |
+| Non-covalent | Water bridges | Light blue |
 | Pi | Pi-pi stacking (face-to-face & edge-to-face) | Cyan |
 | Pi | Pi-cation | Green |
 | Contacts | Good contacts (≤ 1.30× VDW sum, heavy atoms) | Green |
@@ -36,6 +40,16 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 H-bond dashes are drawn via PyMOL's `cmd.distance(mode=2)` polar contact detection. Individual H-bond pairs are also listed in the console summary via geometric D-A distance detection (N/O/S/F within 3.5 Å). All other interaction types are detected geometrically. Non-polar hydrogens (C-H) are excluded from clash detection. Contacts/clashes are hidden by default.
 
 Reference ligand interactions are drawn with the same color scheme but thinner dashes (65% radius) to distinguish them from pose interactions.
+
+### Surface residue color scheme
+
+| Color | Residue type | Residues |
+|---|---|---|
+| Wheat | Hydrophobic | ALA, VAL, LEU, ILE, MET, PHE, TRP, PRO |
+| Pale green | Polar | SER, THR, TYR, CYS, ASN, GLN |
+| Blue | Positive charged | ARG, LYS, HIS |
+| Red | Negative charged | ASP, GLU |
+| Grey | Other | GLY, etc. |
 
 ---
 
@@ -83,6 +97,7 @@ ci_gui
 | `ci_update` | Re-detect interactions for current pose |
 | `ci_refresh` | Sync panel to current PyMOL state |
 | `ci_load_scores <path>` | Load per-pose SD properties from an SDF file |
+| `ci_bookmarks` | List all bookmarked poses to the console |
 | `ci_clear` | Remove all PoseViewer objects |
 
 ### `ci_setup` parameters
@@ -204,6 +219,7 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 | Halogen bonds | Cl/Br/I donor ··· O/N/S acceptor, ≤ 3.5 Å |
 | Salt bridges | Formal charged N ··· Asp/Glu O or Arg/Lys/His N ··· formal charged O, ≤ 4.0 Å |
 | Aromatic H-bonds | Aromatic C ··· O/N/S acceptor, ≤ 3.5 Å, C-H···A angle > 120° |
+| Water bridges | HOH oxygen simultaneously within 3.5 Å of ligand N/O/S/F and protein N/O/S/F |
 | Pi-pi face-to-face | Centroid distance ≤ 4.8 Å, normal angle ≤ 40° |
 | Pi-pi edge-to-face | Centroid distance ≤ 5.5 Å, normal angle 45–90° |
 | Pi-cation | Ring centroid ··· Arg CZ / Lys NZ or formal+ atom, ≤ 6.0 Å |
@@ -221,3 +237,5 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 - **Open-source PyMOL**: SDF data fields are stripped on load. Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
 - The shell shows residues within 5 Å of the current ligand as lines with CA labels; the surface covers atoms within 5 Å. In objects mode both update per ligand step; in states mode they are computed once at setup
 - Duplicate interactions caused by alternate conformations (altloc atoms) in PDB structures are automatically removed by spatial deduplication
+- Water bridges require HOH residues in the loaded structure. HOH is searched globally (not limited to `polymer.protein`), so crystallographic waters in the protein PDB are detected even when the protein selection excludes them
+- Bookmarks are per-session only and are cleared by `ci_clear` or a new `ci_setup`

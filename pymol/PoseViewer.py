@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.3
+PoseViewer - PyMOL Plugin  v1.4
 ================================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -51,6 +51,7 @@ COLORS = {
     "ci_clash_good":  (0.20, 0.80, 0.20),
     "ci_clash_bad":   (1.00, 0.60, 0.00),
     "ci_clash_ugly":  (1.00, 0.15, 0.15),
+    "ci_water":       (0.30, 0.80, 0.95),
 }
 
 def _register_colors():
@@ -121,6 +122,7 @@ _INTERACTION_NAMES = {
     "clash_good": "clash_good",
     "clash_bad": "clash_bad",
     "clash_ugly": "clash_ugly",
+    "water":      "water_bridges",
 }
 
 _AUTOSPLIT_PREFIX = "obj"
@@ -348,6 +350,7 @@ class InteractionResult:
         self.clash_good: List[dict] = []
         self.clash_bad: List[dict] = []
         self.clash_ugly: List[dict] = []
+        self.water_bridges: List[dict] = []
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +362,7 @@ def detect_interactions(
     do_halogen=True, do_salt=True, do_arom_hb=True,
     do_pipi=True, do_pi_cation=True,
     do_clash_good=False, do_clash_bad=False, do_clash_ugly=False,
+    do_water=True,
 ) -> InteractionResult:
 
     result = InteractionResult()
@@ -583,6 +587,57 @@ def detect_interactions(
     result.clash_bad    = _dedup(result.clash_bad)
     result.clash_ugly   = _dedup(result.clash_ugly)
 
+    # --- Water-mediated H-bonds ---
+    if do_water:
+        _TMP_W = "_ci_tmp_w"
+        try:
+            cmd.select(_TMP_W,
+                       f"(resn HOH+WAT+H2O+SOL) within 3.5 of ({lig_sel})")
+            wat_model = cmd.get_model(_TMP_W, state=1)
+            cmd.delete(_TMP_W)
+            for wa in wat_model.atom:
+                if wa.symbol.strip().capitalize() != "O":
+                    continue
+                wc = tuple(wa.coord)
+                lig_match = min(
+                    ((la, lc, _dist(wc, lc)) for _, la, lc in lig_atoms
+                     if _el(la) in HBOND_ELEMENTS),
+                    key=lambda x: x[2], default=None)
+                if lig_match is None or lig_match[2] > 3.5:
+                    continue
+                prot_match = min(
+                    ((pa, pc, _dist(wc, pc)) for _, pa, pc in prot_atoms
+                     if _el(pa) in HBOND_ELEMENTS),
+                    key=lambda x: x[2], default=None)
+                if prot_match is None or prot_match[2] > 3.5:
+                    continue
+                la, lc, dl = lig_match
+                pa, pc, dp = prot_match
+                result.water_bridges.append({
+                    "p1": lc, "p_wat": wc, "p2": pc,
+                    "dist": dl + dp, "d_lig": dl, "d_prot": dp,
+                    "info1": _il(la), "info2": _ip(pa),
+                    "info_wat": f"HOH {wa.chain}/{wa.resi}",
+                })
+        except Exception:
+            pass
+        finally:
+            try: cmd.delete(_TMP_W)
+            except Exception: pass
+
+        def _dedup_wb(items):
+            seen = set()
+            out = []
+            for it in items:
+                key = (tuple(round(x, 1) for x in it["p1"]),
+                       tuple(round(x, 1) for x in it["p_wat"]),
+                       tuple(round(x, 1) for x in it["p2"]))
+                if key not in seen:
+                    seen.add(key); out.append(it)
+            return out
+
+        result.water_bridges = _dedup_wb(result.water_bridges)
+
     return result
 
 
@@ -691,6 +746,18 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
     _draw(result.clash_ugly,   N["clash_ugly"],  "ci_clash_ugly",
           gap=0.15, length=0.10, radius=DASH_RADIUS * r_scale)
 
+    # Water bridges: two dashes per bridge (lig→water, water→prot)
+    wb_name = name_prefix + _INTERACTION_NAMES["water"]
+    if result.water_bridges:
+        _track(wb_name)
+        for b in result.water_bridges:
+            _add_pair(pts, pid, b["p1"],    b["p_wat"], wb_name)
+            pid += 1
+            _add_pair(pts, pid, b["p_wat"], b["p2"],    wb_name)
+            pid += 1
+        _style(wb_name, "ci_water",
+               radius=DASH_RADIUS * 0.8 * r_scale, gap=0.20, length=0.15)
+
     # Contacts/clashes: never show distance labels (too cluttered)
     for q in ("clash_good", "clash_bad", "clash_ugly"):
         if N[q] in _created_objects:
@@ -787,6 +854,23 @@ def _lig_union(ligand_sels):
 # Residue shell
 # ---------------------------------------------------------------------------
 
+_SURF_RESIDUE_COLORS = [
+    ("wheat",     "ALA+VAL+LEU+ILE+MET+PHE+TRP+PRO"),   # hydrophobic
+    ("palegreen", "SER+THR+TYR+CYS+ASN+GLN"),            # polar
+    ("tv_blue",   "ARG+LYS+HIS+HID+HIE+HIP"),            # positive charged
+    ("tv_red",    "ASP+GLU"),                             # negative charged
+]
+
+def _color_surface_by_type(surf_obj):
+    """Color surface atoms by residue type (hydrophobic/polar/charged); grey for others."""
+    cmd.color("grey80", surf_obj)
+    for color, resns in _SURF_RESIDUE_COLORS:
+        try:
+            cmd.color(color, f"({surf_obj}) and resn {resns}")
+        except Exception:
+            pass
+
+
 def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
     global _shell_sel
     lig_union = _lig_union(ligand_sels)
@@ -810,7 +894,10 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
         _track(_OBJ_SURF)
         cmd.hide("everything", _OBJ_SURF)
         cmd.show("surface", _OBJ_SURF)
-        cmd.set("surface_color", "grey80", _OBJ_SURF)
+        if _stepper.color_surf_by_type:
+            _color_surface_by_type(_OBJ_SURF)
+        else:
+            cmd.set("surface_color", "grey80", _OBJ_SURF)
         cmd.set("transparency", 0.4, _OBJ_SURF)
     except Exception:
         pass
@@ -857,6 +944,9 @@ class LigandStepper:
         self._in_compare:    bool           = False
         self._obj_colors:    Dict[str, str] = {}
         self.show_cmp_hbonds: bool          = False
+        self.show_water: bool               = True
+        self.color_surf_by_type: bool       = True
+        self._bookmarks: Set[int]           = set()
 
     def setup_objects(self, prot, ligs, ref_lig=None):
         self.protein_sel = prot
@@ -1134,7 +1224,8 @@ class LigandStepper:
                 do_pipi=self.show_pipi, do_pi_cation=self.show_pi_cation,
                 do_clash_good=self.show_clash_good,
                 do_clash_bad=self.show_clash_bad,
-                do_clash_ugly=self.show_clash_ugly)
+                do_clash_ugly=self.show_clash_ugly,
+                do_water=self.show_water)
             self.last_result = r
             if self.sdf_records:
                 idx = self.current_index
@@ -1159,7 +1250,8 @@ class LigandStepper:
                         do_pipi=self.show_pipi, do_pi_cation=self.show_pi_cation,
                         do_clash_good=self.show_clash_good,
                         do_clash_bad=self.show_clash_bad,
-                        do_clash_ugly=self.show_clash_ugly)
+                        do_clash_ugly=self.show_clash_ugly,
+                        do_water=self.show_water)
                     visualize(self.ref_ligand, self.protein_sel, r_ref,
                               show_hbonds=self.show_hbonds,
                               show_labels=self.show_labels, state=1,
@@ -1221,8 +1313,6 @@ class LigandStepper:
         lines = [f"=== {self._label()} "
                  f"({self.current_index + 1}/{self._count()}) ==="]
 
-        _s("H-bonds", r.hbonds)
-
         def _s(title, items, extra_fn=None):
             if not items: return
             lines.append(f"\n{title} ({len(items)}):")
@@ -1232,6 +1322,7 @@ class LigandStepper:
                 i2 = it.get("info2", "")
                 lines.append(f"  {i1} -- {i2}  {it['dist']:.2f} A{ex}")
 
+        _s("H-bonds", r.hbonds)
         _s("Halogen bonds", r.halogen)
         _s("Salt bridges", r.salt_bridges)
         _s("Aromatic H-bonds", r.arom_hbonds)
@@ -1242,9 +1333,16 @@ class LigandStepper:
         _s("Clash bad", r.clash_bad)
         _s("Clash ugly", r.clash_ugly)
 
+        if r.water_bridges:
+            lines.append(f"\nWater bridges ({len(r.water_bridges)}):")
+            for b in r.water_bridges:
+                lines.append(f"  {b['info1']} -- {b['info_wat']} -- {b['info2']}"
+                             f"  {b['d_lig']:.2f}+{b['d_prot']:.2f} A")
+
         total = sum(len(getattr(r, a)) for a in (
             "hbonds","halogen","salt_bridges","arom_hbonds",
-            "pipi","pi_cation","clash_good","clash_bad","clash_ugly"))
+            "pipi","pi_cation","clash_good","clash_bad","clash_ugly",
+            "water_bridges"))
         if total == 0:
             lines.append("  No interactions found.")
         return "\n".join(lines)
@@ -1517,6 +1615,19 @@ USAGE
 def ci_clear():
     _clear_all(); _unbind_keys(); print("PoseViewer: cleared.")
 
+def ci_bookmarks():
+    """List all bookmarked poses to the console."""
+    bm = sorted(_stepper._bookmarks)
+    if not bm:
+        print("PoseViewer: no bookmarks.")
+        return
+    print(f"PoseViewer: {len(bm)} bookmark(s):")
+    for i in bm:
+        if 0 <= i < len(_stepper.poses):
+            obj, st = _stepper.poses[i]
+            label = f"{obj} state {st}" if cmd.count_states(obj) > 1 else obj
+            print(f"  [{i + 1}] {label}")
+
 def ci_gui():
     _open_gui()
 
@@ -1528,6 +1639,7 @@ cmd.extend("ci_update", ci_update)
 cmd.extend("ci_refresh", ci_refresh)
 cmd.extend("ci_load_scores", ci_load_scores)
 cmd.extend("ci_clear", ci_clear)
+cmd.extend("ci_bookmarks", ci_bookmarks)
 cmd.extend("ci_gui", ci_gui)
 
 
@@ -1630,6 +1742,12 @@ def _open_gui():
     cb_cmp_hb = QtWidgets.QCheckBox("H-bonds in compare mode")
     cb_cmp_hb.setChecked(False)
     l_n.addWidget(cb_cmp_hb)
+    hl_bm = QtWidgets.QHBoxLayout()
+    b_bm = QtWidgets.QPushButton("☆ Bookmark")
+    b_bm.setFixedWidth(120)
+    b_bm_list = QtWidgets.QPushButton("List bookmarks")
+    hl_bm.addWidget(b_bm); hl_bm.addWidget(b_bm_list); hl_bm.addStretch()
+    l_n.addLayout(hl_bm)
     top_l.addWidget(g_n)
 
     # Reference ligand
@@ -1728,6 +1846,7 @@ def _open_gui():
     cb_xb = _cb(l1, "Halogen bonds",   "#9933e6")
     cb_sb = _cb(l1, "Salt bridges",    "#e633e6")
     cb_ah = _cb(l1, "Aromatic H-Bond", "#4dd97f")
+    cb_wb = _cb(l1, "Water bridges",   "#4dccf2")
     bot_l.addWidget(g1)
 
     # Pi interactions
@@ -1748,9 +1867,10 @@ def _open_gui():
     cb_lb   = QtWidgets.QCheckBox("Show distance labels");  cb_lb.setChecked(True)
     cb_surf = QtWidgets.QCheckBox("Show surface");          cb_surf.setChecked(True)
     cb_rlbl = QtWidgets.QCheckBox("Show residue labels");   cb_rlbl.setChecked(True)
-    cb_zoom = QtWidgets.QCheckBox("Auto-zoom to pose");     cb_zoom.setChecked(True)
+    cb_zoom = QtWidgets.QCheckBox("Auto-zoom to pose");           cb_zoom.setChecked(True)
     cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
-    for _w in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h):
+    cb_cstype = QtWidgets.QCheckBox("Color surface by residue type"); cb_cstype.setChecked(True)
+    for _w in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h, cb_cstype):
         l_disp.addWidget(_w)
     bot_l.addWidget(g_disp)
     bot_l.addStretch()
@@ -1774,15 +1894,22 @@ def _open_gui():
             for k in p:
                 if k not in seen:
                     seen[k] = None
-        cols = list(seen.keys())
-        cols = (["_name"] if "_name" in cols else []) + [
-            c for c in cols if c != "_name" and "rank" not in c.lower()]
-        tw_pd.setColumnCount(len(cols))
-        headers = ["Ligand_ID" if c == "_name" else c for c in cols]
+        data_cols = list(seen.keys())
+        data_cols = (["_name"] if "_name" in data_cols else []) + [
+            c for c in data_cols if c != "_name" and "rank" not in c.lower()]
+        # Column 0 = bookmark ★, then data columns
+        tw_pd.setColumnCount(1 + len(data_cols))
+        headers = ["★"] + ["Ligand_ID" if c == "_name" else c for c in data_cols]
         tw_pd.setHorizontalHeaderLabels(headers)
         tw_pd.setRowCount(len(all_props))
         for r, props in enumerate(all_props):
-            for c, key in enumerate(cols):
+            # Bookmark column
+            bm_item = _SortItem("★" if r in _stepper._bookmarks else "")
+            bm_item.setData(QtCore.Qt.UserRole, r)
+            bm_item.setTextAlignment(QtCore.Qt.AlignCenter | QtCore.Qt.AlignVCenter)
+            tw_pd.setItem(r, 0, bm_item)
+            # Data columns
+            for c, key in enumerate(data_cols):
                 val = props.get(key, "")
                 if isinstance(val, int):
                     display = str(val)
@@ -1798,11 +1925,21 @@ def _open_gui():
                     item.setData(QtCore.Qt.UserRole + 1, val)
                     item.setTextAlignment(
                         QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-                tw_pd.setItem(r, c, item)
+                tw_pd.setItem(r, 1 + c, item)
         tw_pd.resizeColumnsToContents()
+        tw_pd.setColumnWidth(0, 24)  # bookmark column stays compact
         tw_pd.setSortingEnabled(True)
         _sel_order.clear()
         _highlight_current_row()
+
+    def _update_bookmark_col():
+        """Refresh ★ column text to reflect current _stepper._bookmarks."""
+        for r in range(tw_pd.rowCount()):
+            item0 = tw_pd.item(r, 0)
+            if item0 is not None:
+                pi = item0.data(QtCore.Qt.UserRole)
+                if pi is not None:
+                    item0.setText("★" if pi in _stepper._bookmarks else "")
 
     def _highlight_current_row():
         """Sync table selection to current single-pose index (no-op in compare mode)."""
@@ -1871,8 +2008,12 @@ def _open_gui():
                                 f"({_stepper.current_index + 1}/{c})")
                 sp.setMaximum(c)
                 sp.setValue(_stepper.current_index + 1)
+                cur = _stepper.current_index
+                b_bm.setText("★ Unbookmark" if cur in _stepper._bookmarks
+                             else "☆ Bookmark")
             else:
                 lbl.setText("Ready - click Setup")
+                b_bm.setText("☆ Bookmark")
             if g_pd.isChecked() and not _stepper._in_compare:
                 _highlight_current_row()
         except RuntimeError:
@@ -2038,6 +2179,7 @@ def _open_gui():
     cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen"))
     cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt"))
     cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb"))
+    cb_wb.stateChanged.connect(_tog(cb_wb, "show_water"))
     cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi"))
     cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation"))
     cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good"))
@@ -2045,9 +2187,34 @@ def _open_gui():
     cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly"))
     cb_zoom.stateChanged.connect(lambda s: setattr(_stepper, "auto_zoom", cb_zoom.isChecked()))
 
+    def do_bookmark():
+        cur = _stepper.current_index
+        if cur in _stepper._bookmarks:
+            _stepper._bookmarks.discard(cur)
+        else:
+            _stepper._bookmarks.add(cur)
+        update_ui()
+        _update_bookmark_col()
+
+    def do_bm_list():
+        ci_bookmarks()
+
+    def do_toggle_cstype(state=None):
+        _stepper.color_surf_by_type = cb_cstype.isChecked()
+        if _OBJ_SURF in _created_objects:
+            if _stepper.color_surf_by_type:
+                _color_surface_by_type(_OBJ_SURF)
+            else:
+                cmd.set("surface_color", "grey80", _OBJ_SURF)
+    cb_cstype.stateChanged.connect(do_toggle_cstype)
+
+    b_bm.clicked.connect(do_bookmark)
+    b_bm_list.clicked.connect(do_bm_list)
+
     g1_en.stateChanged.connect(_group_tog(g1_en, [
         (cb_hb, "show_hbonds"), (cb_xb, "show_halogen"),
         (cb_sb, "show_salt"),   (cb_ah, "show_arom_hb"),
+        (cb_wb, "show_water"),
     ]))
     g2_en.stateChanged.connect(_group_tog(g2_en, [
         (cb_pp, "show_pipi"), (cb_pc, "show_pi_cation"),
@@ -2075,15 +2242,17 @@ def _open_gui():
     cb_rlbl.stateChanged.connect(do_toggle_rlbl)
 
     def do_disp_group_tog(checked):
-        for cb in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h):
+        for cb in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h, cb_cstype):
             cb.blockSignals(True)
             cb.setChecked(checked)
             cb.blockSignals(False)
         _stepper.show_labels = checked
         _stepper.show_lig_h  = checked
         _stepper.auto_zoom   = checked
+        _stepper.color_surf_by_type = checked
         do_toggle_surf()
         do_toggle_rlbl()
+        do_toggle_cstype()
         ci_update(); update_ui()
     g_disp_en.stateChanged.connect(do_disp_group_tog)
 
@@ -2286,7 +2455,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.3"
+__version__ = "1.4"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
