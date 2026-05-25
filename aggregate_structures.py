@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from rdkit.Chem.inchi import MolToInchi
 from rdkit.Chem import InchiToInchiKey
 
@@ -103,6 +104,7 @@ def write_sdf_gz(mols_data: list, outpath: str):
                 elif mol.HasProp(vendor):
                     mol.ClearProp(vendor)
             mol.SetProp("_Name", best_display_name(vendor_ids))
+            AllChem.Compute2DCoords(mol)
             writer.write(mol)
         writer.close()
 
