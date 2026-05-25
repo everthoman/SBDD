@@ -123,6 +123,8 @@ _INTERACTION_NAMES = {
     "clash_ugly": "clash_ugly",
 }
 
+_AUTOSPLIT_PREFIX = "_pv_lig_"
+
 def _track(name):
     _created_objects.add(name)
 
@@ -147,6 +149,14 @@ def _clear_all():
         except Exception: pass
     _created_objects.clear()
     _stepper._cleanup_cmp()
+
+def _cleanup_autosplit():
+    """Delete any auto-split ligand objects from a previous ci_setup call."""
+    for name in list(_created_objects):
+        if name.startswith(_AUTOSPLIT_PREFIX):
+            try: cmd.delete(name)
+            except Exception: pass
+            _created_objects.discard(name)
 
 # ---------------------------------------------------------------------------
 # Vector helpers
@@ -1279,6 +1289,54 @@ def _unbind_keys():
 
 
 # ---------------------------------------------------------------------------
+# Auto-split helper
+# ---------------------------------------------------------------------------
+
+def _auto_split_ligands(ligands_sel):
+    """Extract each unique (chain, resn, resi) in ligands_sel into its own object.
+
+    Returns list of created object names, or [] when only one residue is found.
+    Cleans up any objects created by a previous auto-split call first.
+    """
+    _cleanup_autosplit()
+    try:
+        space = {"residues": []}
+        cmd.iterate(ligands_sel,
+                    "residues.append((chain, resn, resi))",
+                    space=space)
+        unique = list(dict.fromkeys(space["residues"]))
+    except Exception as e:
+        print(f"PoseViewer: auto-split failed: {e}")
+        return []
+
+    if len(unique) <= 1:
+        return []
+
+    existing = set(cmd.get_names("objects"))
+    created = []
+    for chain, resn, resi in unique:
+        safe = f"{resn}_{chain}_{resi}".replace(" ", "").replace("/", "_")
+        name = f"{_AUTOSPLIT_PREFIX}{safe}"
+        base, n = name, 0
+        while name in existing and name not in _created_objects:
+            n += 1
+            name = f"{base}_{n}"
+        chain_part = f"chain {chain} and " if chain.strip() else ""
+        sel = f"({ligands_sel}) and {chain_part}resn {resn} and resi {resi}"
+        try:
+            cmd.create(name, sel)
+            _track(name)
+            existing.add(name)
+            created.append(name)
+        except Exception as e:
+            print(f"PoseViewer: could not extract '{name}': {e}")
+
+    if created:
+        print(f"PoseViewer: auto-split {len(created)} ligand(s): {', '.join(created)}")
+    return created
+
+
+# ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
 
@@ -1322,6 +1380,7 @@ EXAMPLES
         _stepper.setup_states(protein, ligands)
         print(f"PoseViewer: {cmd.count_states(ligands)} states.")
     else:
+        _cleanup_autosplit()
         if "," in ligands:
             ligs = [l.strip() for l in ligands.split(",")]
             ref_lig = None
@@ -1360,8 +1419,13 @@ EXAMPLES
                     ligs    = single_ligs
                     ref_lig = None
             if not ligs:
-                ligs = [ligands]
-                ref_lig = None
+                auto = _auto_split_ligands(ligands)
+                if auto:
+                    ligs = auto
+                    ref_lig = None
+                else:
+                    ligs = [ligands]
+                    ref_lig = None
         _stepper.setup_objects(protein, ligs, ref_lig=ref_lig)
         print(f"PoseViewer: {len(ligs)} ligand(s).")
 
