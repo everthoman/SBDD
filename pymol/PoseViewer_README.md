@@ -1,10 +1,9 @@
-# PoseViewer — beta
+# PoseViewer v1.3
 
-A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review.
+A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
 **Authors:** Evert J. Homan, PhD; Claude (Anthropic)  
-**License:** MIT  
-**Status:** beta
+**License:** MIT
 
 ---
 
@@ -12,17 +11,19 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 
 - Detects and visualizes all major non-covalent protein-ligand interactions
 - Steps through docking poses (multi-state objects) or individual ligand objects
+- **Auto-split**: load any PDB with multiple HETATM ligands and PoseViewer automatically separates them into individual objects for per-ligand browsing and per-pocket surface display
 - **Compare mode**: select any two poses simultaneously — including pose #3 of ligand A vs pose #7 of ligand B — to overlay them in the binding site with distinct colors
-- Residue shell with line representation, CA labels, and a transparent surface
+- Per-ligand pocket surface: residue shell, CA labels, and transparent surface update to the current ligand's binding site in objects mode
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
 - Pose data table: sortable, clickable table of docking scores and SD properties per pose
 - Qt GUI panel with collapsible groups and per-type interaction toggles
+- Interaction summary printed to the PyMOL console on every step
 
 ### Interaction types
 
 | Category | Type | Color |
 |---|---|---|
-| Non-covalent | H-bonds (PyMOL polar contacts) | Yellow |
+| Non-covalent | H-bonds | Yellow |
 | Non-covalent | Halogen bonds | Purple |
 | Non-covalent | Salt bridges | Magenta |
 | Non-covalent | Aromatic H-bonds | Green |
@@ -32,7 +33,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 | Clashes | Bad clashes (< 0.89× VDW sum) | Orange |
 | Clashes | Ugly clashes (< 0.75× VDW sum) | Red |
 
-H-bonds use PyMOL's built-in `cmd.distance(mode=2)` polar contact detection. All other types are detected geometrically. Non-polar hydrogens (C-H) are excluded from clash detection. Contacts/clashes are hidden by default.
+H-bond dashes are drawn via PyMOL's `cmd.distance(mode=2)` polar contact detection. Individual H-bond pairs are also listed in the console summary via geometric D-A distance detection (N/O/S/F within 3.5 Å). All other interaction types are detected geometrically. Non-polar hydrogens (C-H) are excluded from clash detection. Contacts/clashes are hidden by default.
 
 Reference ligand interactions are drawn with the same color scheme but thinner dashes (65% radius) to distinguish them from pose interactions.
 
@@ -54,11 +55,19 @@ ci_gui
 
 ## Quick start
 
-1. Load your protein and ligand(s) into PyMOL
+### Docking poses (multi-state object)
+
+1. Load your protein and docking output into PyMOL
 2. Open the GUI: `ci_gui`
 3. Fill in protein/ligand fields and click **Setup**
-4. Step through poses with **Prev / Next**, arrow keys, or the Go-to spinner
-5. Optionally: specify a scores SDF file to display docking properties per pose
+4. Step through poses with **Prev / Next** or the Go-to spinner
+5. Optionally load a scores SDF to display docking properties per pose
+
+### Multi-ligand PDB (e.g. crystal structure with cofactors)
+
+1. Load the PDB: `load 5VDH.pdb`
+2. Run `ci_gui` and click **Setup** — PoseViewer auto-splits the organic ligands into `obj01`, `obj02`, ... and steps through each with its own pocket surface
+3. No manual extraction needed
 
 ---
 
@@ -97,11 +106,15 @@ ci_load_scores /path/to/gnina_output.sdf
 
 ## Modes
 
-**objects mode** — each ligand is a separate PyMOL object. The plugin cycles through them, enabling one at a time.
+**objects mode** — each ligand is a separate PyMOL object. The plugin cycles through them, enabling one at a time. The pocket surface updates per ligand.
 
-**states mode** — all docking poses are states of a single PyMOL object (e.g. GNINA output). The plugin steps through states.
+**states mode** — all docking poses are states of a single PyMOL object (e.g. GNINA output). The plugin steps through states. The pocket surface is built once at setup (all poses share the same binding site).
 
 **auto mode** — inspects loaded objects. Uses states mode if exactly one object matching the ligand selection has more than one state; otherwise uses objects mode.
+
+### Auto-split
+
+If no separate ligand objects are detected (e.g. a PDB loaded as a single object), `ci_setup` splits the organic selection by `(chain, resn, resi)` into individual PyMOL objects named `obj01`, `obj02`, ... following PyMOL's own extract naming convention. The original atoms in the source object are hidden. Auto-split objects are cleaned up by `ci_clear` or the next `ci_setup`.
 
 ---
 
@@ -113,7 +126,6 @@ ci_load_scores /path/to/gnina_output.sdf
 |---|---|
 | Protein | PyMOL selection for the receptor |
 | Ligand(s) | Object name(s) or selection (comma-separated for objects mode) |
-| Mode | auto / objects / states |
 | Scores (SDF) | Optional path to an SDF file with per-pose SD data tags (e.g. GNINA output). Browse button available. Scores are read directly from the file since open-source PyMOL does not preserve SDF properties on load. |
 
 ### Navigate group
@@ -187,7 +199,8 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 
 | Interaction | Criterion |
 |---|---|
-| H-bonds | PyMOL polar contacts (mode=2) |
+| H-bonds (visual dashes) | PyMOL polar contacts `cmd.distance(mode=2)` |
+| H-bonds (console listing) | N/O/S/F ··· N/O/S/F donor-acceptor distance ≤ 3.5 Å |
 | Halogen bonds | Cl/Br/I donor ··· O/N/S acceptor, ≤ 3.5 Å |
 | Salt bridges | Formal charged N ··· Asp/Glu O or Arg/Lys/His N ··· formal charged O, ≤ 4.0 Å |
 | Aromatic H-bonds | Aromatic C ··· O/N/S acceptor, ≤ 3.5 Å, C-H···A angle > 120° |
@@ -205,5 +218,6 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 - Requires PyMOL with Qt support (PyMOL 2.x+)
 - `numpy` is used if available; falls back to pure Python otherwise
 - **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no scores file needed, leave the Scores field blank
-- **Open-source PyMOL**: SDF data fields are stripped on load (`get_property_list` and `properties` in `iterate` are incentive-only). Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
-- The shell shows residues within 5 Å of any ligand (pose + reference) as lines with CA labels; the surface covers atoms within 5 Å
+- **Open-source PyMOL**: SDF data fields are stripped on load. Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
+- The shell shows residues within 5 Å of the current ligand as lines with CA labels; the surface covers atoms within 5 Å. In objects mode both update per ligand step; in states mode they are computed once at setup
+- Duplicate interactions caused by alternate conformations (altloc atoms) in PDB structures are automatically removed by spatial deduplication
