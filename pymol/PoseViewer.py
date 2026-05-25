@@ -1358,6 +1358,12 @@ def _auto_split_ligands(ligands_sel):
 
     if created:
         print(f"PoseViewer: auto-split {len(created)} ligand(s): {', '.join(info)}")
+        # Suppress the source atoms so the split copies are the sole visible representation.
+        # Without this the original object still shows all ligand atoms including all H.
+        try:
+            cmd.hide("everything", ligands_sel)
+        except Exception:
+            pass
     return created
 
 
