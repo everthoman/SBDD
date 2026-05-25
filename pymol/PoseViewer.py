@@ -564,6 +564,7 @@ def detect_interactions(
 
 def _clear_contacts():
     keep = {_OBJ_SURF}
+    keep.update(n for n in _created_objects if n.startswith(_AUTOSPLIT_PREFIX))
     for name in list(_created_objects):
         if name not in keep:
             try: cmd.delete(name)
