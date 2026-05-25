@@ -844,6 +844,7 @@ class LigandStepper:
         self.show_ref: bool = True
         self.show_pose: bool = True
         self.show_lig_h: bool = False
+        self.show_surface: bool = True
         self._cmp_objs:      List[str]      = []
         self._cmp_indices:   List[int]      = []
         self._in_compare:    bool           = False
@@ -972,6 +973,19 @@ class LigandStepper:
             elif self.ref_ligand and self.show_ref:
                 cmd.zoom(self.ref_ligand, buffer=3.0, animate=1, state=1)
         self._update(obj, state=st)
+        # In objects mode each ligand may sit in a different pocket, so rebuild
+        # the shell/surface around just the current ligand (+ ref if visible).
+        if self.mode == "objects":
+            visible = []
+            if self.show_pose:
+                visible.append(obj)
+            if self.ref_ligand and self.show_ref:
+                visible.append(self.ref_ligand)
+            if visible:
+                _create_shell(self.protein_sel, visible)
+                if not self.show_surface and _OBJ_SURF in _created_objects:
+                    try: cmd.hide("surface", _OBJ_SURF)
+                    except Exception: pass
 
     def _build_obj_colors(self):
         seen = dict.fromkeys(obj for obj, _ in self.poses)
@@ -2040,8 +2054,9 @@ def _open_gui():
     ]))
 
     def do_toggle_surf(state=None):
+        _stepper.show_surface = cb_surf.isChecked()
         if _OBJ_SURF in _created_objects:
-            if cb_surf.isChecked():
+            if _stepper.show_surface:
                 cmd.show("surface", _OBJ_SURF)
             else:
                 cmd.hide("surface", _OBJ_SURF)
