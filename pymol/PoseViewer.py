@@ -123,7 +123,7 @@ _INTERACTION_NAMES = {
     "clash_ugly": "clash_ugly",
 }
 
-_AUTOSPLIT_PREFIX = "_pv_lig_"
+_AUTOSPLIT_PREFIX = "pv_lig_"
 
 def _track(name):
     _created_objects.add(name)
@@ -1841,8 +1841,8 @@ def _open_gui():
         ref_combo.clear()
         ref_combo.addItem("(none)")
         for n in cmd.get_names("objects"):
-            if n.startswith("_ci_") or n in (
-                    _OBJ_PTS, _OBJ_REF_PTS, _OBJ_SURF):
+            if (n.startswith("_ci_") or n.startswith(_AUTOSPLIT_PREFIX)
+                    or n in (_OBJ_PTS, _OBJ_REF_PTS, _OBJ_SURF)):
                 continue
             try:
                 if (cmd.count_atoms(f"{n} and organic") > 0 and
