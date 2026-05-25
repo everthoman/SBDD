@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
 aggregate_structures.py — merge SDF archives, deduplicate by InChIKey,
-and promote vendor IDs from the name field into separate SDF properties.
+and write a merged SDF (with 3D poses + vendor ID properties) and a CSV
+lookup table (SMILES + affinity + per-vendor IDs).
 
 Usage:
-    python aggregate_structures.py [FILE1.sdf.gz FILE2.sdf.gz ...] -o OUTPUT.sdf.gz
+    python aggregate_structures.py [FILE1.sdf.gz FILE2.sdf.gz ...] \
+        [-o OUTPUT.sdf.gz] [--csv OUTPUT.csv]
 """
 
 import argparse
+import csv
 import gzip
 import re
 import sys
@@ -34,10 +37,8 @@ VENDOR_PATTERNS = {
     "LabNetwork_ID":  re.compile(r'^LN\d{6,}$'),
 }
 
-# InChIKey pattern — names matching this are structure identifiers, not catalog IDs
 _INCHIKEY_RE = re.compile(r'^[A-Z]{14}-[A-Z]{10}-[A-Z]$')
 
-# priority order used when choosing the display name for a merged entry
 NAME_PRIORITY = ["CHEMBL_ID", "Enamine_ID", "ZINC_ID", "PubChem_ID",
                  "MCULE_ID", "MolPort_ID", "CSC_ID", "ChemDiv_ID",
                  "ChemSpace_ID", "LabNetwork_ID"]
@@ -109,9 +110,21 @@ def write_sdf_gz(mols_data: list, outpath: str):
         writer.close()
 
 
+def write_csv(entries: list, outpath: str):
+    """Write SMILES, affinity, and per-vendor ID columns for each unique compound."""
+    vendor_cols = list(VENDOR_PATTERNS.keys()) + ["other_IDs"]
+    with open(outpath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ID", "SMILES", "affinity"] + vendor_cols)
+        for i, (mol, vendor_ids, affinity) in enumerate(entries, 1):
+            smi = Chem.MolToSmiles(mol)
+            row = [i, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_cols]
+            writer.writerow(row)
+
+
 # --- main logic ----------------------------------------------------------
 
-def aggregate(input_files: list[str], output: str):
+def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | None):
     # inchikey -> (mol, vendor_ids, affinity)
     registry: dict[str, tuple] = {}
     skipped = 0
@@ -149,16 +162,26 @@ def aggregate(input_files: list[str], output: str):
 
     # sort by affinity (best first)
     sorted_entries = sorted(registry.values(), key=lambda x: x[2])
-    write_sdf_gz([(mol, ids) for mol, ids, _ in sorted_entries], output)
-    print(f"Wrote {len(sorted_entries)} molecules → {output}", file=sys.stderr)
+
+    if output_csv:
+        write_csv(sorted_entries, output_csv)
+        print(f"Wrote {len(sorted_entries)} rows → {output_csv}", file=sys.stderr)
+
+    if output_sdf:
+        write_sdf_gz([(mol, ids) for mol, ids, _ in sorted_entries], output_sdf)
+        print(f"Wrote {len(sorted_entries)} molecules → {output_sdf}", file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("inputs", nargs="+", metavar="FILE.sdf[.gz]", help="Input SDF archives")
-    parser.add_argument("-o", "--output", default="aggregated.sdf.gz", help="Output SDF (default: aggregated.sdf.gz)")
+    parser.add_argument("-o", "--output", default="aggregated.sdf.gz",
+                        help="Output SDF (default: aggregated.sdf.gz; empty string to skip)")
+    parser.add_argument("--csv", default="pharmit_merged.csv",
+                        help="Output CSV (default: pharmit_merged.csv; empty string to skip)")
     args = parser.parse_args()
-    aggregate(args.inputs, args.output)
+
+    aggregate(args.inputs, args.output or None, args.csv or None)
 
 
 if __name__ == "__main__":
