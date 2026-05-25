@@ -555,6 +555,27 @@ def detect_interactions(
                                 "info1": _il(la),
                                 "info2": f"{a0.chain}/{a0.resn}{a0.resi} ring"})
 
+    def _dedup(items):
+        """Remove interactions with identical spatial endpoints (handles altloc duplicates)."""
+        seen = set()
+        out = []
+        for it in items:
+            key = (tuple(round(x, 1) for x in it["p1"]),
+                   tuple(round(x, 1) for x in it["p2"]))
+            if key not in seen:
+                seen.add(key)
+                out.append(it)
+        return out
+
+    result.halogen      = _dedup(result.halogen)
+    result.salt_bridges = _dedup(result.salt_bridges)
+    result.arom_hbonds  = _dedup(result.arom_hbonds)
+    result.pipi         = _dedup(result.pipi)
+    result.pi_cation    = _dedup(result.pi_cation)
+    result.clash_good   = _dedup(result.clash_good)
+    result.clash_bad    = _dedup(result.clash_bad)
+    result.clash_ugly   = _dedup(result.clash_ugly)
+
     return result
 
 
@@ -1817,19 +1838,22 @@ def _open_gui():
             update_ui()
 
     def update_ui():
-        c = _stepper._count()
-        if c > 0:
-            if _stepper._in_compare:
-                lbl.setText(_stepper.compare_label())
+        try:
+            c = _stepper._count()
+            if c > 0:
+                if _stepper._in_compare:
+                    lbl.setText(_stepper.compare_label())
+                else:
+                    lbl.setText(f"{_stepper._label()}  "
+                                f"({_stepper.current_index + 1}/{c})")
+                sp.setMaximum(c)
+                sp.setValue(_stepper.current_index + 1)
             else:
-                lbl.setText(f"{_stepper._label()}  "
-                            f"({_stepper.current_index + 1}/{c})")
-            sp.setMaximum(c)
-            sp.setValue(_stepper.current_index + 1)
-        else:
-            lbl.setText("Ready - click Setup")
-        if g_pd.isChecked() and not _stepper._in_compare:
-            _highlight_current_row()
+                lbl.setText("Ready - click Setup")
+            if g_pd.isChecked() and not _stepper._in_compare:
+                _highlight_current_row()
+        except RuntimeError:
+            pass  # Qt widget deleted (window closed while callback was in flight)
 
     def do_browse():
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
