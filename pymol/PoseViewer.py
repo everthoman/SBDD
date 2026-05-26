@@ -1499,7 +1499,7 @@ def _auto_split_ligands(ligands_sel):
         print(f"PoseViewer: auto-split failed: {e}")
         return []
 
-    if len(unique) <= 1:
+    if len(unique) == 0:
         return []
 
     existing = set(cmd.get_names("objects"))
@@ -1620,11 +1620,17 @@ EXAMPLES
             if not ligs:
                 # If protein is a named object, scope the split to that object
                 # only — otherwise "organic" spans all loaded structures.
+                # Use "model NAME" so PyMOL parses the object name unambiguously
+                # (bare names starting with a digit can be mis-parsed as arithmetic).
                 prot_is_obj = protein in set(cmd.get_names("objects"))
-                lig_scope = f"({ligands}) and ({protein})" if prot_is_obj else ligands
+                lig_scope = f"({ligands}) and model {protein}" if prot_is_obj else ligands
                 auto = _auto_split_ligands(lig_scope)
                 if auto:
                     ligs = auto
+                    ref_lig = None
+                elif prot_is_obj:
+                    print(f"PoseViewer: no organic ligands found in '{protein}'.")
+                    ligs = []
                     ref_lig = None
                 else:
                     ligs = [ligands]
