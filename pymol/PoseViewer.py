@@ -999,7 +999,7 @@ class LigandStepper:
                 continue
             try:
                 if (cmd.count_atoms(f"{n} and organic") > 0 and
-                        cmd.count_atoms(f"{n} and ({prot})") == 0):
+                        cmd.count_atoms(f"{n} and polymer.protein") == 0):
                     extras.append(n)
             except Exception:
                 pass
@@ -1573,7 +1573,7 @@ EXAMPLES
                     continue
                 try:
                     if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
-                            cmd.count_atoms(f"{n} and ({protein})") == 0 and
+                            cmd.count_atoms(f"{n} and polymer.protein") == 0 and
                             cmd.count_states(n) > 1):
                         multi_state.append(n)
                 except CmdException:
@@ -1600,7 +1600,7 @@ EXAMPLES
                     continue
                 try:
                     if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
-                            cmd.count_atoms(f"{n} and ({protein})") == 0):
+                            cmd.count_atoms(f"{n} and polymer.protein") == 0):
                         (multi_ligs if cmd.count_states(n) > 1 else single_ligs).append(n)
                 except CmdException:
                     pass
@@ -2123,7 +2123,7 @@ def _open_gui():
                 continue
             try:
                 if (cmd.count_atoms(f"{n} and organic") > 0 and
-                        cmd.count_atoms(f"{n} and ({_stepper.protein_sel or 'polymer.protein'})") == 0):
+                        cmd.count_atoms(f"{n} and polymer.protein") == 0):
                     ref_combo.addItem(n)
             except Exception:
                 pass
