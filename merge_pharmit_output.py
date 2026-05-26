@@ -4,6 +4,12 @@ merge_pharmit_output.py — merge SDF archives, deduplicate by InChIKey,
 and write a merged SDF (with 3D poses + vendor ID properties) and a CSV
 lookup table (SMILES + affinity + per-vendor IDs).
 
+Each output molecule carries a Structure_ID SDF property set to the best
+available vendor ID (priority: CHEMBL > Enamine > ZINC > PubChem > MCULE >
+MolPort > CSC > ChemDiv > ChemSpace > LabNetwork > other). This property is
+used as the compound identifier by downstream tools such as gnina.py
+(--id-column Structure_ID).
+
 Usage:
     python merge_pharmit_output.py [FILE1.sdf.gz FILE2.sdf.gz ...] \
         [-o OUTPUT.sdf.gz] [--csv OUTPUT.csv]
