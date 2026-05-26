@@ -1799,8 +1799,12 @@ def _open_gui():
     b_go = QtWidgets.QPushButton("Go"); b_go.setFixedWidth(50)
     hl_j.addWidget(b_go); hl_j.addStretch()
     l_n.addLayout(hl_j)
+    cb_docking = QtWidgets.QCheckBox("Docking poses")
+    cb_docking.setChecked(False)
+    l_n.addWidget(cb_docking)
     cb_cmp_hb = QtWidgets.QCheckBox("H-bonds in compare mode")
     cb_cmp_hb.setChecked(False)
+    cb_cmp_hb.setEnabled(False)   # enabled only when Docking poses is checked
     l_n.addWidget(cb_cmp_hb)
     hl_bm = QtWidgets.QHBoxLayout()
     b_bm = QtWidgets.QPushButton("☆ Bookmark")
@@ -2108,12 +2112,16 @@ def _open_gui():
         ref_combo.blockSignals(False)
 
     def _update_cmp_hb_ui():
-        """Enable H-bond compare only when poses share a pocket (multi-state objects).
+        """Set the Docking poses checkbox from a heuristic, then gate H-bond compare on it.
 
-        Single-state ligands (auto-split from a protein) sit in different pockets,
-        so cross-pose H-bond comparison is meaningless — disable and uncheck the box.
+        Multi-state objects are unambiguously docking poses.  Single-state objects
+        could be either (one pose per ligand) or extracted protein ligands, so the
+        heuristic defaults to False — the user can override by ticking the box.
         """
         has_multistate = any(cmd.count_states(o) > 1 for o, _ in _stepper.poses)
+        cb_docking.blockSignals(True)
+        cb_docking.setChecked(has_multistate)
+        cb_docking.blockSignals(False)
         cb_cmp_hb.setEnabled(has_multistate)
         if not has_multistate:
             cb_cmp_hb.blockSignals(True)
@@ -2182,7 +2190,7 @@ def _open_gui():
         tw_pd.clearContents()
         tw_pd.setRowCount(0)
         tw_pd.setColumnCount(0)
-        cb_cmp_hb.setEnabled(True)   # reset for next setup
+        cb_docking.setChecked(False)  # triggers on_docking_toggle → disables cb_cmp_hb
 
     def _table_adjacent(delta):
         """Navigate to the row delta steps from the current row in table order."""
@@ -2339,6 +2347,15 @@ def _open_gui():
     cb_lig_h.stateChanged.connect(lambda s: [
         setattr(_stepper, "show_lig_h", cb_lig_h.isChecked()),
         ci_update(), update_ui()])
+
+    def on_docking_toggle(checked):
+        cb_cmp_hb.setEnabled(checked)
+        if not checked:
+            cb_cmp_hb.blockSignals(True)
+            cb_cmp_hb.setChecked(False)
+            cb_cmp_hb.blockSignals(False)
+            _stepper.show_cmp_hbonds = False
+    cb_docking.stateChanged.connect(on_docking_toggle)
 
     def on_cmp_hb(state):
         _stepper.show_cmp_hbonds = cb_cmp_hb.isChecked()
