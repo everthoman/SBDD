@@ -34,6 +34,7 @@ Author: Evert J. Homan, PhD
 
 import os
 import re
+import sys
 import glob
 import gzip
 import shutil
@@ -51,6 +52,41 @@ from rdkit import Chem
 from rdkit import RDLogger
 
 RDLogger.DisableLog('rdApp.*')
+
+_MIN_COMPUTE_CAP = 6.0   # Pascal and newer; Kepler/Maxwell lack required CUDA ops
+
+
+def _best_gpu_ids(n: int) -> list[int]:
+    """Return the n GPU device IDs with the highest compute capability and most free memory.
+
+    Falls back to [0, ..., n-1] if nvidia-smi is unavailable.
+    GPUs below _MIN_COMPUTE_CAP are excluded; if none qualify, falls back to all GPUs.
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=index,compute_cap,memory.free",
+             "--format=csv,noheader,nounits"],
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return list(range(n))
+
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            continue
+        try:
+            idx, cc, free = int(parts[0]), float(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        gpus.append((idx, cc, free))
+
+    capable = [(idx, cc, free) for idx, cc, free in gpus if cc >= _MIN_COMPUTE_CAP]
+    pool = capable if capable else gpus
+    pool.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    return [idx for idx, _, _ in pool[:n]]
 
 _AUTO_CPUS = os.cpu_count() or 1
 _DEFAULT_GNINA = "/opt/gnina/gnina"
@@ -101,6 +137,7 @@ def merge_sdf(temp_sdf, dock_output_dir):
                     bad += 1
     writer.close()
     print(f"[MERGE] {total} poses merged, {bad} skipped → {temp_sdf}")
+    return total
 
 
 def sort_and_export(input_sdf, output_sdf, tsv_file, id_column):
@@ -205,7 +242,12 @@ def print_config(args, n_batches, threads_per_job):
 
 def finalize(args, dock_output_dir, start_time, n_input):
     temp_sdf = f"{args.output}_unsorted.sdf"
-    merge_sdf(temp_sdf, dock_output_dir)
+    total_merged = merge_sdf(temp_sdf, dock_output_dir)
+    if total_merged == 0:
+        if os.path.exists(temp_sdf):
+            os.remove(temp_sdf)
+        print("[ERROR] No poses were produced — all docking jobs failed. Check gnina logs in gnina_tmp/_docked/")
+        return
     sort_and_export(
         temp_sdf,
         f"{args.output}.sdf",
@@ -370,6 +412,15 @@ def run_gpu_docking(args, parser):
     batch_dir       = os.path.join(args.output_dir, "_batches")
     dock_output_dir = os.path.join(args.output_dir, "_docked")
 
+    # Resolve GPU IDs: 'auto' triggers detection; explicit list is used as-is
+    if args.gpu_ids and args.gpu_ids.strip().lower() == "auto":
+        gpu_ids = _best_gpu_ids(args.num_gpus)
+    elif args.gpu_ids:
+        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
+    else:
+        gpu_ids = _best_gpu_ids(args.num_gpus)
+    args.num_gpus = len(gpu_ids)
+
     # CPU threads split evenly among GPUs
     threads_per_job = max(1, args.cpus // args.num_gpus)
 
@@ -397,7 +448,7 @@ def run_gpu_docking(args, parser):
         threads = [
             threading.Thread(target=gpu_worker,
                              args=(gpu_id, threads_per_job, jq, args, dock_output_dir, pbar))
-            for gpu_id in range(args.num_gpus)
+            for gpu_id in gpu_ids
         ]
         for t in threads:
             t.start()
@@ -432,43 +483,73 @@ def _add_io_args(p):
 def _add_docking_args(p, cnn_default):
     p.add_argument(
         "--exhaustiveness", type=int, default=8,
-        help="Search exhaustiveness (default: 8; increase for XP)",
+        help=(
+            "Stochastic search effort per ligand (default: 8). "
+            "Higher values explore more of the energy landscape at the cost of runtime. "
+            "8 is suitable for SP; 16–32 recommended for XP or flexible receptors."
+        ),
     )
     p.add_argument(
         "--num-modes", type=int, default=1, dest="num_modes",
-        help="Binding modes to generate per ligand (default: 1)",
+        help=(
+            "Number of binding poses to generate per ligand (default: 1). "
+            "Increase to 9 for XP runs where pose diversity matters. "
+            "All modes are written to the output SDF."
+        ),
     )
     p.add_argument(
         "--autobox-add", type=float, default=4.0, dest="autobox_add",
-        help="Padding around the autobox in Å (default: 4.0)",
+        help=(
+            "Padding added around the reference ligand bounding box on each side, in Å "
+            "(default: 4.0). Increase if docked poses are clipped at the box edge."
+        ),
     )
     p.add_argument(
         "--seed", type=int, default=666,
-        help="Random seed for reproducibility (default: 666)",
+        help=(
+            "Random seed for the stochastic docking search (default: 666). "
+            "Fix this value to make runs reproducible across batches."
+        ),
     )
     p.add_argument(
         "--cnn-scoring", default=cnn_default, dest="cnn_scoring",
         choices=["none", "rescore", "refinement", "all"],
-        help=f"CNN scoring mode (default: {cnn_default})",
+        help=(
+            f"CNN scoring mode applied after Vina pose generation (default: {cnn_default}). "
+            "none: Vina score only, fastest. "
+            "rescore: CNN re-scores each Vina pose without moving atoms (SP default). "
+            "refinement: CNN minimises each pose — slower but higher accuracy (XP default). "
+            "all: both rescore and refinement scores are written to the output."
+        ),
     )
 
 
 def _add_common_args(p):
     p.add_argument(
         "--gnina", default=_DEFAULT_GNINA,
-        help=f"Path to GNINA executable (default: {_DEFAULT_GNINA})",
+        help=f"Path to the GNINA executable (default: {_DEFAULT_GNINA})",
     )
     p.add_argument(
         "--output-dir", default="gnina_tmp", dest="output_dir",
-        help="Directory for intermediate batch files (default: gnina_tmp)",
+        help=(
+            "Directory for intermediate files: ligand batches and per-batch docked SDFs "
+            "(default: gnina_tmp). Removed automatically unless --keep-temp is set."
+        ),
     )
     p.add_argument(
         "--id-column", default="Structure_ID", dest="id_column",
-        help="SDF property used to sort output (default: Structure_ID)",
+        help=(
+            "SDF property name used as the molecule identifier in the output SDF and TSV "
+            "(default: Structure_ID). The final SDF is sorted by this column. "
+            "Use the property name exactly as it appears in your input SDF."
+        ),
     )
     p.add_argument(
         "--keep-temp", action="store_true", dest="keep_temp",
-        help="Keep intermediate batch files after completion",
+        help=(
+            "Keep the intermediate batch and per-batch docked files in --output-dir "
+            "after the run completes. Useful for debugging failed batches."
+        ),
     )
 
 
@@ -532,15 +613,33 @@ Examples:
     _add_common_args(sp)
     sp.add_argument(
         "--num-gpus", type=int, default=1, dest="num_gpus",
-        help="Number of GPUs to use (default: 1)",
+        help=(
+            "Number of GPUs to use in parallel (default: 1). "
+            "Ignored if --gpu is given (GPU count is inferred from the ID list)."
+        ),
+    )
+    sp.add_argument(
+        "--gpu", "--gpu-ids", type=str, default="1", dest="gpu_ids",
+        help=(
+            "Comma-separated CUDA device IDs to use, e.g. '1' or '0,1' "
+            "(default: 1). Override with auto-select by passing --gpu auto, "
+            "which skips cards below compute capability 6.0 such as Kepler/Maxwell."
+        ),
     )
     sp.add_argument(
         "--cpus", type=int, default=_AUTO_CPUS,
-        help=f"Total CPU threads, split across GPUs (default: {_AUTO_CPUS})",
+        help=(
+            f"Total CPU threads available for pose generation (default: {_AUTO_CPUS}). "
+            "Divided evenly across GPUs: each GNINA process gets --cpus ÷ --num-gpus threads."
+        ),
     )
     sp.add_argument(
         "--batches-per-gpu", type=int, default=4, dest="batches_per_gpu",
-        help="Batches per GPU processed sequentially (default: 4)",
+        help=(
+            "Number of ligand batches each GPU processes sequentially (default: 4). "
+            "Total batches = --num-gpus × --batches-per-gpu. "
+            "Increase to reduce per-batch memory footprint; decrease for fewer, larger jobs."
+        ),
     )
 
     # ── XP ────────────────────────────────────────────────────────────────────
@@ -558,15 +657,33 @@ Examples:
     _add_common_args(xp)
     xp.add_argument(
         "--num-gpus", type=int, default=1, dest="num_gpus",
-        help="Number of GPUs to use (default: 1)",
+        help=(
+            "Number of GPUs to use in parallel (default: 1). "
+            "Ignored if --gpu is given (GPU count is inferred from the ID list)."
+        ),
+    )
+    xp.add_argument(
+        "--gpu", "--gpu-ids", type=str, default="1", dest="gpu_ids",
+        help=(
+            "Comma-separated CUDA device IDs to use, e.g. '1' or '0,1' "
+            "(default: 1). Override with auto-select by passing --gpu auto, "
+            "which skips cards below compute capability 6.0 such as Kepler/Maxwell."
+        ),
     )
     xp.add_argument(
         "--cpus", type=int, default=_AUTO_CPUS,
-        help=f"Total CPU threads, split across GPUs (default: {_AUTO_CPUS})",
+        help=(
+            f"Total CPU threads available for pose generation (default: {_AUTO_CPUS}). "
+            "Divided evenly across GPUs: each GNINA process gets --cpus ÷ --num-gpus threads."
+        ),
     )
     xp.add_argument(
         "--batches-per-gpu", type=int, default=4, dest="batches_per_gpu",
-        help="Batches per GPU processed sequentially (default: 4)",
+        help=(
+            "Number of ligand batches each GPU processes sequentially (default: 4). "
+            "Total batches = --num-gpus × --batches-per-gpu. "
+            "Increase to reduce per-batch memory footprint; decrease for fewer, larger jobs."
+        ),
     )
 
     return parser
@@ -577,6 +694,12 @@ Examples:
 def main():
     parser = make_parser()
     argcomplete.autocomplete(parser)
+
+    _subcmds = {"htvs", "sp", "xp"}
+    first = sys.argv[1] if len(sys.argv) > 1 else None
+    if first not in _subcmds and first not in ("-h", "--help"):
+        sys.argv.insert(1, "sp")
+
     args = parser.parse_args()
 
     if args.mode == "htvs":
