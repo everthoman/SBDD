@@ -1627,7 +1627,11 @@ EXAMPLES
                     ligs    = single_ligs
                     ref_lig = None
             if not ligs:
-                auto = _auto_split_ligands(ligands)
+                # If protein is a named object, scope the split to that object
+                # only — otherwise "organic" spans all loaded structures.
+                prot_is_obj = protein in set(cmd.get_names("objects"))
+                lig_scope = f"({ligands}) and ({protein})" if prot_is_obj else ligands
+                auto = _auto_split_ligands(lig_scope)
                 if auto:
                     ligs = auto
                     ref_lig = None
