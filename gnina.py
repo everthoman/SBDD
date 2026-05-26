@@ -609,7 +609,7 @@ Examples:
     # ── SP ────────────────────────────────────────────────────────────────────
     sp = subs.add_parser(
         "sp",
-        help="Standard-precision GPU docking with CNN rescoring",
+        help="Standard-precision GPU docking with CNN rescoring (default)",
         formatter_class=RawDescriptionRichHelpFormatter,
         epilog=(
             "GPU-accelerated docking. CPU threads are divided evenly across GPUs.\n"
