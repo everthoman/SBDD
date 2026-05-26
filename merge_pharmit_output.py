@@ -15,6 +15,8 @@ Usage:
         [-o OUTPUT.sdf.gz] [--csv OUTPUT.csv]
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import gzip
@@ -76,12 +78,14 @@ def merge_vendor_ids(a: dict, b: dict) -> dict:
     return merged
 
 
-def best_display_name(ids: dict) -> str:
+def best_display_name(ids: dict, inchikey: str = "") -> str:
     for vendor in NAME_PRIORITY:
         if ids.get(vendor):
             return ids[vendor][0]
     others = ids.get("other_IDs", [])
-    return others[0] if others else "unknown"
+    if others:
+        return others[0]
+    return inchikey if inchikey else "unknown"
 
 
 # --- SDF I/O -------------------------------------------------------------
@@ -104,13 +108,13 @@ def read_mols(path: str):
 def write_sdf_gz(mols_data: list, outpath: str):
     with gzip.open(outpath, "wt") as fh:
         writer = Chem.SDWriter(fh)   # type: ignore[arg-type]
-        for mol, vendor_ids in mols_data:
+        for mol, vendor_ids, inchikey in mols_data:
             for vendor, id_list in vendor_ids.items():
                 if id_list:
                     mol.SetProp(vendor, " ".join(id_list))
                 elif mol.HasProp(vendor):
                     mol.ClearProp(vendor)
-            name = best_display_name(vendor_ids)
+            name = best_display_name(vendor_ids, inchikey)
             mol.SetProp("_Name", name)
             mol.SetProp("Structure_ID", name)
             AllChem.Compute2DCoords(mol)
@@ -123,10 +127,10 @@ def write_csv(entries: list, outpath: str):
     vendor_cols = list(VENDOR_PATTERNS.keys()) + ["other_IDs"]
     with open(outpath, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["ID", "SMILES", "affinity"] + vendor_cols)
-        for mol, vendor_ids, affinity in entries:
+        writer.writerow(["Structure_ID", "SMILES", "affinity"] + vendor_cols)
+        for mol, vendor_ids, affinity, inchikey in entries:
             smi = Chem.MolToSmiles(mol)
-            name = best_display_name(vendor_ids)
+            name = best_display_name(vendor_ids, inchikey)
             row = [name, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_cols]
             writer.writerow(row)
 
@@ -165,19 +169,23 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
             else:
                 registry[key] = (mol, vendor_ids, affinity)
 
+
     print(f"  Unique structures: {len(registry)}", file=sys.stderr)
     if skipped:
         print(f"  Skipped (no InChI): {skipped}", file=sys.stderr)
 
-    # sort by affinity (best first)
-    sorted_entries = sorted(registry.values(), key=lambda x: x[2])
+    # sort by affinity (best first); carry InChIKey as fallback ID
+    sorted_entries = [
+        (mol, ids, aff, key)
+        for key, (mol, ids, aff) in sorted(registry.items(), key=lambda x: x[1][2])
+    ]
 
     if output_csv:
         write_csv(sorted_entries, output_csv)
         print(f"Wrote {len(sorted_entries)} rows → {output_csv}", file=sys.stderr)
 
     if output_sdf:
-        write_sdf_gz([(mol, ids) for mol, ids, _ in sorted_entries], output_sdf)
+        write_sdf_gz([(mol, ids, key) for mol, ids, _, key in sorted_entries], output_sdf)
         print(f"Wrote {len(sorted_entries)} molecules → {output_sdf}", file=sys.stderr)
 
 
