@@ -104,7 +104,9 @@ def write_sdf_gz(mols_data: list, outpath: str):
                     mol.SetProp(vendor, " ".join(id_list))
                 elif mol.HasProp(vendor):
                     mol.ClearProp(vendor)
-            mol.SetProp("_Name", best_display_name(vendor_ids))
+            name = best_display_name(vendor_ids)
+            mol.SetProp("_Name", name)
+            mol.SetProp("Structure_ID", name)
             AllChem.Compute2DCoords(mol)
             writer.write(mol)
         writer.close()
@@ -116,9 +118,10 @@ def write_csv(entries: list, outpath: str):
     with open(outpath, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["ID", "SMILES", "affinity"] + vendor_cols)
-        for i, (mol, vendor_ids, affinity) in enumerate(entries, 1):
+        for mol, vendor_ids, affinity in entries:
             smi = Chem.MolToSmiles(mol)
-            row = [i, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_cols]
+            name = best_display_name(vendor_ids)
+            row = [name, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_cols]
             writer.writerow(row)
 
 
