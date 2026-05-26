@@ -108,15 +108,16 @@ def read_mols(path: str):
 def write_sdf_gz(mols_data: list, outpath: str):
     with gzip.open(outpath, "wt") as fh:
         writer = Chem.SDWriter(fh)   # type: ignore[arg-type]
-        for mol, vendor_ids, inchikey in mols_data:
+        for i, (mol, vendor_ids, inchikey) in enumerate(mols_data, 1):
             for vendor, id_list in vendor_ids.items():
                 if id_list:
                     mol.SetProp(vendor, " ".join(id_list))
                 elif mol.HasProp(vendor):
                     mol.ClearProp(vendor)
-            name = best_display_name(vendor_ids, inchikey)
-            mol.SetProp("_Name", name)
-            mol.SetProp("Structure_ID", name)
+            compound_id = f"ID_{i:06d}"
+            mol.SetProp("_Name", best_display_name(vendor_ids, inchikey))
+            mol.SetProp("Compound_ID", compound_id)
+            mol.SetProp("Structure_ID", compound_id)
             AllChem.Compute2DCoords(mol)
             writer.write(mol)
         writer.close()
@@ -127,11 +128,11 @@ def write_csv(entries: list, outpath: str):
     vendor_cols = list(VENDOR_PATTERNS.keys()) + ["other_IDs"]
     with open(outpath, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Structure_ID", "SMILES", "affinity"] + vendor_cols)
-        for mol, vendor_ids, affinity, inchikey in entries:
+        writer.writerow(["Compound_ID", "SMILES", "affinity"] + vendor_cols)
+        for i, (mol, vendor_ids, affinity, inchikey) in enumerate(entries, 1):
             smi = Chem.MolToSmiles(mol)
-            name = best_display_name(vendor_ids, inchikey)
-            row = [name, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_cols]
+            compound_id = f"ID_{i:06d}"
+            row = [compound_id, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_cols]
             writer.writerow(row)
 
 
