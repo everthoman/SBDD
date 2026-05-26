@@ -556,6 +556,7 @@ def _add_common_args(p):
 def make_parser():
     parser = argparse.ArgumentParser(
         description="GNINA docking: htvs (CPU-only) · sp (GPU) · xp (GPU + CNN refinement)",
+        usage="%(prog)s [sp|htvs|xp] -r RECEPTOR -a REF -l LIGANDS -o OUTPUT [--gpu ID] [options]",
         formatter_class=RawDescriptionRichHelpFormatter,
         epilog="""
 Default mode: sp (omitting the subcommand runs SP docking).
