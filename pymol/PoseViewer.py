@@ -2107,6 +2107,20 @@ def _open_gui():
         ref_combo.setCurrentIndex(max(idx, 0))
         ref_combo.blockSignals(False)
 
+    def _update_cmp_hb_ui():
+        """Enable H-bond compare only when poses share a pocket (multi-state objects).
+
+        Single-state ligands (auto-split from a protein) sit in different pockets,
+        so cross-pose H-bond comparison is meaningless — disable and uncheck the box.
+        """
+        has_multistate = any(cmd.count_states(o) > 1 for o, _ in _stepper.poses)
+        cb_cmp_hb.setEnabled(has_multistate)
+        if not has_multistate:
+            cb_cmp_hb.blockSignals(True)
+            cb_cmp_hb.setChecked(False)
+            cb_cmp_hb.blockSignals(False)
+            _stepper.show_cmp_hbonds = False
+
     def do_setup():
         sf = e_scores.text().strip()
         if sf:
@@ -2115,6 +2129,7 @@ def _open_gui():
             _stepper.sdf_records = []
         ci_setup(protein=e_prot.text(), ligands=e_lig.text(), mode="auto")
         _populate_ref_combo()
+        _update_cmp_hb_ui()
         update_ui()
         rebuild_table()
 
@@ -2167,6 +2182,7 @@ def _open_gui():
         tw_pd.clearContents()
         tw_pd.setRowCount(0)
         tw_pd.setColumnCount(0)
+        cb_cmp_hb.setEnabled(True)   # reset for next setup
 
     def _table_adjacent(delta):
         """Navigate to the row delta steps from the current row in table order."""
