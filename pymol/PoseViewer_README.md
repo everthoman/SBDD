@@ -48,11 +48,9 @@ Reference ligand interactions are drawn with the same color scheme but thinner d
 
 | Color | Residue type | Residues |
 |---|---|---|
-| Wheat | Hydrophobic | ALA, VAL, LEU, ILE, MET, PHE, TRP, PRO |
-| Pale green | Polar | SER, THR, TYR, CYS, ASN, GLN |
 | Blue | Positive charged | ARG, LYS, HIS |
 | Red | Negative charged | ASP, GLU |
-| Grey | Other | GLY, etc. |
+| Grey | Everything else | — |
 
 ---
 

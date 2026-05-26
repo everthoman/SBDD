@@ -874,22 +874,13 @@ _SURF_POLAR  = ("(resn SER and name OG) or "
 
 
 def _color_surface_by_type(surf_obj):
-    """Color surface by local atom chemistry.
-
-    All C atoms → wheat (hydrophobic); charged N → blue; charged O → red;
-    polar O/N/S (hydroxyl, amide, backbone) → palegreen; rest → grey80.
-    Clears any per-object surface_color override so atom colors take effect.
-    """
+    """Color surface by charge: charged N → blue, charged O → red, all else → grey80."""
     try: cmd.unset("surface_color", surf_obj)
     except Exception: pass
     cmd.color("grey80", surf_obj)
-    try: cmd.color("wheat",     f"({surf_obj}) and elem C")
+    try: cmd.color("tv_blue", f"({surf_obj}) and ({_SURF_POS_N})")
     except Exception: pass
-    try: cmd.color("palegreen", f"({surf_obj}) and ({_SURF_POLAR})")
-    except Exception: pass
-    try: cmd.color("tv_blue",   f"({surf_obj}) and ({_SURF_POS_N})")
-    except Exception: pass
-    try: cmd.color("tv_red",    f"({surf_obj}) and ({_SURF_NEG_O})")
+    try: cmd.color("tv_red",  f"({surf_obj}) and ({_SURF_NEG_O})")
     except Exception: pass
 
 
