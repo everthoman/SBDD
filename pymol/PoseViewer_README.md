@@ -1,4 +1,4 @@
-# PoseViewer v1.4
+# PoseViewer v1.5
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -17,6 +17,9 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Residue-colored surface**: pocket surface is colored by residue type (hydrophobic/polar/charged) rather than flat grey
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
 - **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks persist across navigation and are visible in the pose table
+- **Residue identity in pose table**: extracted ligands (auto-split from a protein structure) show their original `resn`, `resi`, and `chain` columns in the pose data table
+- **Protein selector**: the Protein field is a dropdown listing all loaded protein objects, enabling quick switching between multiple structures in the same session
+- **Docking poses mode**: explicit toggle that gates H-bond compare — avoids meaningless cross-pocket H-bond overlays when browsing extracted ligands from a multi-ligand crystal structure
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
 - Pose data table: sortable, clickable table of docking scores and SD properties per pose
 - Qt GUI panel with collapsible groups and per-type interaction toggles
@@ -81,7 +84,14 @@ ci_gui
 
 1. Load the PDB: `load 5VDH.pdb`
 2. Run `ci_gui` and click **Setup** — PoseViewer auto-splits the organic ligands into `obj01`, `obj02`, ... and steps through each with its own pocket surface
-3. No manual extraction needed
+3. The pose data table shows each ligand's original residue name and number (`resn`, `resi`, `chain`)
+4. No manual extraction needed
+
+### Two protein structures in the same session
+
+1. Load both structures: `load 3FCI.pdb` and `load 5VDH.pdb`
+2. Open `ci_gui` — the Protein dropdown lists both objects
+3. Select the structure you want to inspect and click **Setup**
 
 ---
 
@@ -139,7 +149,7 @@ If no separate ligand objects are detected (e.g. a PDB loaded as a single object
 
 | Field | Description |
 |---|---|
-| Protein | PyMOL selection for the receptor |
+| Protein | Editable dropdown listing all loaded objects that contain protein atoms, plus the default `polymer.protein`. Refreshes automatically when objects are added or removed. Custom selection strings can be typed directly. |
 | Ligand(s) | Object name(s) or selection (comma-separated for objects mode) |
 | Scores (SDF) | Optional path to an SDF file with per-pose SD data tags (e.g. GNINA output). Browse button available. Scores are read directly from the file since open-source PyMOL does not preserve SDF properties on load. |
 
@@ -150,7 +160,8 @@ If no separate ligand objects are detected (e.g. a PDB loaded as a single object
 | Prev / Next | Step through poses in current table sort order (exits compare mode) |
 | Refresh | Re-detect interactions for the current PyMOL state |
 | Go to # | Jump to pose by 1-based number (exits compare mode) |
-| H-bonds in compare mode | When checked, H-bond dashes are drawn during compare mode, colored to match each pose |
+| Docking poses | Marks the session as a docking run. Auto-checked when multi-state objects are detected; must be ticked manually for single-pose-per-ligand docking sessions. Gates the H-bonds in compare mode checkbox. |
+| H-bonds in compare mode | When checked, H-bond dashes are drawn during compare mode, colored to match each pose. Only available when **Docking poses** is checked (not meaningful when each ligand sits in a different pocket). |
 
 ### Reference ligand group
 
@@ -167,6 +178,8 @@ Reference ligand interaction lines respect the same **Show distance labels** tog
 ### Pose Data group
 
 Sortable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Column headers are movable. Rank columns are excluded. Requires a scores SDF to be loaded, or Incentive PyMOL.
+
+When browsing auto-split ligands from a protein structure (no SDF), the table shows `resn`, `resi`, and `chain` columns derived from the original PDB residue identity of each ligand.
 
 **Single-click** a row to navigate to that pose. **Ctrl-click** (or click a second row) to enter compare mode — the two most recently selected rows are shown simultaneously. A third selection automatically drops the oldest, maintaining a rolling window of two. Clicking Prev/Next or Go exits compare mode and resumes single-pose navigation.
 
@@ -203,7 +216,7 @@ Each selected pose is extracted into a temporary single-state PyMOL object (`_cm
 Poses from different ligand objects are colored by their object's palette entry (assigned at Setup). Poses from the same object (e.g. two states of the same docking run) receive distinct slot colors instead. The color palette is: cyan, orange, forest green, hotpink, violet, salmon. The reference ligand always remains magenta.
 
 **Interactions:**  
-All interaction types are hidden in compare mode to keep the view uncluttered — the spatial overlay is the primary information. Enable **H-bonds in compare mode** in the Navigate group to overlay H-bond dashes colored to match each pose.
+All interaction types are hidden in compare mode to keep the view uncluttered — the spatial overlay is the primary information. Enable **H-bonds in compare mode** in the Navigate group to overlay H-bond dashes colored to match each pose. This option is only available when **Docking poses** is checked, since H-bond comparison is only meaningful when poses share the same binding site.
 
 **Limitations:**  
 Maximum two poses at a time (excluding the reference ligand). The full interaction panel (all types) remains available in single-pose mode.
