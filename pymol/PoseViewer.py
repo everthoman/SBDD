@@ -1293,8 +1293,14 @@ class LigandStepper:
     def _prefetch_all_properties(self):
         """Populate all_properties: one dict per pose, used by the table view."""
         if not self.sdf_records:
-            self.all_properties = [_get_pose_properties(obj, st)
-                                    for obj, st in self.poses]
+            result = []
+            for obj, st in self.poses:
+                props = _get_pose_properties(obj, st)
+                props.setdefault("_name", obj)
+                for k, v in _get_ligand_resinfo(obj).items():
+                    props.setdefault(k, v)
+                result.append(props)
+            self.all_properties = result
             return
 
         if self.mode == "states":
@@ -1430,6 +1436,38 @@ def _get_pose_properties(lig_name: str, state: int) -> dict:
     except Exception:
         pass
     return props
+
+
+def _get_ligand_resinfo(obj: str) -> dict:
+    """Return {resn, resi, chain} for the unique residue(s) in obj.
+
+    resn/resi/chain are the original PDB residue identity of the ligand,
+    preserved even after the atom was extracted into a new object.
+    chain is omitted when empty for all residues.
+    """
+    space: dict = {"residues": []}
+    try:
+        cmd.iterate(f"({obj}) and not elem H",
+                    "residues.append((resn, resi, chain))",
+                    space=space)
+    except Exception:
+        return {}
+    unique = list(dict.fromkeys(space["residues"]))
+    if not unique:
+        return {}
+    if len(unique) == 1:
+        resn, resi, chain = unique[0]
+        out: dict = {"resn": resn.strip(), "resi": resi.strip()}
+        if chain.strip():
+            out["chain"] = chain.strip()
+        return out
+    resns  = "+".join(r[0].strip() for r in unique)
+    resis  = "+".join(r[1].strip() for r in unique)
+    chains = "+".join(r[2].strip() for r in unique if r[2].strip())
+    out = {"resn": resns, "resi": resis}
+    if chains:
+        out["chain"] = chains
+    return out
 
 
 # ---------------------------------------------------------------------------
