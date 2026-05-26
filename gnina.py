@@ -558,6 +558,8 @@ def make_parser():
         description="GNINA docking: htvs (CPU-only) · sp (GPU) · xp (GPU + CNN refinement)",
         formatter_class=RawDescriptionRichHelpFormatter,
         epilog="""
+Default mode: sp (omitting the subcommand runs SP docking).
+
 Resource allocation:
   htvs  One GNINA process per CPU core (OMP_NUM_THREADS=1 each).
         Set --cpus to override; defaults to all available cores.
@@ -565,15 +567,21 @@ Resource allocation:
         (threads/job = --cpus ÷ --num-gpus). Each GPU sequentially works
         through --batches-per-gpu batches.
 
+GPU selection (sp/xp):
+  --gpu defaults to 1. Pass --gpu auto to select by compute capability and
+  free memory, skipping cards below CC 6.0 (Kepler/Maxwell). Use a
+  comma-separated list for multi-GPU runs (e.g. --gpu 0,1).
+
 Examples:
+  %(prog)s -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out          # sp is default
+  %(prog)s sp -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out --gpu 1
+  %(prog)s sp -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out --gpu 0,1 --cpus 16
+
   %(prog)s htvs -r receptor.pdb -a ref.sdf -l library.sdf -o htvs_out
   %(prog)s htvs -r receptor.pdb -a ref.sdf -l library.sdf -o htvs_out --cpus 32
 
-  %(prog)s sp   -r receptor.pdb -a ref.sdf -l hits.sdf    -o sp_out
-  %(prog)s sp   -r receptor.pdb -a ref.sdf -l hits.sdf    -o sp_out --num-gpus 2 --cpus 16
-
-  %(prog)s xp   -r receptor.pdb -a ref.sdf -l hits.sdf    -o xp_out --exhaustiveness 16
-  %(prog)s xp   -r receptor.pdb -a ref.sdf -l hits.sdf    -o xp_out --num-gpus 2 --cnn-scoring all
+  %(prog)s xp -r receptor.pdb -a ref.sdf -l hits.sdf -o xp_out --exhaustiveness 16
+  %(prog)s xp -r receptor.pdb -a ref.sdf -l hits.sdf -o xp_out --gpu 0,1 --cnn-scoring all
         """,
     )
 
