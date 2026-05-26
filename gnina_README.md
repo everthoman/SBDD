@@ -64,13 +64,15 @@ Each GPU worker drains the shared queue sequentially, so no two jobs share a GPU
 ## Usage
 
 ```
-gnina.py {htvs,sp,xp} -r RECEPTOR -a AUTOBOX_LIGAND -l LIGANDS -o OUTPUT
+gnina.py [sp|htvs|xp] -r RECEPTOR -a AUTOBOX_LIGAND -l LIGANDS -o OUTPUT
                       [--exhaustiveness N] [--num-modes N] [--autobox-add Å]
                       [--seed N] [--cnn-scoring MODE]
                       [--gnina PATH] [--output-dir DIR] [--id-column NAME] [--keep-temp]
                       [htvs:    --cpus N]
-                      [sp/xp:   --num-gpus N --cpus N --batches-per-gpu N]
+                      [sp/xp:   --gpu ID[,ID] --num-gpus N --cpus N --batches-per-gpu N]
 ```
+
+The subcommand defaults to `sp` when omitted.
 
 ### Options
 
@@ -112,7 +114,8 @@ gnina.py {htvs,sp,xp} -r RECEPTOR -a AUTOBOX_LIGAND -l LIGANDS -o OUTPUT
 
 | Flag | Default | Description |
 |---|---|---|
-| `--num-gpus INT` | `1` | Number of GPUs to use |
+| `--gpu / --gpu-ids IDs` | `1` | Comma-separated CUDA device IDs (e.g. `1` or `0,1`). Pass `auto` to select by compute capability / free memory, skipping cards below CC 6.0 |
+| `--num-gpus INT` | `1` | Number of GPUs; ignored when `--gpu` is given (count inferred from the ID list) |
 | `--cpus INT` | all cores | Total CPU threads, split evenly across GPUs |
 | `--batches-per-gpu INT` | `4` | Batches per GPU processed sequentially |
 
@@ -141,14 +144,15 @@ gnina.py htvs -r receptor.pdb -a ref.sdf -l library.sdf -o htvs_out
 gnina.py htvs -r receptor.pdb -a ref.sdf -l library.sdf -o htvs_out --cpus 32
 ```
 
-### SP — hit list on a single GPU
+### SP — hit list on a single GPU (subcommand optional, defaults to sp)
 ```bash
-gnina.py sp -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out
+gnina.py -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out
+gnina.py sp -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out --gpu 1
 ```
 
 ### SP — two GPUs, 16 CPU threads total
 ```bash
-gnina.py sp -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out --num-gpus 2 --cpus 16
+gnina.py sp -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out --gpu 0,1 --cpus 16
 ```
 
 ### XP — higher exhaustiveness, multiple binding modes
@@ -178,6 +182,10 @@ gnina.py xp -r receptor.pdb -a ref.sdf -l hits.sdf -o xp_out \
 - **Round-robin batching** distributes molecules evenly across batches by `$$$$` delimiter, so
   fast and slow ligands are mixed in every batch. This gives good load balancing without
   pre-sorting by complexity.
+
+- **GPU selection**: `--gpu` defaults to `1`. Pass `--gpu auto` to auto-select the best
+  available GPU(s) ranked by compute capability then free memory, skipping cards below
+  CC 6.0 (Kepler/Maxwell). Use explicit IDs (e.g. `--gpu 0,1`) for multi-GPU runs.
 
 - **GPU sharing is avoided**: SP/XP launch exactly one GNINA worker per GPU. Each worker drains
   the shared batch queue sequentially. `--batches-per-gpu` controls how many batches a GPU
