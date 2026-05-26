@@ -1755,7 +1755,8 @@ def _open_gui():
     g_s = QtWidgets.QGroupBox("Setup")
     l_s = QtWidgets.QGridLayout(g_s)
     l_s.addWidget(QtWidgets.QLabel("Protein:"), 0, 0)
-    e_prot = QtWidgets.QLineEdit("polymer.protein")
+    e_prot = QtWidgets.QComboBox(); e_prot.setEditable(True)
+    e_prot.addItem("polymer.protein")
     l_s.addWidget(e_prot, 0, 1)
     l_s.addWidget(QtWidgets.QLabel("Ligand(s):"), 1, 0)
     e_lig = QtWidgets.QLineEdit("organic")
@@ -2090,6 +2091,27 @@ def _open_gui():
         if path:
             e_scores.setText(path)
 
+    def _populate_prot_combo():
+        """Refill the protein combo with objects that contain protein atoms."""
+        prev = e_prot.currentText()
+        e_prot.blockSignals(True)
+        e_prot.clear()
+        e_prot.addItem("polymer.protein")
+        for n in cmd.get_names("objects"):
+            if n.startswith("_"):
+                continue
+            try:
+                if cmd.count_atoms(f"{n} and polymer.protein") > 0:
+                    e_prot.addItem(n)
+            except Exception:
+                pass
+        idx = e_prot.findText(prev)
+        if idx >= 0:
+            e_prot.setCurrentIndex(idx)
+        elif prev:
+            e_prot.setEditText(prev)
+        e_prot.blockSignals(False)
+
     def _populate_ref_combo():
         """Refill ref_combo with current organic objects, preserving selection."""
         prev = ref_combo.currentText()
@@ -2135,7 +2157,8 @@ def _open_gui():
             ci_load_scores(sf)
         else:
             _stepper.sdf_records = []
-        ci_setup(protein=e_prot.text(), ligands=e_lig.text(), mode="auto")
+        ci_setup(protein=e_prot.currentText(), ligands=e_lig.text(), mode="auto")
+        _populate_prot_combo()
         _populate_ref_combo()
         _update_cmp_hb_ui()
         update_ui()
@@ -2401,6 +2424,7 @@ def _open_gui():
             removed = win._known_pymol_objs - current_objs
             added   = current_objs - win._known_pymol_objs
             win._known_pymol_objs = current_objs
+            _populate_prot_combo()
 
             if _stepper.mode == "objects":
                 pose_objs = {o for o, _ in _stepper.poses}
@@ -2536,6 +2560,7 @@ def _open_gui():
     win._sync_timer.timeout.connect(_sync_if_external_change)
     win._sync_timer.start()
 
+    _populate_prot_combo()   # fill combo with objects already loaded at open time
     win.show(); win.raise_()
 
 
