@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-aggregate_structures.py — merge SDF archives, deduplicate by InChIKey,
+merge_pharmit_output.py — merge SDF archives, deduplicate by InChIKey,
 and write a merged SDF (with 3D poses + vendor ID properties) and a CSV
 lookup table (SMILES + affinity + per-vendor IDs).
 
 Usage:
-    python aggregate_structures.py [FILE1.sdf.gz FILE2.sdf.gz ...] \
+    python merge_pharmit_output.py [FILE1.sdf.gz FILE2.sdf.gz ...] \
         [-o OUTPUT.sdf.gz] [--csv OUTPUT.csv]
 """
 
