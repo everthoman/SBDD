@@ -233,8 +233,19 @@ def run_checks(output_path: Path, name_col: str, delay: float):
     print(f"\nChecked {done} compounds — {flagged} flagged. Results written to {output_path}")
 
 
-def sniff_delimiter(path: Path) -> str:
-    with open(path, newline="", encoding="utf-8") as f:
+def detect_encoding(path: Path) -> str:
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(path, encoding=enc) as f:
+                f.read(4096)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "latin-1"
+
+
+def sniff_delimiter(path: Path, encoding: str = "utf-8") -> str:
+    with open(path, newline="", encoding=encoding) as f:
         sample = f.read(4096)
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=",\t|;")
@@ -374,8 +385,9 @@ def main():
     if not input_path.exists():
         sys.exit(f"Error: file not found: {args.input}")
 
-    delimiter = sniff_delimiter(input_path)
-    with open(input_path, newline="", encoding="utf-8") as f:
+    encoding = detect_encoding(input_path)
+    delimiter = sniff_delimiter(input_path, encoding)
+    with open(input_path, newline="", encoding=encoding) as f:
         reader = csv.DictReader(f, delimiter=delimiter)
         rows = list(reader)
         fieldnames = reader.fieldnames
