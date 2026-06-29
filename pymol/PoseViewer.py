@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.4
+PoseViewer - PyMOL Plugin  v1.5
 ================================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
