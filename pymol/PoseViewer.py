@@ -1303,10 +1303,17 @@ class LigandStepper:
         # Group SDF records by molecule title, preserving their in-file order.
         # That order corresponds to state indices (1st occurrence = state 1, etc.)
         # because docking software emits poses per compound in score order.
+        # PyMOL converts hyphens (and other non-word chars) to underscores when
+        # it creates object names from SDF titles, so normalise before matching.
+        import re as _re
         from collections import defaultdict
+
+        def _norm(s: str) -> str:
+            return _re.sub(r'[^\w]', '_', s)
+
         by_name: dict = defaultdict(list)
         for rec in self.sdf_records:
-            by_name[rec.get("_name", "")].append(rec)
+            by_name[_norm(rec.get("_name", ""))].append(rec)
 
         obj_names = {o for o, _ in self.poses}
         if obj_names & set(by_name.keys()):
@@ -1604,7 +1611,10 @@ EXAMPLES
                 # names to separate pose ligands (appear in SDF) from ref candidates
                 # (don't appear in SDF). Without SDF, treat everything as poses.
                 if _stepper.sdf_records:
-                    sdf_names = {r.get("_name", "")
+                    import re as _re
+                    # Normalise SDF titles the same way PyMOL does when it creates
+                    # object names: replace non-word characters with underscores.
+                    sdf_names = {_re.sub(r'[^\w]', '_', r.get("_name", ""))
                                  for r in _stepper.sdf_records if r.get("_name")}
                     matched   = [n for n in single_ligs if n in sdf_names]
                     unmatched = [n for n in single_ligs if n not in sdf_names]
