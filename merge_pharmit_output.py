@@ -44,6 +44,30 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.inchi import MolToInchi
 from rdkit.Chem import InchiToInchiKey
+from rdkit.Chem.MolStandardize import rdMolStandardize
+
+
+# --- SMILES standardization -----------------------------------------------
+
+_LARGEST_FRAGMENT_CHOOSER = rdMolStandardize.LargestFragmentChooser()
+_UNCHARGER = rdMolStandardize.Uncharger()
+
+
+def standardize(mol: Chem.Mol) -> Chem.Mol | None:
+    """Strip salts and neutralize charges, returning a flat, canonical mol.
+
+    Used to derive the canonical SMILES and dedup key so that different salt
+    forms / protonation states of the same compound collapse to one entry.
+    The original 3D pose mol is left untouched for SDF output.
+    """
+    flat = Chem.RemoveHs(mol)
+    try:
+        flat = _LARGEST_FRAGMENT_CHOOSER.choose(flat)
+        flat = _UNCHARGER.uncharge(flat)
+        Chem.SanitizeMol(flat)
+    except (Chem.KekulizeException, Chem.AtomValenceException, ValueError, RuntimeError):
+        return None
+    return flat
 
 
 # --- vendor ID extraction -------------------------------------------------
@@ -154,11 +178,7 @@ def write_csv(entries: list, outpath: str):
     with open(outpath, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Compound_ID", "SMILES", "affinity"] + vendor_cols)
-        for i, (mol, vendor_ids, affinity, inchikey) in enumerate(entries, 1):
-            # Docking poses carry explicit Hs (removeHs=False on read); strip
-            # them for the lookup-table SMILES so it's a normal canonical
-            # SMILES instead of e.g. "[H]OC([H])([H])C([H])([H])[H]".
-            smi = Chem.MolToSmiles(Chem.RemoveHs(mol))
+        for i, (mol, vendor_ids, affinity, inchikey, smi) in enumerate(entries, 1):
             compound_id = f"ID_{i:06d}"
             row = [compound_id, smi, affinity] + [",".join(vendor_ids.get(v, [])) for v in vendor_cols]
             writer.writerow(row)
@@ -167,7 +187,7 @@ def write_csv(entries: list, outpath: str):
 # --- main logic ----------------------------------------------------------
 
 def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | None):
-    # inchikey -> (mol, vendor_ids, affinity)
+    # inchikey -> (mol, vendor_ids, affinity, canonical_smiles)
     registry: dict[str, tuple] = {}
     skipped = 0
 
@@ -177,7 +197,12 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
             if mol is None:
                 skipped += 1
                 continue
-            inchi = MolToInchi(mol)
+            flat = standardize(mol)
+            if flat is None:
+                skipped += 1
+                continue
+            smi = Chem.MolToSmiles(flat)
+            inchi = MolToInchi(flat)
             if inchi is None:
                 skipped += 1
                 continue
@@ -191,15 +216,15 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
             affinity = float(mol.GetProp("minimizedAffinity")) if mol.HasProp("minimizedAffinity") else 0.0
 
             if key in registry:
-                existing_mol, existing_ids, existing_aff = registry[key]
+                existing_mol, existing_ids, existing_aff, existing_smi = registry[key]
                 merged_ids = merge_vendor_ids(existing_ids, vendor_ids)
                 # keep the pose with better (more negative) affinity
                 if affinity < existing_aff:
-                    registry[key] = (mol, merged_ids, affinity)
+                    registry[key] = (mol, merged_ids, affinity, smi)
                 else:
-                    registry[key] = (existing_mol, merged_ids, existing_aff)
+                    registry[key] = (existing_mol, merged_ids, existing_aff, existing_smi)
             else:
-                registry[key] = (mol, vendor_ids, affinity)
+                registry[key] = (mol, vendor_ids, affinity, smi)
 
 
     print(f"  Unique structures: {len(registry)}", file=sys.stderr)
@@ -208,8 +233,8 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
 
     # sort by affinity (best first); carry InChIKey as fallback ID
     sorted_entries = [
-        (mol, ids, aff, key)
-        for key, (mol, ids, aff) in sorted(registry.items(), key=lambda x: x[1][2])
+        (mol, ids, aff, key, smi)
+        for key, (mol, ids, aff, smi) in sorted(registry.items(), key=lambda x: x[1][2])
     ]
 
     if output_csv:
@@ -217,7 +242,7 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
         print(f"Wrote {len(sorted_entries)} rows → {output_csv}", file=sys.stderr)
 
     if output_sdf:
-        write_sdf_gz([(mol, ids, key) for mol, ids, _, key in sorted_entries], output_sdf)
+        write_sdf_gz([(mol, ids, key) for mol, ids, _, key, _ in sorted_entries], output_sdf)
         print(f"Wrote {len(sorted_entries)} molecules → {output_sdf}", file=sys.stderr)
 
 
