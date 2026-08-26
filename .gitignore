@@ -1,3 +1,4 @@
 *.sdf
 *.sdf.gz
 __pycache__/
+merge_test/merged.csv
