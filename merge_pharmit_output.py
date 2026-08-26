@@ -74,7 +74,10 @@ def standardize(mol: Chem.Mol) -> Chem.Mol | None:
 
 VENDOR_PATTERNS = {
     "Enamine_ID":     re.compile(r'^Z\d{6,}$'),
-    "ZINC_ID":        re.compile(r'^ZINC\d+$'),
+    # Pharmit often lists a compound's legacy unprefixed ZINC ID (e.g. "69514405")
+    # right alongside its prefixed one (e.g. "ZINC000069514405"); fold both forms
+    # into ZINC_ID rather than leaving the bare digits to fall through to other_IDs.
+    "ZINC_ID":        re.compile(r'^(?:ZINC\d+|\d+)$'),
     "PubChem_ID":     re.compile(r'^PubChem-\d+$'),
     "CHEMBL_ID":      re.compile(r'^CHEMBL\d+$'),
     "MCULE_ID":       re.compile(r'^MCULE-\d+$'),
