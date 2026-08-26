@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 merge_pharmit_output.py — merge SDF archives, deduplicate by InChIKey,
-and write a merged SDF (with 3D poses + vendor ID properties) and a CSV
-lookup table (SMILES + affinity + per-vendor IDs).
+and write a merged SDF (2D layout + vendor ID properties, docking affinity
+kept as an SDF property) and a CSV lookup table (SMILES + affinity + per-vendor
+IDs). Deduplication happens before the 2D layout is generated, against the
+original sanitized docking-pose molecules, so it is unaffected by the 2D
+flattening below.
 
 Each output molecule is assigned a sequential Compound_ID (ID_000001,
 ID_000002, …) that is guaranteed unique regardless of vendor ID availability.
@@ -120,6 +123,12 @@ def write_sdf_gz(mols_data: list, outpath: str):
             mol.SetProp("_Name", best_display_name(vendor_ids, inchikey))
             mol.SetProp("Compound_ID", compound_id)
             mol.SetProp("Structure_ID", compound_id)
+            # Docking-pose Z coords are non-zero absolute pocket coordinates
+            # (~477-480 A); DataWarrior renders those as invisible structures,
+            # so replace them with a proper 2D layout. Affinity/vendor IDs are
+            # kept as SDF properties; only the geometry is flattened, and only
+            # after dedup (see module docstring), so this doesn't affect
+            # duplicate detection.
             AllChem.Compute2DCoords(mol)
             writer.write(mol)
         writer.close()
@@ -132,7 +141,10 @@ def write_csv(entries: list, outpath: str):
         writer = csv.writer(f)
         writer.writerow(["Compound_ID", "SMILES", "affinity"] + vendor_cols)
         for i, (mol, vendor_ids, affinity, inchikey) in enumerate(entries, 1):
-            smi = Chem.MolToSmiles(mol)
+            # Docking poses carry explicit Hs (removeHs=False on read); strip
+            # them for the lookup-table SMILES so it's a normal canonical
+            # SMILES instead of e.g. "[H]OC([H])([H])C([H])([H])[H]".
+            smi = Chem.MolToSmiles(Chem.RemoveHs(mol))
             compound_id = f"ID_{i:06d}"
             row = [compound_id, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_cols]
             writer.writerow(row)
