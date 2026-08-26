@@ -91,7 +91,7 @@ def write_sdf_gz(mols_data: list, outpath: str, vendor_order: list[str]):
                 prop = f"{vendor}_ID"
                 id_list = vendor_ids.get(vendor, [])
                 if id_list:
-                    mol.SetProp(prop, " ".join(id_list))
+                    mol.SetProp(prop, ",".join(id_list))
                 elif mol.HasProp(prop):
                     mol.ClearProp(prop)
             compound_id = f"ID_{i:06d}"
@@ -121,7 +121,7 @@ def write_csv(entries: list, outpath: str, vendor_order: list[str]):
             # SMILES instead of e.g. "[H]OC([H])([H])C([H])([H])[H]".
             smi = Chem.MolToSmiles(Chem.RemoveHs(mol))
             compound_id = f"ID_{i:06d}"
-            row = [compound_id, smi, affinity] + [" ".join(vendor_ids.get(v, [])) for v in vendor_order]
+            row = [compound_id, smi, affinity] + [",".join(vendor_ids.get(v, [])) for v in vendor_order]
             writer.writerow(row)
 
 
