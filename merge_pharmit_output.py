@@ -97,6 +97,14 @@ NAME_PRIORITY = ["CHEMBL_ID", "Enamine_ID", "ZINC_ID", "PubChem_ID",
                  "ChemSpace_ID", "LabNetwork_ID", "NSC_ID", "MCULE-Ultimate_ID"]
 
 
+def _normalize_zinc(tok: str) -> str:
+    """Collapse ZINC's various ID spellings (bare digits, 8-digit legacy
+    padding, 12-digit modern padding) to one canonical "ZINC" + 12-digit
+    form, so the same accession doesn't show up multiple times per compound."""
+    digits = tok[4:] if tok.startswith("ZINC") else tok
+    return f"ZINC{int(digits):012d}"
+
+
 def parse_vendor_ids(name_field: str) -> dict[str, list[str]]:
     """Split a space-separated name field into per-vendor ID lists, by
     matching each token's own ID format — not by which input file it's in
@@ -108,7 +116,10 @@ def parse_vendor_ids(name_field: str) -> dict[str, list[str]]:
         matched = False
         for vendor, pat in VENDOR_PATTERNS.items():
             if pat.match(tok):
-                ids[vendor].append(tok)
+                if vendor == "ZINC_ID":
+                    tok = _normalize_zinc(tok)
+                if tok not in ids[vendor]:
+                    ids[vendor].append(tok)
                 matched = True
                 break
         if not matched:
