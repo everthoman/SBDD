@@ -7,9 +7,11 @@ IDs). Deduplication happens before the 2D layout is generated, against the
 original sanitized docking-pose molecules, so it is unaffected by the 2D
 flattening below.
 
-Each input file is one vendor/database's search results; the vendor name is
-given explicitly on the command line (not inferred from the filename or from
-the compound name text) and used verbatim as that file's ID column name.
+Each input file is one vendor/database's search results. The vendor name is
+taken from the filename's trailing _VENDOR segment (e.g.
+search1_hits_Enamine.sdf.gz → "Enamine"), or can be set explicitly with
+VENDOR=FILE.sdf[.gz]; either way it's used verbatim as that file's ID column
+name — not inferred from the compound name text.
 
 Each output molecule is assigned a sequential Compound_ID (ID_000001,
 ID_000002, …) that is guaranteed unique regardless of vendor ID availability.
@@ -19,7 +21,7 @@ best available vendor ID for display in molecule viewers (priority: order the
 vendors were given on the command line, then InChIKey).
 
 Usage:
-    python merge_pharmit_output.py VENDOR1=FILE1.sdf.gz VENDOR2=FILE2.sdf.gz ... \
+    python merge_pharmit_output.py results_hits_Enamine.sdf.gz results_hits_ZINC.sdf.gz ... \
         [-o OUTPUT.sdf.gz] [--csv OUTPUT.csv]
 """
 
@@ -184,23 +186,42 @@ def aggregate(inputs: list[tuple[str, str]], output_sdf: str | None, output_csv:
         print(f"Wrote {len(sorted_entries)} molecules → {output_sdf}", file=sys.stderr)
 
 
-def parse_input_arg(arg: str) -> tuple[str, str]:
-    if "=" not in arg:
-        raise argparse.ArgumentTypeError(
-            f"expected VENDOR=FILE.sdf[.gz], got {arg!r} (missing '=')"
-        )
-    vendor, _, path = arg.partition("=")
-    vendor = vendor.strip()
+def vendor_from_filename(path: str) -> str:
+    """Derive the vendor name from a file named like blabla_blablabla_VENDOR.sdf[.gz]
+    — the last underscore-separated segment of the filename stem."""
+    name = Path(path).name
+    for suffix in (".sdf.gz", ".sdf"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    vendor = name.rsplit("_", 1)[-1]
     if not vendor:
-        raise argparse.ArgumentTypeError(f"empty vendor name in {arg!r}")
-    return vendor, path
+        raise argparse.ArgumentTypeError(
+            f"could not derive a vendor name from filename {path!r} "
+            f"(expected ..._VENDOR.sdf[.gz]); use VENDOR={path} to set it explicitly"
+        )
+    return vendor
+
+
+def parse_input_arg(arg: str) -> tuple[str, str]:
+    """VENDOR=FILE.sdf[.gz] for an explicit vendor tag, or just FILE.sdf[.gz]
+    to derive the vendor from the filename's trailing _VENDOR segment."""
+    if "=" in arg:
+        vendor, _, path = arg.partition("=")
+        vendor = vendor.strip()
+        if not vendor:
+            raise argparse.ArgumentTypeError(f"empty vendor name in {arg!r}")
+        return vendor, path
+    return vendor_from_filename(arg), arg
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("inputs", nargs="+", type=parse_input_arg,
-                        metavar="VENDOR=FILE.sdf[.gz]",
-                        help="Input SDF archives, each tagged with its vendor name")
+                        metavar="FILE.sdf[.gz]",
+                        help="Input SDF archives, named ..._VENDOR.sdf[.gz] "
+                             "(vendor is the filename's trailing _VENDOR segment), "
+                             "or VENDOR=FILE.sdf[.gz] to set the vendor explicitly")
     parser.add_argument("-o", "--output", default="aggregated.sdf.gz",
                         help="Output SDF (default: aggregated.sdf.gz; empty string to skip)")
     parser.add_argument("--csv", default="pharmit_merged.csv",
