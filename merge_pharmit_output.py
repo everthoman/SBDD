@@ -103,11 +103,11 @@ def open_sdf(path: str):
 
 
 def read_mols(path: str):
+    """Yield every record's mol, including None for records that failed to
+    parse/sanitize, so callers can count them alongside other skips."""
     with open_sdf(path) as fh:
         suppl = Chem.ForwardSDMolSupplier(fh, removeHs=False)
-        for mol in suppl:
-            if mol is not None:
-                yield mol
+        yield from suppl
 
 
 def write_sdf_gz(mols_data: list, outpath: str):
@@ -160,6 +160,9 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
     for path in input_files:
         print(f"Reading {path} …", file=sys.stderr)
         for mol in read_mols(path):
+            if mol is None:
+                skipped += 1
+                continue
             inchi = MolToInchi(mol)
             if inchi is None:
                 skipped += 1
@@ -187,7 +190,7 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
 
     print(f"  Unique structures: {len(registry)}", file=sys.stderr)
     if skipped:
-        print(f"  Skipped (no InChI): {skipped}", file=sys.stderr)
+        print(f"  Skipped (parse/sanitize or InChI failure): {skipped}", file=sys.stderr)
 
     # sort by affinity (best first); carry InChIKey as fallback ID
     sorted_entries = [
