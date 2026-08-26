@@ -21,7 +21,10 @@ Structure_ID is set to the same value for compatibility with downstream tools
 such as gnina.py (--id-column Structure_ID). The molecule _Name retains the
 best available vendor ID for display in molecule viewers (priority: CHEMBL >
 Enamine > ZINC > PubChem > MCULE > MolPort > CSC > ChemDiv > ChemSpace >
-LabNetwork > NSC > other > InChIKey).
+LabNetwork > NSC > MCULE-Ultimate > other > InChIKey). MCULE-Ultimate is a
+virtual make-on-demand space with no persistent catalog numbers — its
+compounds are addressed by InChIKey, so InChIKey-shaped tokens now get their
+own column instead of being silently discarded as noise.
 
 Usage:
     python merge_pharmit_output.py [FILE1.sdf.gz FILE2.sdf.gz ...] \
@@ -57,13 +60,14 @@ VENDOR_PATTERNS = {
     "ChemSpace_ID":   re.compile(r'^CSSS\d+$'),
     "LabNetwork_ID":  re.compile(r'^LN\d+$'),
     "NSC_ID":         re.compile(r'^NSC\d+$'),
+    # MCULE-Ultimate is a virtual make-on-demand space too large for
+    # persistent catalog numbers; its compounds are addressed by InChIKey.
+    "MCULE-Ultimate_ID": re.compile(r'^[A-Z]{14}-[A-Z]{10}-[A-Z]$'),
 }
-
-_INCHIKEY_RE = re.compile(r'^[A-Z]{14}-[A-Z]{10}-[A-Z]$')
 
 NAME_PRIORITY = ["CHEMBL_ID", "Enamine_ID", "ZINC_ID", "PubChem_ID",
                  "MCULE_ID", "MolPort_ID", "CSC_ID", "ChemDiv_ID",
-                 "ChemSpace_ID", "LabNetwork_ID", "NSC_ID"]
+                 "ChemSpace_ID", "LabNetwork_ID", "NSC_ID", "MCULE-Ultimate_ID"]
 
 
 def parse_vendor_ids(name_field: str) -> dict[str, list[str]]:
@@ -74,8 +78,6 @@ def parse_vendor_ids(name_field: str) -> dict[str, list[str]]:
     ids: dict[str, list[str]] = {k: [] for k in VENDOR_PATTERNS}
     ids["other_IDs"] = []
     for tok in name_field.split():
-        if _INCHIKEY_RE.match(tok):
-            continue  # InChIKey used as name (e.g. Mcule-Ultimate) — skip
         matched = False
         for vendor, pat in VENDOR_PATTERNS.items():
             if pat.match(tok):
