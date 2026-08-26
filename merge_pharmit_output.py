@@ -80,7 +80,7 @@ VENDOR_PATTERNS = {
     "MCULE_ID":       re.compile(r'^MCULE-\d+$'),
     "MolPort_ID":     re.compile(r'^(?:MolPort|Molport)-\d{3}-\d{3}-\d{3}$'),
     "CSC_ID":         re.compile(r'^CSC\d+$'),
-    "ChemDiv_ID":     re.compile(r'^ChemDiv-\d+-\d+$'),
+    "ChemDiv_ID":     re.compile(r'^ChemDiv-[A-Z0-9]{4}-\d{4}[A-Z]?$'),
     "ChemSpace_ID":   re.compile(r'^CSSS\d+$'),
     "LabNetwork_ID":  re.compile(r'^LN\d+$'),
     "NSC_ID":         re.compile(r'^NSC\d+$'),
