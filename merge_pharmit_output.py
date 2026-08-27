@@ -162,8 +162,16 @@ def read_mols(path: str):
         yield from suppl
 
 
-def write_sdf_gz(mols_data: list, outpath: str):
-    with gzip.open(outpath, "wt") as fh:
+def open_sdf_out(path: str):
+    """Open an SDF output stream in text mode, gzip-compressed iff the path
+    ends in .gz (mirrors open_sdf on the read side)."""
+    if Path(path).suffix == ".gz":
+        return gzip.open(path, "wt")
+    return open(path, "w")
+
+
+def write_sdf(mols_data: list, outpath: str):
+    with open_sdf_out(outpath) as fh:
         writer = Chem.SDWriter(fh)   # type: ignore[arg-type]
         for i, (mol, vendor_ids, inchikey) in enumerate(mols_data, 1):
             for vendor, id_list in vendor_ids.items():
@@ -256,7 +264,7 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
         print(f"Wrote {len(sorted_entries)} rows → {output_csv}", file=sys.stderr)
 
     if output_sdf:
-        write_sdf_gz([(mol, ids, key) for mol, ids, _, key, _ in sorted_entries], output_sdf)
+        write_sdf([(mol, ids, key) for mol, ids, _, key, _ in sorted_entries], output_sdf)
         print(f"Wrote {len(sorted_entries)} molecules → {output_sdf}", file=sys.stderr)
 
 
@@ -264,7 +272,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("inputs", nargs="+", metavar="FILE.sdf[.gz]", help="Input SDF archives")
     parser.add_argument("-o", "--output", default="aggregated.sdf.gz",
-                        help="Output SDF (default: aggregated.sdf.gz; empty string to skip)")
+                        help="Output SDF; gzip-compressed iff the name ends in .gz "
+                             "(default: aggregated.sdf.gz; empty string to skip)")
     parser.add_argument("--csv", default="pharmit_merged.csv",
                         help="Output CSV (default: pharmit_merged.csv; empty string to skip)")
     args = parser.parse_args()

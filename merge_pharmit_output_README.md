@@ -77,7 +77,7 @@ merge_pharmit_output.py FILE1.sdf[.gz] [FILE2.sdf[.gz] ...] [-o OUTPUT.sdf.gz] [
 | Flag | Default | Description |
 |---|---|---|
 | `inputs` | required | One or more input SDF archives (`.sdf` or `.sdf.gz`) |
-| `-o / --output FILE` | `aggregated.sdf.gz` | Merged SDF output; pass `""` to skip |
+| `-o / --output FILE` | `aggregated.sdf.gz` | Merged SDF output; gzip-compressed iff the name ends in `.gz`, plain text otherwise; pass `""` to skip |
 | `--csv FILE` | `pharmit_merged.csv` | CSV lookup table output; pass `""` to skip |
 
 ---
