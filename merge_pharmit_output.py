@@ -27,8 +27,10 @@ compounds are addressed by InChIKey, so InChIKey-shaped tokens now get their
 own column instead of being silently discarded as noise.
 
 Usage:
-    python merge_pharmit_output.py [FILE1.sdf.gz FILE2.sdf.gz ...] \
-        [-o OUTPUT.sdf.gz] [--csv OUTPUT.csv]
+    python merge_pharmit_output.py FILE1.sdf.gz [FILE2.sdf.gz ...] \
+        [-o NAME] [--no-sdf] [--no-csv]
+
+-o gives a shared stem: the run writes NAME.sdf (plain text) and NAME.csv.
 """
 
 from __future__ import annotations
@@ -162,16 +164,8 @@ def read_mols(path: str):
         yield from suppl
 
 
-def open_sdf_out(path: str):
-    """Open an SDF output stream in text mode, gzip-compressed iff the path
-    ends in .gz (mirrors open_sdf on the read side)."""
-    if Path(path).suffix == ".gz":
-        return gzip.open(path, "wt")
-    return open(path, "w")
-
-
 def write_sdf(mols_data: list, outpath: str):
-    with open_sdf_out(outpath) as fh:
+    with open(outpath, "w") as fh:
         writer = Chem.SDWriter(fh)   # type: ignore[arg-type]
         for i, (mol, vendor_ids, inchikey) in enumerate(mols_data, 1):
             for vendor, id_list in vendor_ids.items():
@@ -268,17 +262,33 @@ def aggregate(input_files: list[str], output_sdf: str | None, output_csv: str | 
         print(f"Wrote {len(sorted_entries)} molecules → {output_sdf}", file=sys.stderr)
 
 
+def output_stem(name: str) -> str:
+    """Strip a trailing .sdf / .csv / .sdf.gz so -o accepts either a bare
+    stem or a filename with an extension, and both outputs share the stem."""
+    p = Path(name)
+    if p.suffix == ".gz":
+        p = p.with_suffix("")
+    if p.suffix in (".sdf", ".csv"):
+        p = p.with_suffix("")
+    return str(p)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("inputs", nargs="+", metavar="FILE.sdf[.gz]", help="Input SDF archives")
-    parser.add_argument("-o", "--output", default="aggregated.sdf.gz",
-                        help="Output SDF; gzip-compressed iff the name ends in .gz "
-                             "(default: aggregated.sdf.gz; empty string to skip)")
-    parser.add_argument("--csv", default="pharmit_merged.csv",
-                        help="Output CSV (default: pharmit_merged.csv; empty string to skip)")
+    parser.add_argument("-o", "--output", default="pharmit_merged", metavar="NAME",
+                        help="Output stem; writes NAME.sdf and NAME.csv "
+                             "(default: pharmit_merged). A trailing .sdf/.csv/.gz is stripped.")
+    parser.add_argument("--no-sdf", action="store_true", help="Skip the merged SDF output")
+    parser.add_argument("--no-csv", action="store_true", help="Skip the CSV lookup table")
     args = parser.parse_args()
 
-    aggregate(args.inputs, args.output or None, args.csv or None)
+    stem = output_stem(args.output)
+    aggregate(
+        args.inputs,
+        None if args.no_sdf else f"{stem}.sdf",
+        None if args.no_csv else f"{stem}.csv",
+    )
 
 
 if __name__ == "__main__":

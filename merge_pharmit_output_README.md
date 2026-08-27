@@ -71,14 +71,15 @@ never appears twice.
 ## Usage
 
 ```
-merge_pharmit_output.py FILE1.sdf[.gz] [FILE2.sdf[.gz] ...] [-o OUTPUT.sdf.gz] [--csv OUTPUT.csv]
+merge_pharmit_output.py FILE1.sdf[.gz] [FILE2.sdf[.gz] ...] [-o NAME] [--no-sdf] [--no-csv]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `inputs` | required | One or more input SDF archives (`.sdf` or `.sdf.gz`) |
-| `-o / --output FILE` | `aggregated.sdf.gz` | Merged SDF output; gzip-compressed iff the name ends in `.gz`, plain text otherwise; pass `""` to skip |
-| `--csv FILE` | `pharmit_merged.csv` | CSV lookup table output; pass `""` to skip |
+| `-o / --output NAME` | `pharmit_merged` | Output stem; writes `NAME.sdf` (plain text) and `NAME.csv`. A trailing `.sdf`, `.csv`, or `.gz` is stripped, so `-o merged.sdf` and `-o merged` behave the same |
+| `--no-sdf` | off | Skip the merged SDF output |
+| `--no-csv` | off | Skip the CSV lookup table |
 
 ---
 
@@ -104,18 +105,18 @@ Vendor cells hold comma-separated IDs when a compound has more than one for that
 
 ### Merge every vendor hit list for one target
 ```bash
-merge_pharmit_output.py 5VDH_7C6_*.sdf.gz -o merged.sdf.gz --csv merged.csv
+merge_pharmit_output.py 5VDH_7C6_*.sdf.gz -o merged     # → merged.sdf + merged.csv
 ```
 
 ### CSV only, no merged SDF
 ```bash
-merge_pharmit_output.py *.sdf.gz -o "" --csv merged.csv
+merge_pharmit_output.py *.sdf.gz -o merged --no-sdf
 ```
 
 ### Merged SDF only, feed straight into gnina.py
 ```bash
-merge_pharmit_output.py *.sdf.gz -o merged.sdf.gz --csv ""
-gnina.py sp -r receptor.pdb -a ref.sdf -l merged.sdf.gz -o docked --id-column Structure_ID
+merge_pharmit_output.py *.sdf.gz -o merged --no-csv
+gnina.py sp -r receptor.pdb -a ref.sdf -l merged.sdf -o docked --id-column Structure_ID
 ```
 
 ---
