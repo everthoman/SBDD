@@ -61,11 +61,13 @@ def _best_gpu_ids(n: int) -> list[int]:
 
     Falls back to [0, ..., n-1] if nvidia-smi is unavailable.
     GPUs below _MIN_COMPUTE_CAP are excluded; if none qualify, falls back to all GPUs.
+    GPUs driving a display are excluded (to keep the screen's card free);
+    if every card drives a display, falls back to all of them.
     """
     try:
         out = subprocess.check_output(
             ["nvidia-smi",
-             "--query-gpu=index,compute_cap,memory.free",
+             "--query-gpu=index,compute_cap,memory.free,display_active",
              "--format=csv,noheader,nounits"],
             text=True,
         )
@@ -75,18 +77,20 @@ def _best_gpu_ids(n: int) -> list[int]:
     gpus = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 3:
+        if len(parts) != 4:
             continue
         try:
             idx, cc, free = int(parts[0]), float(parts[1]), int(parts[2])
         except ValueError:
             continue
-        gpus.append((idx, cc, free))
+        gpus.append((idx, cc, free, parts[3].lower() == "yes"))
 
-    capable = [(idx, cc, free) for idx, cc, free in gpus if cc >= _MIN_COMPUTE_CAP]
+    capable = [(idx, cc, free, da) for idx, cc, free, da in gpus if cc >= _MIN_COMPUTE_CAP]
     pool = capable if capable else gpus
+    headless = [g for g in pool if not g[3]]
+    pool = headless if headless else pool
     pool.sort(key=lambda x: (x[1], x[2]), reverse=True)
-    return [idx for idx, _, _ in pool[:n]]
+    return [idx for idx, *_ in pool[:n]]
 
 _AUTO_CPUS = os.cpu_count() or 1
 _DEFAULT_GNINA = "/opt/gnina/gnina"
@@ -94,9 +98,17 @@ _DEFAULT_GNINA = "/opt/gnina/gnina"
 
 # ─────────────────────────── SHARED UTILITIES ────────────────────────────────
 
-def count_molecules_in_sdf(sdf_file):
+def read_sdf_ids(sdf_file, id_column):
+    """Return (molecule_count, set_of_ids) for the given SDF property."""
     suppl = Chem.SDMolSupplier(sdf_file, sanitize=False, removeHs=False)
-    return sum(1 for m in suppl if m is not None)
+    count, ids = 0, set()
+    for m in suppl:
+        if m is None:
+            continue
+        count += 1
+        if m.HasProp(id_column):
+            ids.add(m.GetProp(id_column).strip())
+    return count, ids
 
 
 def split_ligands(input_file, total_batches, batch_dir):
@@ -240,14 +252,16 @@ def print_config(args, n_batches, threads_per_job):
     print(f"{'═' * 56}\n")
 
 
-def finalize(args, dock_output_dir, start_time, n_input):
+def finalize(args, dock_output_dir, start_time, n_input, input_ids,
+             n_batches, failed_batches):
     temp_sdf = f"{args.output}_unsorted.sdf"
     total_merged = merge_sdf(temp_sdf, dock_output_dir)
     if total_merged == 0:
         if os.path.exists(temp_sdf):
             os.remove(temp_sdf)
-        print("[ERROR] No poses were produced — all docking jobs failed. Check gnina logs in gnina_tmp/_docked/")
-        return
+        print(f"[ERROR] No poses were produced — all docking jobs failed. "
+              f"Check gnina logs in {dock_output_dir}")
+        return False
     sort_and_export(
         temp_sdf,
         f"{args.output}.sdf",
@@ -257,18 +271,34 @@ def finalize(args, dock_output_dir, start_time, n_input):
     os.remove(temp_sdf)
 
     elapsed = time.time() - start_time
-    n_docked = count_molecules_in_sdf(f"{args.output}.sdf")
-    secs_per = elapsed / n_docked if n_docked else float('inf')
+    n_poses, output_ids = read_sdf_ids(f"{args.output}.sdf", args.id_column)
+    n_ligands_docked = len(output_ids) if output_ids else n_poses
+    secs_per = elapsed / n_ligands_docked if n_ligands_docked else float('inf')
+
+    if failed_batches:
+        shown = ", ".join(sorted(failed_batches)[:10])
+        more = f" (+{len(failed_batches) - 10} more)" if len(failed_batches) > 10 else ""
+        print(f"[WARN] {len(failed_batches)}/{n_batches} batches failed: {shown}{more}")
+    if input_ids:
+        missing = input_ids - output_ids
+        if missing:
+            shown = ", ".join(sorted(missing)[:10])
+            more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+            print(f"[WARN] {len(missing)}/{n_input} input ligands missing from output: {shown}{more}")
 
     print(f"\n{'═' * 56}")
     print(f"  Mode:             {args.mode.upper()}")
     print(f"  Input ligands:    {n_input}")
-    print(f"  Docked poses:     {n_docked}")
+    print(f"  Docked poses:     {n_poses}")
+    if args.num_modes > 1:
+        print(f"  Ligands docked:   {n_ligands_docked}")
+    print(f"  Failed batches:   {len(failed_batches)}/{n_batches}")
     print(f"  Total time:       {format_time(elapsed)}")
     print(f"  Avg / ligand:     {secs_per:.2f} s")
     print(f"  Output SDF:       {args.output}.sdf")
     print(f"  Scores TSV:       {args.output}_scores.tsv")
     print(f"{'═' * 56}")
+    return True
 
 
 # ─────────────────────────── HTVS (CPU-ONLY) ─────────────────────────────────
@@ -304,7 +334,7 @@ def run_gnina_cpu(ligand_batch, args, dock_output_dir):
             raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
-def cpu_worker(job_queue, args, dock_output_dir, pbar):
+def cpu_worker(job_queue, args, dock_output_dir, pbar, failed_batches):
     while True:
         try:
             batch = job_queue.get_nowait()
@@ -314,6 +344,7 @@ def cpu_worker(job_queue, args, dock_output_dir, pbar):
             run_gnina_cpu(batch, args, dock_output_dir)
         except Exception as e:
             print(f"[ERROR] {os.path.basename(batch)}: {e}")
+            failed_batches.append(os.path.basename(batch))
         finally:
             job_queue.task_done()
             pbar.update(1)
@@ -326,7 +357,7 @@ def run_htvs(args, parser):
     dock_output_dir = os.path.join(args.output_dir, "_docked")
 
     print(f"[INFO] Counting ligands…")
-    n_ligands = count_molecules_in_sdf(args.ligands)
+    n_ligands, input_ids = read_sdf_ids(args.ligands, args.id_column)
 
     # Never create more batches than ligands
     n_batches = min(args.cpus, n_ligands)
@@ -342,11 +373,12 @@ def run_htvs(args, parser):
     for b in batches:
         jq.put(b)
 
+    failed_batches = []
     start = time.time()
     with tqdm(total=n_batches, desc="Docking (HTVS)", unit="batch") as pbar:
         threads = [
             threading.Thread(target=cpu_worker,
-                             args=(jq, args, dock_output_dir, pbar))
+                             args=(jq, args, dock_output_dir, pbar, failed_batches))
             for _ in range(n_batches)
         ]
         for t in threads:
@@ -354,7 +386,10 @@ def run_htvs(args, parser):
         for t in threads:
             t.join()
 
-    finalize(args, dock_output_dir, start, n_ligands)
+    if not finalize(args, dock_output_dir, start, n_ligands, input_ids,
+                    n_batches, failed_batches):
+        print(f"[CLEANUP] Keeping temporary files for debugging: {args.output_dir}")
+        return
     cleanup(batch_dir, dock_output_dir, args.keep_temp)
 
 
@@ -391,7 +426,8 @@ def run_gnina_gpu(ligand_batch, gpu_id, threads_per_job, args, dock_output_dir):
             raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
-def gpu_worker(gpu_id, threads_per_job, job_queue, args, dock_output_dir, pbar):
+def gpu_worker(gpu_id, threads_per_job, job_queue, args, dock_output_dir, pbar,
+               failed_batches):
     while True:
         try:
             batch = job_queue.get_nowait()
@@ -401,6 +437,7 @@ def gpu_worker(gpu_id, threads_per_job, job_queue, args, dock_output_dir, pbar):
             run_gnina_gpu(batch, gpu_id, threads_per_job, args, dock_output_dir)
         except Exception as e:
             print(f"[ERROR][GPU {gpu_id}] {os.path.basename(batch)}: {e}")
+            failed_batches.append(os.path.basename(batch))
         finally:
             job_queue.task_done()
             pbar.update(1)
@@ -412,10 +449,9 @@ def run_gpu_docking(args, parser):
     batch_dir       = os.path.join(args.output_dir, "_batches")
     dock_output_dir = os.path.join(args.output_dir, "_docked")
 
-    # Resolve GPU IDs: 'auto' triggers detection; explicit list is used as-is
-    if args.gpu_ids and args.gpu_ids.strip().lower() == "auto":
-        gpu_ids = _best_gpu_ids(args.num_gpus)
-    elif args.gpu_ids:
+    # Resolve GPU IDs: an explicit list is used as-is; otherwise
+    # auto-select the best --num-gpus by compute capability and free memory
+    if args.gpu_ids and args.gpu_ids.strip().lower() != "auto":
         gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
     else:
         gpu_ids = _best_gpu_ids(args.num_gpus)
@@ -425,7 +461,7 @@ def run_gpu_docking(args, parser):
     threads_per_job = max(1, args.cpus // args.num_gpus)
 
     print(f"[INFO] Counting ligands…")
-    n_ligands   = count_molecules_in_sdf(args.ligands)
+    n_ligands, input_ids = read_sdf_ids(args.ligands, args.id_column)
     max_batches = args.num_gpus * args.batches_per_gpu
     n_batches   = min(max_batches, n_ligands)
 
@@ -441,13 +477,15 @@ def run_gpu_docking(args, parser):
     for b in batches:
         jq.put(b)
 
+    failed_batches = []
     start = time.time()
     with tqdm(total=n_batches, desc=f"Docking ({args.mode.upper()})", unit="batch") as pbar:
         # One worker thread per GPU; each drains the shared queue sequentially,
         # so no two jobs ever share the same GPU simultaneously.
         threads = [
             threading.Thread(target=gpu_worker,
-                             args=(gpu_id, threads_per_job, jq, args, dock_output_dir, pbar))
+                             args=(gpu_id, threads_per_job, jq, args, dock_output_dir, pbar,
+                                   failed_batches))
             for gpu_id in gpu_ids
         ]
         for t in threads:
@@ -455,7 +493,10 @@ def run_gpu_docking(args, parser):
         for t in threads:
             t.join()
 
-    finalize(args, dock_output_dir, start, n_ligands)
+    if not finalize(args, dock_output_dir, start, n_ligands, input_ids,
+                    n_batches, failed_batches):
+        print(f"[CLEANUP] Keeping temporary files for debugging: {args.output_dir}")
+        return
     cleanup(batch_dir, dock_output_dir, args.keep_temp)
 
 
@@ -569,9 +610,10 @@ Resource allocation:
         through --batches-per-gpu batches.
 
 GPU selection (sp/xp):
-  --gpu defaults to 1. Pass --gpu auto to select by compute capability and
-  free memory, skipping cards below CC 6.0 (Kepler/Maxwell). Use a
-  comma-separated list for multi-GPU runs (e.g. --gpu 0,1).
+  By default the best --num-gpus GPUs are auto-selected by compute
+  capability and free memory, skipping cards below CC 6.0 (Kepler/Maxwell)
+  and any card driving a display. Pass --gpu with a comma-separated list
+  for explicit multi-GPU runs (e.g. --gpu 0,1).
 
 Examples:
   %(prog)s -r receptor.pdb -a ref.sdf -l hits.sdf -o sp_out          # sp is default
@@ -623,16 +665,17 @@ Examples:
     sp.add_argument(
         "--num-gpus", type=int, default=1, dest="num_gpus",
         help=(
-            "Number of GPUs to use in parallel (default: 1). "
-            "Ignored if --gpu is given (GPU count is inferred from the ID list)."
+            "Number of GPUs to use in parallel when --gpu is omitted or set to auto (default: 1). "
+            "Ignored if an explicit --gpu ID list is given (GPU count is inferred from the list)."
         ),
     )
     sp.add_argument(
-        "--gpu", "--gpu-ids", type=str, default="1", dest="gpu_ids",
+        "--gpu", "--gpu-ids", type=str, default=None, dest="gpu_ids",
         help=(
-            "Comma-separated CUDA device IDs to use, e.g. '1' or '0,1' "
-            "(default: 1). Override with auto-select by passing --gpu auto, "
-            "which skips cards below compute capability 6.0 such as Kepler/Maxwell."
+            "Comma-separated CUDA device IDs to use, e.g. '1' or '0,1'. "
+            "Omit (or pass 'auto') to auto-select the best --num-gpus GPUs by "
+            "compute capability and free memory, skipping cards below CC 6.0 "
+            "(Kepler/Maxwell) and any card driving a display."
         ),
     )
     sp.add_argument(
@@ -667,16 +710,17 @@ Examples:
     xp.add_argument(
         "--num-gpus", type=int, default=1, dest="num_gpus",
         help=(
-            "Number of GPUs to use in parallel (default: 1). "
-            "Ignored if --gpu is given (GPU count is inferred from the ID list)."
+            "Number of GPUs to use in parallel when --gpu is omitted or set to auto (default: 1). "
+            "Ignored if an explicit --gpu ID list is given (GPU count is inferred from the list)."
         ),
     )
     xp.add_argument(
-        "--gpu", "--gpu-ids", type=str, default="1", dest="gpu_ids",
+        "--gpu", "--gpu-ids", type=str, default=None, dest="gpu_ids",
         help=(
-            "Comma-separated CUDA device IDs to use, e.g. '1' or '0,1' "
-            "(default: 1). Override with auto-select by passing --gpu auto, "
-            "which skips cards below compute capability 6.0 such as Kepler/Maxwell."
+            "Comma-separated CUDA device IDs to use, e.g. '1' or '0,1'. "
+            "Omit (or pass 'auto') to auto-select the best --num-gpus GPUs by "
+            "compute capability and free memory, skipping cards below CC 6.0 "
+            "(Kepler/Maxwell) and any card driving a display."
         ),
     )
     xp.add_argument(
