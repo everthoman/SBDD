@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.7.1
+PoseViewer - PyMOL Plugin  v1.7.2
 =================================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.7.1
+Version: 1.7.2
 License: MIT
 """
 
@@ -113,6 +113,13 @@ CLASH_UGLY_FRAC = 0.75        # severe steric overlap
 CLASH_DIST_MAX = 2.0 * max(VDW_RADII.values()) * CLASH_GOOD_FRAC
 
 SHELL_DIST = 5.0
+# The pocket surface is a piece of the real protein molecular surface: computed
+# on a generous residue shell (so the solvent-excluded surface is correct near
+# the pocket) and then carved back to just the wall facing the ligand.  Surfacing
+# only the atoms within SHELL_DIST instead produced a closed blob around a bag of
+# clipped side chains that swallowed the pocket residues whole.
+SURF_SHELL_DIST = SHELL_DIST + 3.0   # atoms fed to the surface calculation
+SURF_CARVE_DIST = SHELL_DIST         # surface kept within this distance of the ligand
 ZOOM_BUFFER = 2.0             # padding around the binding site when auto-zooming
 
 DASH_RADIUS = 0.06
@@ -132,6 +139,7 @@ _OBJ_PTS        = "_ci_pts"
 _OBJ_SNAP       = "_ci_snap"     # single-state pose copies used by `within`
 _OBJ_SHELL      = "_ci_shell"    # materialised shell selection
 _OBJ_SHELL_ATOMS = "_ci_shell_atoms"
+_OBJ_CARVE      = "_ci_carve"    # single-state ligand copy the surface carves against
 _OBJ_REF_PTS    = "_ci_ref_pts"
 _OBJ_SURF       = "_ci_surf"
 
@@ -165,10 +173,11 @@ def _clear_shell():
         try: cmd.delete(_OBJ_SHELL)
         except Exception: pass
         _shell_sel = None
-    if _OBJ_SURF in _created_objects:
-        try: cmd.delete(_OBJ_SURF)
-        except Exception: pass
-        _created_objects.discard(_OBJ_SURF)
+    for _o in (_OBJ_SURF, _OBJ_CARVE):
+        if _o in _created_objects:
+            try: cmd.delete(_o)
+            except Exception: pass
+            _created_objects.discard(_o)
 
 def _clear_all():
     _clear_shell()
@@ -842,7 +851,10 @@ def _detect_interactions(
 # ---------------------------------------------------------------------------
 
 def _clear_contacts():
-    keep = {_OBJ_SURF}
+    # _OBJ_SURF and _OBJ_CARVE are the pocket shell, not interaction geometry —
+    # _OBJ_CARVE is what the surface carves against, so dropping it here leaves
+    # surface_carve_selection dangling and the surface fails to render.
+    keep = {_OBJ_SURF, _OBJ_CARVE}
     keep.update(n for n in _created_objects if n.startswith(_AUTOSPLIT_PREFIX))
     for name in list(_created_objects):
         if name not in keep:
@@ -1323,16 +1335,29 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
         _delete_snapshots(snaps)
         return
 
-    # Transparent surface on the atom-based shell (no byres expansion)
+    # Pocket surface: a carved patch of the real protein molecular surface, not
+    # the surface of a bag of clipped atoms.  Surfacing just the atoms within
+    # SHELL_DIST closed the mesh over into a blob that swallowed the pocket
+    # residues; instead build the SES on a wide residue shell (so it is correct
+    # at the pocket wall), keep a single-state ligand copy to carve against, and
+    # trim to the wall within SURF_CARVE_DIST of the ligand (the negative
+    # normal-cutoff keeps the patch continuous rather than dropping to fragments).
     try:
+        cmd.create(_OBJ_CARVE, snap_sel, 1, 1)
+        _track(_OBJ_CARVE)
+        cmd.disable(_OBJ_CARVE)
         cmd.select(_OBJ_SHELL_ATOMS,
-                   f"({protein_sel}) within {dist} of ({snap_sel})",
+                   f"byres (({protein_sel}) within {SURF_SHELL_DIST} "
+                   f"of ({snap_sel}))",
                    enable=0, state=1)
-        cmd.create(_OBJ_SURF, _OBJ_SHELL_ATOMS)
+        cmd.create(_OBJ_SURF, _OBJ_SHELL_ATOMS, 1, 1)
         cmd.delete(_OBJ_SHELL_ATOMS)
         _track(_OBJ_SURF)
         cmd.hide("everything", _OBJ_SURF)
         cmd.show("surface", _OBJ_SURF)
+        cmd.set("surface_carve_selection", _OBJ_CARVE, _OBJ_SURF)
+        cmd.set("surface_carve_cutoff", SURF_CARVE_DIST, _OBJ_SURF)
+        cmd.set("surface_carve_normal_cutoff", -0.5, _OBJ_SURF)
         if _stepper.color_surf_by_type:
             _color_surface_by_type(_OBJ_SURF)
         else:
@@ -4436,7 +4461,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")

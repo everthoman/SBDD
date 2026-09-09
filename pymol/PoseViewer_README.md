@@ -1,4 +1,4 @@
-# PoseViewer v1.7.1
+# PoseViewer v1.7.2
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -379,7 +379,7 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 - `numpy` is optional. It is used only for the best-fit-plane SVD in the aromatic ring planarity test, which falls back to Newell's method without it. The per-pair geometry is deliberately scalar Python — numpy's per-call overhead dominates on 3-vectors and made pose stepping about twice as slow
 - **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no scores file needed, leave the Scores field blank
 - **Open-source PyMOL**: SDF data fields are stripped on load. Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
-- The shell shows residues within 5 Å of the current ligand as lines with CA labels; the surface covers atoms within 5 Å. In objects mode both update per ligand step; in states mode they are computed once at setup, around the first pose
+- The shell shows residues within 5 Å of the current ligand as lines with CA labels. The pocket surface is a carved patch of the real protein molecular surface: the solvent-excluded surface is computed on a wider residue shell (8 Å) for correct geometry, then trimmed to the wall within 5 Å of the ligand — so it hugs the binding site rather than closing over into a blob around whole side chains. In objects mode shell and surface update per ligand step; in states mode they are computed once at setup, around the first pose
 - **Large pose sets** are fine: Setup on a 1600-pose SDF takes well under a second, and stepping is ~20 ms per pose. Every distance-based selection is evaluated against a single-state copy of the current pose and pinned to state 1, because PyMOL's default evaluates `within` once per state in the session — 0.001 s at one state, 0.13 s at 800 — which is what used to make PyMOL appear to hang on a full docking run. A corollary: the shell and surface follow the pose on screen rather than the union of every pose
 - Duplicate interactions caused by alternate conformations (altloc atoms) in PDB structures are automatically removed by spatial deduplication
 - Water bridges require HOH residues in the loaded structure. HOH is searched globally (not limited to `polymer.protein`), so crystallographic waters in the protein PDB are detected even when the protein selection excludes them
