@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.8.3
+PoseViewer - PyMOL Plugin  v1.8.4
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.8.3
+Version: 1.8.4
 License: MIT
 """
 
@@ -123,7 +123,7 @@ SHELL_DIST = 5.0
 # the pocket) and then carved back to just the wall facing the ligand.  Surfacing
 # only the atoms within SHELL_DIST instead produced a closed blob around a bag of
 # clipped side chains that swallowed the pocket residues whole.
-SURF_CARVE_DIST = SHELL_DIST         # default surface reach; GUI-tunable per session
+SURF_CARVE_DIST = 7.5                # default surface reach (Å); GUI-tunable per session
 SURF_SHELL_PAD  = 3.0                # extra reach for the SES scratch geometry
 ZOOM_BUFFER = 2.0             # padding around the binding site when auto-zooming
 
@@ -4522,7 +4522,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.8.3"
+__version__ = "1.8.4"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
