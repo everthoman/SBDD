@@ -22,6 +22,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Docking poses mode**: explicit toggle that gates H-bond compare — avoids meaningless cross-pocket H-bond overlays when browsing extracted ligands from a multi-ligand crystal structure
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
 - Pose data table: sortable, clickable table of docking scores and SD properties per pose
+- **Computed pose metrics**: MCS RMSD, 3D shape similarity, 2D similarity, PLIF similarity and PoseBusters flags are calculated from what is loaded in the session, so they are available even when the docking program never wrote them into the SDF
 - Qt GUI panel with collapsible groups and per-type interaction toggles
 - Interaction summary printed to the PyMOL console on every step
 
@@ -105,6 +106,7 @@ ci_gui
 | `ci_update` | Re-detect interactions for current pose |
 | `ci_refresh` | Sync panel to current PyMOL state |
 | `ci_load_scores <path>` | Load per-pose SD properties from an SDF file |
+| `ci_calc [metrics]` | Compute pose metrics (see [Pose metrics](#pose-metrics)) |
 | `ci_bookmarks` | List all bookmarked poses to the console |
 | `ci_clear` | Remove all PoseViewer objects |
 
@@ -123,6 +125,9 @@ ci_setup
 ci_setup protein=chain A, ligands=LIG1,LIG2,LIG3
 ci_setup protein=polymer.protein, ligands=poses, mode=states
 ci_load_scores /path/to/gnina_output.sdf
+ci_calc                         # MCS_RMSD, Shape_Sim, Ref_Sim
+ci_calc all
+ci_calc mcs_rmsd,plif_sim
 ```
 
 ---
@@ -181,6 +186,18 @@ When browsing auto-split ligands from a protein structure (no SDF), the table sh
 
 **Single-click** a row to navigate to that pose. **Ctrl-click** (or click a second row) to enter compare mode — the two most recently selected rows are shown simultaneously. A third selection automatically drops the oldest, maintaining a rolling window of two. Clicking Prev/Next or Go exits compare mode and resumes single-pose navigation.
 
+### Calculate group
+
+Computes the pose metrics described in [Pose metrics](#pose-metrics) for every pose in
+the current setup.
+
+| Control | Description |
+|---|---|
+| Metric checkboxes | MCS RMSD, shape similarity, 2D similarity are on by default; PLIF similarity and PoseBusters flags are opt-in (slower, and they need a second interpreter) |
+| Calculate | Exports poses/reference/receptor, then runs the selected metrics on a background thread |
+| Cancel | Stops the run; metrics already finished are kept |
+| Progress bar / status | Per-metric progress, then a per-field count of how many poses got a value. Errors are shown here and printed to the console |
+
 ### Interaction groups (Non-covalent bonds / Pi interactions / Contacts/Clashes)
 
 Each group has:
@@ -200,6 +217,97 @@ Individual interaction types can be toggled within each group. Contacts/Clashes 
 | Show nonpolar H on ligands | Off | Show all hydrogens (including nonpolar C-H) on pose and reference ligands as sticks. Off by default (only polar H on N/O/S shown). |
 
 The Display group enable checkbox hides all display elements at once (surface, labels) without changing individual settings.
+
+---
+
+## Pose metrics
+
+Docking output usually carries only the program's own score (`minimizedAffinity`,
+`CNNscore`, ...). PoseViewer can compute five further per-pose metrics from what is
+already loaded in the session — the poses, the reference ligand and the receptor —
+so no re-docking or external post-processing pass is needed. Results are added to the
+Pose Data table as ordinary sortable columns.
+
+Field names match those written by the GNINA webapp, so a computed value and one read
+from the SDF are interchangeable; computing a metric overrides the SDF value for that
+column.
+
+| Field | Metric | Needs | Notes |
+|---|---|---|---|
+| `MCS_RMSD` | Heavy-atom RMSD over the maximum common substructure with the reference | reference | Symmetry-aware (all MCS matchings tried, best kept). **No superposition** — poses and reference already share the receptor frame, so this measures pose deviation, not conformer difference |
+| `Shape_Sim` | 3D shape Tanimoto vs the reference (1 = identical) | reference | Computed on the poses as placed, again without alignment, so it measures overlap with the reference in the site |
+| `Ref_Sim` | 2D Morgan ECFP4 (r=2, 2048 bit) Tanimoto vs the reference | reference | Both molecules are neutralized and tautomer-canonicalized first, so a different protomer/tautomer of the same compound scores 1.0 |
+| `PLIF_Sim` | ProLIF interaction-fingerprint Tanimoto vs the reference | reference + receptor + `prolif` | Reference and all poses run through one `Fingerprint` instance so the bitvectors stay comparable |
+| `PB_Flags` | Number of failed PoseBusters checks (0 = all pass) | receptor + `posebusters` | `dock` config: ligand internal geometry plus intermolecular checks against the receptor |
+
+### Running it
+
+**GUI** — the **Calculate** group (bottom panel): tick the metrics, click **Calculate**.
+The run happens on a background thread with a progress bar, so PyMOL stays responsive,
+and **Cancel** stops it while keeping whatever finished. Reference-based metrics are
+dropped automatically when you pick a different reference ligand.
+
+**Command line** — `ci_calc`, which blocks and prints progress:
+
+```
+ci_calc                      # MCS_RMSD, Shape_Sim, Ref_Sim (the default set)
+ci_calc all                  # adds PLIF_Sim and PB_Flags
+ci_calc mcs_rmsd,plif_sim    # or: MCS_RMSD,PLIF_Sim — field names work too
+```
+
+An open GUI picks up `ci_calc` results on its next sync tick (within ~0.5 s).
+
+### Dependencies
+
+`MCS_RMSD`, `Shape_Sim` and `Ref_Sim` need only **RDKit** in the interpreter running
+PyMOL, and run in-process.
+
+`PLIF_Sim` and `PB_Flags` need `prolif` + `MDAnalysis` and `posebusters` respectively,
+which PyMOL's own environment rarely has. PoseViewer therefore runs them in a
+**subprocess under another interpreter**, found by scanning, in order:
+
+1. `$POSEVIEWER_PYTHON`
+2. the interpreter running PyMOL
+3. conda environments under `$CONDA_PREFIX/..`, `~/miniconda3/envs`, `~/anaconda3/envs`,
+   `~/Programs/miniconda3/envs`, `/opt/conda/envs`
+
+The first environment whose `site-packages` contains the needed package wins (checked on
+the filesystem, not by importing, so the scan is instant). If none is found, the
+Calculate panel says so and points at `$POSEVIEWER_PYTHON`; the other metrics still run.
+Set it explicitly to skip the search:
+
+```bash
+export POSEVIEWER_PYTHON=~/Programs/miniconda3/envs/gnina_webapp/bin/python
+```
+
+### What gets sent where
+
+Poses, reference and receptor are exported from the live session on the main thread
+(`cmd.get_str("mol", ...)` per pose, `cmd.save` for the receptor) before any work
+starts — the background thread and the subprocess only ever see molblock strings and
+temporary files, never the PyMOL API. Molecules are sanitized once in PyMOL's process,
+including a fix for the non-ring aromatic bonds PyMOL writes for delocalized groups
+(a carboxylate exported as `C(:O):[O-]`), which would otherwise change fingerprints and
+make PoseBusters reject the pose. Explicit hydrogens are added before the external run
+because ProLIF perceives H-bond donors from them. The temporary directory is removed
+when the job ends.
+
+### Cost
+
+Per pose, roughly: `Ref_Sim` and `Shape_Sim` are milliseconds, `MCS_RMSD` tens of
+milliseconds, `PLIF_Sim` is one batched run of a few seconds plus the receptor parse,
+and `PB_Flags` is by far the most expensive (order of a second per pose, parallelized
+inside the worker). Tick PoseBusters only for a shortlist, not a full docking run.
+
+### Caveats
+
+- Poses loaded from a PDB have no bond orders, so RDKit's perception of them is a guess —
+  metrics are most reliable for poses loaded from SDF/MOL2
+- `MCS_RMSD` and `Shape_Sim` need a reference with 3D coordinates; `MCS_RMSD` is `N/A`
+  when the common substructure has fewer than 3 atoms
+- `PLIF_Sim` uses the receptor as loaded. A receptor without hydrogens limits ProLIF's
+  H-bond perception, so prepare (protonate) the structure for the most meaningful numbers
+- The receptor passed to both external metrics is the current **Protein** selection
 
 ---
 
@@ -243,6 +351,7 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 ## Notes
 
 - Requires PyMOL with Qt support (PyMOL 2.x+)
+- `rdkit` is required only for the Calculate group; it is imported on first use, so the plugin loads normally without it
 - `numpy` is used if available; falls back to pure Python otherwise
 - **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no scores file needed, leave the Scores field blank
 - **Open-source PyMOL**: SDF data fields are stripped on load. Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`

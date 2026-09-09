@@ -26,7 +26,16 @@ License: MIT
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
 from collections import defaultdict
 from typing import List, Dict, Optional, Set
 
@@ -960,6 +969,10 @@ class LigandStepper:
         self.show_water: bool               = True
         self.color_surf_by_type: bool       = True
         self._bookmarks: Set[int]           = set()
+        # Metrics computed by _MetricsJob, keyed by (object, state) so they
+        # survive the pose list being rebuilt (objects added/removed/renumbered).
+        self.computed: Dict[tuple, dict]    = {}
+        self._table_dirty: bool             = False
 
     def setup_objects(self, prot, ligs, ref_lig=None):
         self.protein_sel = prot
@@ -1283,6 +1296,45 @@ class LigandStepper:
 
     def _prefetch_all_properties(self):
         """Populate all_properties: one dict per pose, used by the table view."""
+        self._build_all_properties()
+        self._apply_computed()
+
+    def _apply_computed(self):
+        """Overlay metrics computed in-session onto the SDF/object properties.
+
+        Copies each touched dict first: in states mode all_properties holds the
+        sdf_records objects themselves, which must not be mutated.
+        """
+        if not self.computed or not self.all_properties:
+            return
+        merged = []
+        for key, props in zip(self.poses, self.all_properties):
+            vals = self.computed.get(key)
+            if vals:
+                props = dict(props)
+                props.update(vals)
+            merged.append(props)
+        self.all_properties = merged
+
+    def merge_metrics(self, results: dict):
+        """Store freshly computed metrics and push them into the table data."""
+        for key, vals in results.items():
+            self.computed.setdefault(key, {}).update(vals)
+        self._prefetch_all_properties()
+
+    def invalidate_metrics(self, fields):
+        """Drop computed values for `fields` (e.g. after the reference changes)."""
+        dropped = False
+        for vals in self.computed.values():
+            for f in fields:
+                if vals.pop(f, None) is not None:
+                    dropped = True
+        if dropped:
+            self._prefetch_all_properties()
+        return dropped
+
+    def _build_all_properties(self):
+        """Build all_properties from the SDF records / PyMOL object properties."""
         if not self.sdf_records:
             result = []
             for obj, st in self.poses:
@@ -1393,15 +1445,24 @@ def _parse_sdf_records(path: str) -> list:
     try:
         with open(path) as fh:
             content = fh.read()
-        for block in content.split("$$$$"):
-            block = block.strip()
-            if not block:
+        for i, block in enumerate(content.split("$$$$")):
+            if not block.strip():
                 continue
+            if i:
+                # Drop only the newline left by the separator: strip() would eat
+                # an empty title line too, promoting the counts line to the title.
+                if block.startswith("\r\n"):
+                    block = block[2:]
+                elif block.startswith("\n"):
+                    block = block[1:]
             props = {}
             lines = block.splitlines()
             if lines and lines[0].strip():
                 props["_name"] = lines[0].strip()
-            for m in re.finditer(r">\s*<([^>]+)>\s*\n([^\n]*)", block):
+            # The header line may carry extra fields after the tag name —
+            # "> <Ligand_ID>  (1) " as written by RDKit/GNINA — so skip to EOL
+            # rather than requiring the newline right after '>'.
+            for m in re.finditer(r">\s*<([^>]+)>[^\n]*\n([^\n]*)", block):
                 key = m.group(1).strip()
                 raw = m.group(2).strip()
                 try:
@@ -1466,6 +1527,934 @@ def _get_ligand_resinfo(obj: str) -> dict:
     if chains:
         out["chain"] = chains
     return out
+
+
+# ---------------------------------------------------------------------------
+# Pose metrics
+# ---------------------------------------------------------------------------
+# Everything below computes pose quality/similarity metrics from what is loaded
+# in the PyMOL session, so they are available even when the docking program did
+# not write them into the SDF.  Field names match those written by the GNINA
+# webapp (MCS_RMSD, Shape_Sim, Ref_Sim, PLIF_Sim, PB_Flags) so computed and
+# SDF-supplied values are interchangeable in the Pose Data table.
+#
+# MCS_RMSD / Shape_Sim / Ref_Sim need only RDKit and run in a background thread.
+# PLIF_Sim / PB_Flags need prolif / posebusters, which PyMOL's own interpreter
+# rarely has, so they run in a subprocess under an interpreter that does (see
+# _external_python_candidates).
+
+METRIC_FIELDS = {
+    "mcs_rmsd":    "MCS_RMSD",
+    "shape_sim":   "Shape_Sim",
+    "ref_sim":     "Ref_Sim",
+    "plif_sim":    "PLIF_Sim",
+    "posebusters": "PB_Flags",
+}
+
+METRIC_LABELS = {
+    "mcs_rmsd":    "MCS RMSD vs reference (Å)",
+    "shape_sim":   "Shape similarity vs reference (3D)",
+    "ref_sim":     "2D similarity vs reference (ECFP4)",
+    "plif_sim":    "PLIF similarity vs reference",
+    "posebusters": "PoseBusters flags (failed checks)",
+}
+
+METRIC_ORDER = ("mcs_rmsd", "shape_sim", "ref_sim", "plif_sim", "posebusters")
+
+# Metrics compared against the reference ligand — dropped when the reference changes.
+REF_METRICS = ("mcs_rmsd", "shape_sim", "ref_sim", "plif_sim")
+
+# Metrics that need the receptor.
+RECEPTOR_METRICS = ("plif_sim", "posebusters")
+
+# Metrics that run in a subprocess, and the modules that subprocess must import.
+EXTERNAL_METRICS = ("plif_sim", "posebusters")
+_EXTERNAL_REQUIRES = {
+    "plif_sim":    ("prolif", "MDAnalysis"),
+    "posebusters": ("posebusters",),
+}
+
+
+# --- RDKit (imported on demand: ~1 s, not worth paying at plugin load) -------
+
+_RDKIT: dict = {}
+
+
+def _load_rdkit() -> bool:
+    """Import RDKit and cache the pieces the metrics need. False if unavailable."""
+    if _RDKIT:
+        return bool(_RDKIT.get("ok"))
+    try:
+        from rdkit import Chem, DataStructs, RDLogger
+        from rdkit.Chem import rdFMCS, rdShapeHelpers, rdFingerprintGenerator
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+        RDLogger.DisableLog("rdApp.*")
+        _RDKIT.update(ok=True, Chem=Chem, DataStructs=DataStructs, rdFMCS=rdFMCS,
+                      rdShapeHelpers=rdShapeHelpers,
+                      rdFingerprintGenerator=rdFingerprintGenerator,
+                      rdMolStandardize=rdMolStandardize)
+    except Exception as e:
+        _RDKIT.update(ok=False, error=f"{type(e).__name__}: {e}")
+    return bool(_RDKIT.get("ok"))
+
+
+def _sanitize_keep_hs(mol):
+    """Sanitize a mol parsed with sanitize=False, in place. Returns mol.
+
+    Full SanitizeMol can fail on docking output (unusual atom types, charges);
+    fall back to FastFindRings so ring info is populated and fingerprints /
+    MCS still work.
+
+    PyMOL exports delocalized groups outside rings — a carboxylate written as
+    C(:O):[O-] — using MDL bond type 4 ("aromatic").  RDKit's aromaticity model
+    only processes ring systems, so those bonds survive sanitization as bare
+    BondType.AROMATIC and hash differently from the same group's Kekule form.
+    Resolve each such set into an explicit single/double pair (double bond to
+    the least-negatively-charged neighbour) and re-sanitize.
+    """
+    Chem = _RDKIT["Chem"]
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        Chem.FastFindRings(mol)
+
+    stray = [b for b in mol.GetBonds()
+             if b.GetBondType() == Chem.BondType.AROMATIC and not b.IsInRing()]
+    if stray:
+        stray_idx = {b.GetIdx() for b in stray}
+        resolved = set()
+        # An atom may be the DOUBLE end of at most one stray bond; tracking that
+        # across atoms stops a 3-atom conjugated chain from getting a cumulated
+        # double bond that SanitizeMol would then reject.
+        has_double = set()
+        for atom in mol.GetAtoms():
+            idx = atom.GetIdx()
+            bonds = [b for b in atom.GetBonds()
+                     if b.GetIdx() in stray_idx and b.GetIdx() not in resolved]
+            if not bonds:
+                continue
+            chosen_double = None
+            if idx not in has_double:
+                eligible = [b for b in bonds
+                            if b.GetOtherAtom(atom).GetIdx() not in has_double]
+                pool = eligible or bonds
+                pool.sort(key=lambda b: b.GetOtherAtom(atom).GetFormalCharge(),
+                          reverse=True)
+                chosen_double = pool[0]
+            for bond in bonds:
+                bond.SetIsAromatic(False)
+                if bond is chosen_double:
+                    bond.SetBondType(Chem.BondType.DOUBLE)
+                    has_double.add(idx)
+                    has_double.add(bond.GetOtherAtom(atom).GetIdx())
+                else:
+                    bond.SetBondType(Chem.BondType.SINGLE)
+                resolved.add(bond.GetIdx())
+        for atom in mol.GetAtoms():
+            atom.SetIsAromatic(False)
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception:
+            Chem.FastFindRings(mol)
+    return mol
+
+
+def _sanitize_heavy(mol):
+    """_sanitize_keep_hs plus explicit-H removal, for heavy-atom-only comparisons.
+
+    Poses often carry explicit Hs while the reference does not; that asymmetry
+    corrupts every heavy-atom comparison (Morgan FP, shape overlap, MCS), so
+    strip them here rather than relying on the parser's removeHs (which is
+    silently skipped when sanitize=False).
+    """
+    Chem = _RDKIT["Chem"]
+    mol = _sanitize_keep_hs(mol)
+    try:
+        mol = Chem.RemoveHs(mol, sanitize=False)
+        # RemoveHs(sanitize=False) drops ring info, same as a fresh unsanitized
+        # parse would — repopulate it so shape/MCS/FP calls don't hit
+        # "RingInfo not initialized".
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception:
+            Chem.FastFindRings(mol)
+    except Exception:
+        pass
+    return mol
+
+
+# Uncharger / TautomerEnumerator / fingerprint generator construction has
+# non-trivial setup cost, so instances are reused — but kept thread-local, since
+# RDKit's MolStandardize classes are not thread-safe and a metrics job runs off
+# the main thread.
+_RD_CACHE = threading.local()
+
+
+def _standardize_2d(mol):
+    """Neutralize charges and collapse to a canonical tautomer for Ref_Sim, so a
+    different protomer/tautomer of the same compound scores 1.0 rather than being
+    penalized as a distinct structure.  Order matters: uncharge first, then
+    canonicalize tautomers on the neutral form."""
+    rdMolStandardize = _RDKIT["rdMolStandardize"]
+    uncharger = getattr(_RD_CACHE, "uncharger", None)
+    if uncharger is None:
+        uncharger = _RD_CACHE.uncharger = rdMolStandardize.Uncharger()
+    tautomer = getattr(_RD_CACHE, "tautomer", None)
+    if tautomer is None:
+        tautomer = _RD_CACHE.tautomer = rdMolStandardize.TautomerEnumerator()
+    try:
+        mol = uncharger.uncharge(mol)
+    except Exception:
+        pass
+    try:
+        mol = tautomer.Canonicalize(mol)
+    except Exception:
+        pass
+    return mol
+
+
+def _mol_from_block(block: str, keep_hs: bool = False):
+    """Parse a molblock into a sanitized RDKit mol, or None."""
+    Chem = _RDKIT["Chem"]
+    try:
+        mol = Chem.MolFromMolBlock(block, removeHs=False, sanitize=False)
+        if mol is None or mol.GetNumAtoms() == 0:
+            return None
+        return _sanitize_keep_hs(mol) if keep_hs else _sanitize_heavy(mol)
+    except Exception:
+        return None
+
+
+def _conf_coords(mol):
+    """Return [(x, y, z), ...] for mol's conformer, or None if it has none."""
+    if not mol.GetNumConformers():
+        return None
+    conf = mol.GetConformer()
+    return [tuple(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())]
+
+
+# --- In-process metrics -----------------------------------------------------
+
+def _calc_mcs_rmsd(ref_mol, pose_mol):
+    """Symmetry-aware heavy-atom RMSD over the maximum common substructure.
+
+    No superposition: poses and reference already share the receptor frame, so
+    aligning first would report conformer difference rather than pose deviation.
+    Returns a float, or None when no usable MCS was found.
+    """
+    rdFMCS, Chem = _RDKIT["rdFMCS"], _RDKIT["Chem"]
+    res = rdFMCS.FindMCS(
+        [ref_mol, pose_mol],
+        atomCompare=rdFMCS.AtomCompare.CompareElements,
+        bondCompare=rdFMCS.BondCompare.CompareOrder,
+        ringMatchesRingOnly=True,
+        completeRingsOnly=False,
+        timeout=2,
+    )
+    if res.numAtoms < 3:
+        return None
+    mcs_mol = Chem.MolFromSmarts(res.smartsString)
+    if mcs_mol is None:
+        return None
+    ref_matches = ref_mol.GetSubstructMatches(mcs_mol, uniquify=False, maxMatches=16)
+    pose_matches = pose_mol.GetSubstructMatches(mcs_mol, uniquify=False, maxMatches=16)
+    if not ref_matches or not pose_matches:
+        return None
+    ref_xyz = _conf_coords(ref_mol)
+    pose_xyz = _conf_coords(pose_mol)
+    if ref_xyz is None or pose_xyz is None:
+        return None
+    best = None
+    for ref_match in ref_matches:
+        rc = [ref_xyz[i] for i in ref_match]
+        for pose_match in pose_matches:
+            total = 0.0
+            for (ax, ay, az), pi in zip(rc, pose_match):
+                bx, by, bz = pose_xyz[pi]
+                total += (ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2
+            rmsd = math.sqrt(total / len(ref_match))
+            if best is None or rmsd < best:
+                best = rmsd
+    return best
+
+
+def _calc_shape_sim(ref_mol, pose_mol):
+    """Shape Tanimoto (1 = identical) between pose and reference as placed.
+
+    No alignment: docking already puts both in the binding site, so this measures
+    overlap with the reference rather than best-case shape agreement.
+    """
+    if not ref_mol.GetNumConformers() or not pose_mol.GetNumConformers():
+        return None
+    dist = _RDKIT["rdShapeHelpers"].ShapeTanimotoDist(ref_mol, pose_mol)
+    return 1.0 - dist
+
+
+def _morgan_generator():
+    """ECFP4 generator (radius 2, 2048 bits), reused per thread."""
+    gen = getattr(_RD_CACHE, "morgan", None)
+    if gen is None:
+        gen = _RD_CACHE.morgan = _RDKIT["rdFingerprintGenerator"].GetMorganGenerator(
+            radius=2, fpSize=2048)
+    return gen
+
+
+def _calc_ref_sim(ref_fp, pose_mol):
+    """Morgan ECFP4 Tanimoto to the reference, on standardized 2D structures."""
+    fp = _morgan_generator().GetFingerprint(_standardize_2d(pose_mol))
+    return _RDKIT["DataStructs"].TanimotoSimilarity(ref_fp, fp)
+
+
+# --- External worker (prolif / posebusters) ---------------------------------
+
+_WORKER_SRC = r'''#!/usr/bin/env python3
+"""PoseViewer external metric worker.
+
+Runs under an interpreter that has prolif / posebusters installed.  Reads a JSON
+job file, writes JSON results, and prints "PROGRESS <done> <total>" lines so the
+caller can drive a progress bar.  Input SDFs are written by PoseViewer with
+already-sanitized molecules, so no bond/valence fixing is needed here.
+"""
+import json
+import os
+import sys
+import tempfile
+import warnings
+
+
+def _first_mol(path):
+    from rdkit import Chem
+    for mol in Chem.SDMolSupplier(path, removeHs=False, sanitize=True):
+        if mol is not None and mol.GetNumAtoms() > 0:
+            return mol
+    return None
+
+
+def _split_blocks(path):
+    """Split an SDF into molblocks.
+
+    Drops only the single newline that follows the "$$$$" separator: a molecule
+    whose title line is empty would otherwise lose it to strip(), shifting the
+    counts line up and making the block unparseable.
+    """
+    with open(path) as fh:
+        text = fh.read()
+    blocks = []
+    for i, raw in enumerate(text.split("$$$$")):
+        if not raw.strip():
+            continue
+        if i:  # not the first record: drop the newline left by the separator
+            if raw.startswith("\r\n"):
+                raw = raw[2:]
+            elif raw.startswith("\n"):
+                raw = raw[1:]
+        blocks.append(raw)
+    return blocks
+
+
+def run_plif(job):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        import MDAnalysis as mda
+    import prolif
+    from rdkit import Chem, DataStructs
+
+    n = job["n_poses"]
+    print("PROGRESS 0 %d" % n, flush=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        u = mda.Universe(job["receptor"])
+        prot_ag = u.select_atoms("protein")
+        if prot_ag.n_atoms == 0:
+            raise ValueError("no protein atoms in receptor")
+        try:
+            protein = prolif.Molecule.from_mda(prot_ag)
+        except Exception:
+            # Some PDB connectivity trips RDKit's strict valence check when
+            # NoImplicit=True; retry with implicit Hs allowed.
+            protein = prolif.Molecule.from_mda(prot_ag, NoImplicit=False)
+
+    ref = _first_mol(job["reference"])
+    if ref is None:
+        raise ValueError("could not read reference ligand")
+    ref_lig = prolif.Molecule.from_rdkit(ref)
+
+    ligs, valid = [], []
+    supplier = Chem.SDMolSupplier(job["poses"], removeHs=False, sanitize=True)
+    for i, mol in enumerate(supplier):
+        if mol is None or mol.GetNumAtoms() == 0:
+            continue
+        try:
+            ligs.append(prolif.Molecule.from_rdkit(mol))
+            valid.append(i)
+        except Exception:
+            pass
+
+    values = [None] * n
+    if ligs:
+        # One Fingerprint instance for reference + all poses, so every bitvector
+        # shares the same residue-interaction columns and they stay comparable.
+        fp = prolif.Fingerprint()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fp.run_from_iterable([ref_lig] + ligs, protein, progress=False)
+        bvs = fp.to_bitvectors()
+        for i, bv in zip(valid, bvs[1:]):
+            values[i] = round(DataStructs.TanimotoSimilarity(bvs[0], bv), 4)
+    print("PROGRESS %d %d" % (n, n), flush=True)
+    return values, ""
+
+
+def run_posebusters(job):
+    from posebusters import PoseBusters
+
+    n = job["n_poses"]
+    blocks = _split_blocks(job["poses"])
+    try:
+        pb = PoseBusters(config="dock", max_workers=None)
+    except TypeError:
+        pb = PoseBusters(config="dock")
+
+    infra_cols = {"mol_cond_loaded", "mol_true_loaded"}
+    values = [None] * n
+    fail_totals = {}
+
+    def bust(indices):
+        fd, tmp = tempfile.mkstemp(suffix=".sdf", dir=job["tmpdir"])
+        try:
+            with os.fdopen(fd, "w") as fh:
+                for i in indices:
+                    fh.write(blocks[i].rstrip("\n") + "\n$$$$\n")
+            return pb.bust(tmp, mol_cond=job["receptor"], full_report=False)
+        except Exception:
+            return None
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def process(indices):
+        df = bust(indices)
+        if df is None:
+            # Isolate the offending pose by bisection so one bad molecule does
+            # not invalidate the whole batch.
+            if len(indices) == 1:
+                return
+            mid = len(indices) // 2
+            process(indices[:mid])
+            process(indices[mid:])
+            return
+        cols = [c for c in df.columns if df[c].dtype == bool and c not in infra_cols]
+        for pos, (_, row) in zip(indices, df.iterrows()):
+            vals = row[cols].dropna()
+            values[pos] = int((vals == False).sum())  # noqa: E712
+        for col, k in (df[cols] == False).sum().items():  # noqa: E712
+            fail_totals[col] = fail_totals.get(col, 0) + int(k)
+
+    done = 0
+    batch = 20
+    for start in range(0, n, batch):
+        idx = list(range(start, min(start + batch, n)))
+        process(idx)
+        done += len(idx)
+        print("PROGRESS %d %d" % (done, n), flush=True)
+
+    failing = [(k, v) for k, v in fail_totals.items() if v]
+    failing.sort(key=lambda kv: -kv[1])
+    summary = "; ".join("%s: %d" % (k, v) for k, v in failing[:6])
+    return values, summary
+
+
+def main():
+    job = json.load(open(sys.argv[1]))
+    try:
+        if job["metric"] == "plif_sim":
+            values, summary = run_plif(job)
+        elif job["metric"] == "posebusters":
+            values, summary = run_posebusters(job)
+        else:
+            raise ValueError("unknown metric %r" % job["metric"])
+        out = {"values": values, "summary": summary}
+    except Exception as e:
+        out = {"error": "%s: %s" % (type(e).__name__, e)}
+    with open(job["out"], "w") as fh:
+        json.dump(out, fh)
+
+
+main()
+'''
+
+_EXTERNAL_PYTHON: dict = {}
+
+
+def _candidate_pythons():
+    """Interpreters to consider for the external metrics, best guess first."""
+    cands = []
+    env = os.environ.get("POSEVIEWER_PYTHON")
+    if env:
+        cands.append(env)
+    cands.append(sys.executable)
+    roots = []
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        roots.append(os.path.join(os.path.dirname(conda_prefix)))
+    home = os.path.expanduser("~")
+    roots += [os.path.join(home, "miniconda3", "envs"),
+              os.path.join(home, "anaconda3", "envs"),
+              os.path.join(home, "Programs", "miniconda3", "envs"),
+              os.path.join(home, "Programs", "anaconda3", "envs"),
+              "/opt/conda/envs"]
+    import glob as _glob
+    for root in roots:
+        if root and os.path.isdir(root):
+            cands += sorted(_glob.glob(os.path.join(root, "*", "bin", "python")))
+    seen, out = set(), []
+    for c in cands:
+        if c and c not in seen and os.path.exists(c):
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+_HAS_MODULES_CACHE: dict = {}
+
+
+def _python_has_modules(python_exe: str, modules) -> bool:
+    """True when every module looks installed for python_exe.
+
+    Checked by looking for the package in that interpreter's site-packages
+    rather than by importing it — importing prolif/MDAnalysis costs seconds and
+    this runs over every conda env on the machine.  A package that is present
+    but broken is caught later, when the worker actually runs.
+    """
+    key = (python_exe, tuple(modules))
+    if key in _HAS_MODULES_CACHE:
+        return _HAS_MODULES_CACHE[key]
+    import glob as _glob
+    prefix = os.path.dirname(os.path.dirname(python_exe))
+    site_dirs = _glob.glob(os.path.join(prefix, "lib", "python*", "site-packages"))
+    site_dirs += _glob.glob(os.path.join(prefix, "lib", "site-packages"))
+    ok = bool(site_dirs)
+    for mod in modules if ok else ():
+        if not any(os.path.isdir(os.path.join(sd, mod)) or
+                   os.path.exists(os.path.join(sd, mod + ".py"))
+                   for sd in site_dirs):
+            ok = False
+            break
+    _HAS_MODULES_CACHE[key] = ok
+    return ok
+
+
+def _external_python_candidates(metric: str):
+    """Interpreters that look able to run `metric`, best first.
+
+    Environments that also cover the other external metric are ranked first, so
+    both end up in the same interpreter when one environment has everything.
+    Once a candidate has actually produced results it is cached and used alone.
+    """
+    if _EXTERNAL_PYTHON.get(metric):
+        return [_EXTERNAL_PYTHON[metric]]
+    needed = _EXTERNAL_REQUIRES[metric]
+    every = tuple(sorted({m for mods in _EXTERNAL_REQUIRES.values() for m in mods}))
+    found = [c for c in _candidate_pythons() if _python_has_modules(c, needed)]
+    found.sort(key=lambda c: not _python_has_modules(c, every))
+    return found
+
+
+def _looks_like_missing_module(error: str) -> bool:
+    """True when an error suggests trying the next candidate interpreter."""
+    return any(s in error for s in ("ModuleNotFoundError", "ImportError",
+                                    "No module named", "worker produced no result"))
+
+
+def _stream_process(proc, cancel, on_line):
+    """Feed proc's stdout lines to on_line until it exits; kill it if cancelled.
+
+    Reads the raw fds through select so a cancel is noticed within ~0.2 s even
+    when the child is silent for minutes (PLIF emits nothing until it is done).
+    Returns collected stderr text.
+    """
+    fds = {proc.stdout.fileno(): ("out", b""), proc.stderr.fileno(): ("err", b"")}
+    err_chunks = []
+
+    def emit(kind, text):
+        if kind == "out":
+            on_line(text)
+        else:
+            err_chunks.append(text)
+
+    while fds:
+        if cancel is not None and cancel.is_set():
+            try:
+                # PoseBusters spawns its own workers; kill the whole group.
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                proc.terminate()
+            break
+        try:
+            ready, _, _ = select.select(list(fds), [], [], 0.2)
+        except Exception:
+            break
+        for fd in ready:
+            kind, buf = fds[fd]
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                # EOF: drop the fd, otherwise select keeps reporting it ready
+                # and this loop spins forever after the child exits.
+                if buf:
+                    emit(kind, buf.decode("utf-8", "replace").rstrip())
+                del fds[fd]
+                continue
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            fds[fd] = (kind, buf)
+            for raw in lines:
+                emit(kind, raw.decode("utf-8", "replace").rstrip())
+        if not ready and proc.poll() is not None:
+            break
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            proc.kill()
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            stream.close()
+        except Exception:
+            pass
+    return "\n".join(err_chunks)
+
+
+def _run_external_metric(metric, python_exe, workdir, poses_sdf, ref_sdf,
+                         receptor_path, n_poses, report, cancel):
+    """Run one external metric in a subprocess. Returns (values, summary, error)."""
+    worker_py = os.path.join(workdir, "pv_metric_worker.py")
+    if not os.path.exists(worker_py):
+        with open(worker_py, "w") as fh:
+            fh.write(_WORKER_SRC)
+    job_path = os.path.join(workdir, f"{metric}_job.json")
+    out_path = os.path.join(workdir, f"{metric}_out.json")
+    with open(job_path, "w") as fh:
+        json.dump({"metric": metric, "poses": poses_sdf, "reference": ref_sdf,
+                   "receptor": receptor_path, "out": out_path,
+                   "n_poses": n_poses, "tmpdir": workdir}, fh)
+
+    try:
+        proc = subprocess.Popen(
+            [python_exe, worker_py, job_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+    except Exception as e:
+        return None, "", f"could not start {python_exe}: {e}"
+
+    def on_line(line):
+        if line.startswith("PROGRESS "):
+            parts = line.split()
+            try:
+                report(int(parts[1]))
+            except (IndexError, ValueError):
+                pass
+
+    stderr_text = _stream_process(proc, cancel, on_line)
+    if cancel is not None and cancel.is_set():
+        return None, "", "cancelled"
+    if not os.path.exists(out_path):
+        tail = stderr_text.strip().splitlines()[-3:]
+        return None, "", "worker produced no result" + (
+            ": " + " / ".join(tail) if tail else "")
+    with open(out_path) as fh:
+        result = json.load(fh)
+    if "error" in result:
+        return None, "", result["error"]
+    return result.get("values") or [], result.get("summary", ""), None
+
+
+# --- Job driver -------------------------------------------------------------
+
+class _MetricsJob:
+    """Computes selected metrics for a set of poses off the PyMOL main thread.
+
+    All PyMOL API access happens in _collect_metric_inputs before the thread
+    starts; the job itself only ever sees molblock strings and file paths.
+    """
+
+    def __init__(self, metrics, pose_keys, pose_blocks, ref_block, receptor_path,
+                 workdir):
+        self.metrics = [m for m in METRIC_ORDER if m in metrics]
+        self.pose_keys = pose_keys
+        self.pose_blocks = pose_blocks
+        self.ref_block = ref_block
+        self.receptor_path = receptor_path
+        self.workdir = workdir
+        self.results: Dict[tuple, dict] = {}
+        self.errors: List[str] = []
+        self.notes: List[str] = []
+        self.finished = False
+        self.total_n = max(1, len(pose_blocks) * len(self.metrics))
+        self._done = 0
+        self._base = 0
+        self._message = "Starting…"
+        self._cancel = threading.Event()
+        self._lock = threading.Lock()
+
+    # -- driving ------------------------------------------------------------
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True, name="PoseViewer-metrics").start()
+
+    def cancel(self):
+        self._cancel.set()
+
+    @property
+    def cancelled(self):
+        return self._cancel.is_set()
+
+    def progress(self):
+        with self._lock:
+            return self._done, self.total_n, self._message
+
+    def _report(self, done_in_metric, message=None):
+        with self._lock:
+            self._done = self._base + done_in_metric
+            if message is not None:
+                self._message = message
+
+    def _set_message(self, message):
+        with self._lock:
+            self._message = message
+
+    # -- computation --------------------------------------------------------
+
+    def run(self):
+        try:
+            for metric in self.metrics:
+                if self.cancelled:
+                    break
+                field = METRIC_FIELDS[metric]
+                self._set_message(f"{METRIC_LABELS[metric]}…")
+                try:
+                    values = self._run_metric(metric)
+                except Exception as e:
+                    self.errors.append(f"{field}: {type(e).__name__}: {e}")
+                    values = None
+                if values:
+                    for key, val in zip(self.pose_keys, values):
+                        self.results.setdefault(key, {})[field] = (
+                            "N/A" if val is None else val)
+                self._base += len(self.pose_blocks)
+                self._report(0)
+            self._set_message("Cancelled." if self.cancelled else "Done.")
+        finally:
+            shutil.rmtree(self.workdir, ignore_errors=True)
+            self.finished = True
+
+    def _run_metric(self, metric):
+        if metric in EXTERNAL_METRICS:
+            return self._run_external(metric)
+        return self._run_rdkit(metric)
+
+    def _run_rdkit(self, metric):
+        """MCS_RMSD / Shape_Sim / Ref_Sim — RDKit only, one pose at a time."""
+        ref_mol = _mol_from_block(self.ref_block)
+        if ref_mol is None:
+            self.errors.append(f"{METRIC_FIELDS[metric]}: could not read reference ligand")
+            return None
+        ref_fp = None
+        if metric == "ref_sim":
+            ref_fp = _morgan_generator().GetFingerprint(_standardize_2d(ref_mol))
+        elif not ref_mol.GetNumConformers():
+            self.errors.append(f"{METRIC_FIELDS[metric]}: reference has no 3D coordinates")
+            return None
+
+        values = []
+        label = METRIC_LABELS[metric]
+        for i, block in enumerate(self.pose_blocks):
+            if self.cancelled:
+                # Shorter list than pose_blocks: zip() in run() leaves the
+                # remaining poses untouched rather than marking them N/A.
+                return values
+            val = None
+            try:
+                pose_mol = _mol_from_block(block)
+                if pose_mol is not None:
+                    if metric == "mcs_rmsd":
+                        val = _calc_mcs_rmsd(ref_mol, pose_mol)
+                    elif metric == "shape_sim":
+                        val = _calc_shape_sim(ref_mol, pose_mol)
+                    else:
+                        val = _calc_ref_sim(ref_fp, pose_mol)
+            except Exception:
+                val = None
+            values.append(None if val is None else round(float(val), 4))
+            if i % 5 == 0 or i == len(self.pose_blocks) - 1:
+                self._report(i + 1, f"{label}: {i + 1}/{len(self.pose_blocks)}")
+        return values
+
+    def _run_external(self, metric):
+        """PLIF_Sim / PB_Flags — subprocess under an interpreter that has the deps."""
+        field = METRIC_FIELDS[metric]
+        candidates = _external_python_candidates(metric)
+        if not candidates:
+            self.errors.append(
+                f"{field}: no Python found with "
+                f"{'/'.join(_EXTERNAL_REQUIRES[metric])} installed "
+                f"(set $POSEVIEWER_PYTHON to one)")
+            return None
+        if not self.receptor_path:
+            self.errors.append(f"{field}: no receptor available")
+            return None
+
+        # Write sanitized (H-bearing) SDFs once and reuse for both external
+        # metrics: the worker then needs no bond/valence fixing of its own.
+        poses_sdf = os.path.join(self.workdir, "poses.sdf")
+        index_path = os.path.join(self.workdir, "poses_index.json")
+        if os.path.exists(poses_sdf):
+            with open(index_path) as fh:
+                written = json.load(fh)
+        else:
+            written = self._write_pose_sdf(poses_sdf)
+            with open(index_path, "w") as fh:
+                json.dump(written, fh)
+        if not written:
+            self.errors.append(f"{field}: no poses could be prepared for {field}")
+            return None
+
+        ref_sdf = os.path.join(self.workdir, "reference.sdf")
+        if metric == "plif_sim" and not os.path.exists(ref_sdf):
+            if not self._write_ref_sdf(ref_sdf):
+                self.errors.append(f"{field}: could not prepare reference ligand")
+                return None
+
+        n = len(written)
+        report = (lambda done: self._report(
+            min(done, len(self.pose_blocks)),
+            f"{METRIC_LABELS[metric]}: {done}/{n}"))
+
+        # The filesystem check only says a package is present; if that
+        # interpreter cannot actually import it, move on to the next candidate.
+        values = summary = error = None
+        for python_exe in candidates[:3]:
+            values, summary, error = _run_external_metric(
+                metric, python_exe, self.workdir, poses_sdf, ref_sdf,
+                self.receptor_path, n, report, self._cancel)
+            if error is None:
+                _EXTERNAL_PYTHON[metric] = python_exe
+                break
+            if error == "cancelled" or not _looks_like_missing_module(error):
+                break
+        if error:
+            if error != "cancelled":
+                self.errors.append(f"{field}: {error}")
+            return None
+        if summary:
+            self.notes.append(f"{field} most common failures — {summary}")
+
+        # Map worker results (SDF record order) back onto pose order.
+        out = [None] * len(self.pose_blocks)
+        for rec_i, pose_i in enumerate(written):
+            if rec_i < len(values):
+                out[pose_i] = values[rec_i]
+        return out
+
+    def _write_pose_sdf(self, path):
+        """Write sanitized poses (Hs added) to path; returns pose indices written."""
+        Chem = _RDKIT["Chem"]
+        written = []
+        with open(path, "w") as fh:
+            for i, block in enumerate(self.pose_blocks):
+                if self.cancelled:
+                    break
+                mol = _mol_from_block(block, keep_hs=True)
+                if mol is None:
+                    continue
+                if not mol.GetPropsAsDict().get("_Name", "").strip():
+                    mol.SetProp("_Name", f"pose_{i + 1}")
+                try:
+                    # ProLIF perceives H-bond donors from explicit Hs, and poses
+                    # loaded from a PDB often have none.
+                    mol = Chem.AddHs(mol, addCoords=True)
+                    fh.write(Chem.MolToMolBlock(mol) + "\n$$$$\n")
+                except Exception:
+                    continue
+                written.append(i)
+        return written
+
+    def _write_ref_sdf(self, path):
+        Chem = _RDKIT["Chem"]
+        mol = _mol_from_block(self.ref_block, keep_hs=True)
+        if mol is None:
+            return False
+        try:
+            mol = Chem.AddHs(mol, addCoords=True)
+            with open(path, "w") as fh:
+                fh.write(Chem.MolToMolBlock(mol) + "\n$$$$\n")
+        except Exception:
+            return False
+        return True
+
+
+def _collect_metric_inputs(metrics):
+    """Dump poses, reference and receptor from the live session.
+
+    Runs on the PyMOL main thread — the returned job only holds strings and
+    paths, so nothing downstream touches the PyMOL API.  Raises RuntimeError
+    with a message suitable for display when a requested metric can't be run.
+    """
+    metrics = [m for m in METRIC_ORDER if m in metrics]
+    if not metrics:
+        raise RuntimeError("No metrics selected.")
+    if not _load_rdkit():
+        raise RuntimeError(f"RDKit not available in this PyMOL: {_RDKIT.get('error', '')}")
+    if not _stepper.poses:
+        raise RuntimeError("No poses loaded — click Setup first.")
+
+    needs_ref = any(m in REF_METRICS for m in metrics)
+    ref_block = ""
+    if needs_ref:
+        ref = _stepper.ref_ligand
+        if not ref:
+            raise RuntimeError("Select a reference ligand first.")
+        try:
+            ref_block = cmd.get_str("mol", f"({ref})", 1)
+        except Exception as e:
+            raise RuntimeError(f"Could not export reference '{ref}': {e}")
+        if not ref_block:
+            raise RuntimeError(f"Reference '{ref}' has no atoms.")
+
+    workdir = tempfile.mkdtemp(prefix="poseviewer_metrics_")
+    receptor_path = ""
+    if any(m in RECEPTOR_METRICS for m in metrics):
+        prot = _stepper.protein_sel or "polymer.protein"
+        try:
+            if cmd.count_atoms(f"({prot})") == 0:
+                raise RuntimeError(f"Receptor selection '{prot}' has no atoms.")
+            receptor_path = os.path.join(workdir, "receptor.pdb")
+            cmd.save(receptor_path, f"({prot})", 1)
+        except RuntimeError:
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise
+        except Exception as e:
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise RuntimeError(f"Could not export receptor '{prot}': {e}")
+
+    pose_keys, pose_blocks = [], []
+    for obj, state in _stepper.poses:
+        try:
+            block = cmd.get_str("mol", f"({obj})", state)
+        except Exception:
+            block = ""
+        pose_keys.append((obj, state))
+        pose_blocks.append(block)
+
+    return _MetricsJob(metrics, pose_keys, pose_blocks, ref_block, receptor_path,
+                       workdir)
 
 
 # ---------------------------------------------------------------------------
@@ -1683,6 +2672,64 @@ USAGE
     _stepper.sdf_records = _parse_sdf_records(path)
     print(f"PoseViewer: loaded {len(_stepper.sdf_records)} score records from '{path}'.")
 
+def ci_calc(metrics="", quiet=0):
+    """Compute pose metrics for the current setup, blocking until done.
+
+USAGE
+    ci_calc                          # MCS_RMSD, Shape_Sim, Ref_Sim
+    ci_calc all
+    ci_calc mcs_rmsd,plif_sim
+
+    Names: mcs_rmsd, shape_sim, ref_sim, plif_sim, posebusters (or the field
+    names MCS_RMSD, Shape_Sim, Ref_Sim, PLIF_Sim, PB_Flags).  Reference-based
+    metrics need a reference ligand (ci_setup picks one up automatically, or
+    set _stepper.ref_ligand / choose one in the GUI).
+    """
+    import time
+    by_field = {v.lower(): k for k, v in METRIC_FIELDS.items()}
+    text = str(metrics).replace(",", " ").split()
+    if not text:
+        wanted = ["mcs_rmsd", "shape_sim", "ref_sim"]
+    elif len(text) == 1 and text[0].lower() == "all":
+        wanted = list(METRIC_ORDER)
+    else:
+        wanted = []
+        for name in text:
+            key = name.lower()
+            key = key if key in METRIC_FIELDS else by_field.get(key)
+            if key is None:
+                print(f"PoseViewer: unknown metric '{name}'.")
+                return
+            wanted.append(key)
+
+    try:
+        job = _collect_metric_inputs(wanted)
+    except RuntimeError as e:
+        print(f"PoseViewer: {e}")
+        return
+
+    job.start()
+    last = ""
+    while not job.finished:
+        done, total, msg = job.progress()
+        if not int(quiet) and msg != last:
+            last = msg
+            print(f"PoseViewer: {msg}")
+        time.sleep(0.25)
+
+    _stepper.merge_metrics(job.results)
+    _stepper._table_dirty = True      # picked up by the GUI's sync timer
+    for note in job.notes:
+        print(f"PoseViewer: {note}")
+    for err in job.errors:
+        print(f"PoseViewer: {err}")
+    for metric in job.metrics:
+        field = METRIC_FIELDS[metric]
+        n = sum(1 for v in job.results.values()
+                if isinstance(v.get(field), (int, float)))
+        print(f"PoseViewer: {field:9s} {n}/{len(job.pose_keys)} poses")
+
+
 def ci_clear():
     _clear_all(); _unbind_keys(); print("PoseViewer: cleared.")
 
@@ -1709,6 +2756,7 @@ cmd.extend("ci_goto", ci_goto)
 cmd.extend("ci_update", ci_update)
 cmd.extend("ci_refresh", ci_refresh)
 cmd.extend("ci_load_scores", ci_load_scores)
+cmd.extend("ci_calc", ci_calc)
 cmd.extend("ci_clear", ci_clear)
 cmd.extend("ci_bookmarks", ci_bookmarks)
 cmd.extend("ci_gui", ci_gui)
@@ -1915,6 +2963,31 @@ def _open_gui():
             btn_col.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
         btn_col.toggled.connect(_toggle)
         return g, en, body, bl
+
+    # Calculate — metrics derived from the session instead of read from the SDF
+    g_calc, _calc_en, _gcb, l_calc = _section("Calculate", expanded=False,
+                                              show_enable=False)
+    cb_metrics = {}
+    for _key in METRIC_ORDER:
+        _cb_m = QtWidgets.QCheckBox(METRIC_LABELS[_key])
+        # External metrics (prolif / posebusters) are slow and need a second
+        # interpreter, so they are opt-in.
+        _cb_m.setChecked(_key not in EXTERNAL_METRICS)
+        l_calc.addWidget(_cb_m)
+        cb_metrics[_key] = _cb_m
+    hl_calc = QtWidgets.QHBoxLayout()
+    b_calc = QtWidgets.QPushButton("Calculate")
+    b_calc_stop = QtWidgets.QPushButton("Cancel")
+    b_calc_stop.setEnabled(False)
+    hl_calc.addWidget(b_calc); hl_calc.addWidget(b_calc_stop)
+    l_calc.addLayout(hl_calc)
+    pb_calc = QtWidgets.QProgressBar()
+    pb_calc.setVisible(False)
+    l_calc.addWidget(pb_calc)
+    lbl_calc = QtWidgets.QLabel("")
+    lbl_calc.setWordWrap(True)
+    l_calc.addWidget(lbl_calc)
+    bot_l.addWidget(g_calc)
 
     # Non-covalent bonds
     g1, g1_en, _g1b, l1 = _section("Non-covalent bonds", enabled=True, expanded=False)
@@ -2178,6 +3251,11 @@ def _open_gui():
     def on_ref_changed(text):
         prev = _stepper.ref_ligand
         _stepper.ref_ligand = None if text == "(none)" else text
+        if prev != _stepper.ref_ligand and _stepper.invalidate_metrics(
+                [METRIC_FIELDS[m] for m in REF_METRICS]):
+            rebuild_table()
+            lbl_calc.setText("Reference changed — recalculate to update "
+                             "reference-based metrics.")
         if _stepper.ref_ligand:
             _color_ref_ligand(_stepper.ref_ligand)
             _stepper.show_ref = True
@@ -2214,6 +3292,7 @@ def _open_gui():
         ci_clear()
         _stepper.sdf_records = []
         _stepper.all_properties = []
+        _stepper.computed.clear()
         _stepper.ref_ligand = None
         _sel_order.clear()
         ref_combo.blockSignals(True)
@@ -2281,6 +3360,89 @@ def _open_gui():
             ci_update(); update_ui()
         return h
 
+    _calc_job: list = [None]
+
+    def do_calculate():
+        running = _calc_job[0]
+        if running is not None and not running.finished:
+            return
+        wanted = [k for k in METRIC_ORDER if cb_metrics[k].isChecked()]
+        if not wanted:
+            lbl_calc.setText("Select at least one metric.")
+            return
+        missing = [k for k in wanted
+                   if k in EXTERNAL_METRICS and not _external_python_candidates(k)]
+        if missing:
+            mods = ", ".join("/".join(_EXTERNAL_REQUIRES[k]) for k in missing)
+            lbl_calc.setText(f"No Python found with {mods} installed — "
+                             f"set $POSEVIEWER_PYTHON to one.")
+            return
+        try:
+            job = _collect_metric_inputs(wanted)
+        except RuntimeError as e:
+            lbl_calc.setText(str(e))
+            return
+        _calc_job[0] = job
+        job.start()
+        b_calc.setEnabled(False)
+        b_calc_stop.setEnabled(True)
+        pb_calc.setRange(0, job.total_n)
+        pb_calc.setValue(0)
+        pb_calc.setVisible(True)
+        lbl_calc.setText("Starting…")
+        calc_timer.start()
+
+    def do_calc_cancel():
+        job = _calc_job[0]
+        if job is not None:
+            job.cancel()
+            lbl_calc.setText("Cancelling…")
+        b_calc_stop.setEnabled(False)
+
+    def _calc_poll():
+        job = _calc_job[0]
+        if job is None:
+            calc_timer.stop()
+            return
+        try:
+            done, total, msg = job.progress()
+            pb_calc.setRange(0, max(1, total))
+            pb_calc.setValue(done)
+            if not job.finished:
+                lbl_calc.setText(msg)
+                return
+            calc_timer.stop()
+            _calc_job[0] = None
+            b_calc.setEnabled(True)
+            b_calc_stop.setEnabled(False)
+            pb_calc.setVisible(False)
+            _stepper.merge_metrics(job.results)
+            _stepper._table_dirty = False
+            rebuild_table()
+            update_ui()
+            parts = ["Cancelled."] if job.cancelled else []
+            for metric in job.metrics:
+                field = METRIC_FIELDS[metric]
+                n = sum(1 for v in job.results.values()
+                        if isinstance(v.get(field), (int, float)))
+                parts.append(f"{field}: {n}/{len(job.pose_keys)}")
+            for note in job.notes:
+                print(f"PoseViewer: {note}")
+            for err in job.errors:
+                print(f"PoseViewer: {err}")
+                parts.append(err)
+            lbl_calc.setText("   ".join(parts))
+        except RuntimeError:
+            calc_timer.stop()   # window closed mid-job
+
+    # Parented to win so Qt stops and destroys it when the window closes.
+    calc_timer = QtCore.QTimer(win)
+    calc_timer.setInterval(150)
+    calc_timer.timeout.connect(_calc_poll)
+    win._calc_timer = calc_timer
+
+    b_calc.clicked.connect(do_calculate)
+    b_calc_stop.clicked.connect(do_calc_cancel)
     b_browse.clicked.connect(do_browse)
     b_setup.clicked.connect(do_setup)
     b_clear.clicked.connect(do_clear)
@@ -2418,6 +3580,12 @@ def _open_gui():
     win._sync_tick = 0
 
     def _sync_if_external_change():
+        if _stepper._table_dirty:
+            # ci_calc merged new metrics from the command line (another thread),
+            # so refresh the table here, in the GUI thread.
+            _stepper._table_dirty = False
+            rebuild_table()
+            update_ui()
         if _stepper._in_compare or not _stepper.poses:
             return
         win._sync_tick += 1
@@ -2590,4 +3758,5 @@ print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
 print("  ci_refresh     - sync to current PyMOL state / state slider")
 print("  ci_load_scores - load per-pose properties from SDF file")
+print("  ci_calc        - compute MCS_RMSD / Shape_Sim / Ref_Sim / PLIF_Sim / PB_Flags")
 print("  LEFT/RIGHT arrow keys after setup")
