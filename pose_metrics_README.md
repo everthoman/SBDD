@@ -138,7 +138,13 @@ PoseBusters failures by check:
   way the GNINA web app does — including resolving stray non-ring aromatic bonds, which would
   otherwise make an identical molecule fingerprint differently — so the two tools score alike.
 - **Hydrogens.** `Ref_Sim`, `MCS_RMSD` and `Shape_Sim` strip explicit Hs so a pose with Hs and an
-  H-free reference stay comparable. `PLIF_Sim` keeps them: H-bond donor/acceptor perception needs them.
+  H-free reference stay comparable. `PLIF_Sim` goes the other way and completes them, on the poses
+  *and* the reference: H-bond donor perception needs them, and ProLIF's `VdWContact` sums van der
+  Waals radii over every atom, hydrogens included — so H-completing one side only would give that
+  side a richer contact profile and bias the similarity. The added positions come from idealised
+  geometry, not from optimisation, so for rotatable donors (hydroxyls, protonated amines) the
+  torsion is arbitrary; treat H-bond bits that depend on *added* Hs as softer evidence than ones
+  placed by ligand prep.
 - **Empty title lines.** SDF records are split without stripping leading blank lines — an empty
   molecule title is legal, and trimming it shifts the counts line and makes RDKit reject the
   whole molecule. Poses from GNINA typically have exactly that shape.

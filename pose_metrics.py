@@ -530,7 +530,11 @@ def _plif_prolif(receptor: Path, ref_sdf: Path, blocks: List[str],
         if mol is None:
             continue
         try:
-            ligands.append(prolif.Molecule.from_rdkit(mol))
+            # Hs are completed on the pose as well as on the reference above:
+            # ProLIF's VdWContact sums van der Waals radii over every atom,
+            # hydrogens included, so H-completing only one side gives that side a
+            # systematically richer contact profile and biases the similarity.
+            ligands.append(prolif.Molecule.from_rdkit(Chem.AddHs(mol, addCoords=True)))
             valid.append(i)
         except Exception:
             pass
