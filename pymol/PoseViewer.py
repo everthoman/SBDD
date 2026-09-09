@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.8.2
+PoseViewer - PyMOL Plugin  v1.8.3
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.8.2
+Version: 1.8.3
 License: MIT
 """
 
@@ -62,6 +62,11 @@ COLORS = {
     "ci_clash_bad":   (1.00, 0.60, 0.00),
     "ci_clash_ugly":  (1.00, 0.15, 0.15),
     "ci_water":       (0.30, 0.80, 0.95),
+    # Surface charge shades: saturated for formal charge, pale for partial.
+    "ci_surf_neg":     (0.90, 0.20, 0.20),   # carboxylate O
+    "ci_surf_neg_wk":  (0.96, 0.62, 0.60),   # amide / hydroxyl / thiol
+    "ci_surf_pos":     (0.24, 0.36, 0.92),   # guanidinium / ammonium / HIP
+    "ci_surf_pos_wk":  (0.62, 0.70, 0.96),   # amide N / indole / neutral His
 }
 
 def _register_colors():
@@ -1267,27 +1272,41 @@ def _delete_snapshots(temps):
 # Residue shell
 # ---------------------------------------------------------------------------
 
-# Atom-name-based surface colouring: only the charged/polar functional atoms of a
-# side chain drive the colour, never the aliphatic carbons — so a lysine reads as
-# a blue cap on its NZ, not a blue stripe down the whole side chain.
-_SURF_POS_N  = ("(resn ARG and name NH1+NH2+NE) or "
-                "(resn LYS and name NZ) or "
-                "(resn HIS+HID+HIE+HIP and name ND1+NE2)")
+# Atom-name-based surface colouring: only a side chain's charged/polar functional
+# atoms drive the colour, never the aliphatic carbons or the backbone.  Two
+# intensities per sign — saturated for a formal charge, pale for a partial one —
+# so a carboxylate and an amide oxygen don't read as the same thing.
+_HIS_RESN = "HIS+HID+HIE+HIP+HSD+HSE+HSP"
+# A histidine counts as protonated (+1) only when both imidazole NH are present:
+# explicitly named HIP/HSP, or an explicit-H model carrying both HD1 and HE2.
+_HIS_POS  = (f"((resn HIP+HSP) or ((resn {_HIS_RESN}) "
+             f"and (byres (name HD1)) and (byres (name HE2))))")
 
-_SURF_NEG_O  = ("(resn ASP and name OD1+OD2) or "
-                "(resn GLU and name OE1+OE2)")
+_SURF_NEG_STRONG = "(resn ASP and name OD1+OD2) or (resn GLU and name OE1+OE2)"
+_SURF_NEG_WEAK   = ("(resn ASN and name OD1) or (resn GLN and name OE1) or "
+                    "(resn SER and name OG) or (resn THR and name OG1) or "
+                    "(resn TYR and name OH) or (resn CYS and name SG)")
+_SURF_POS_STRONG = ("(resn ARG and name NH1+NH2+NE) or (resn LYS and name NZ) or "
+                    f"(({_HIS_POS}) and name ND1+NE2)")
+_SURF_POS_WEAK   = ("(resn ASN and name ND2) or (resn GLN and name NE2) or "
+                    "(resn TRP and name NE1) or "
+                    f"((resn {_HIS_RESN}) and not ({_HIS_POS}) and name ND1+NE2)")
 
 
 def _color_surface_by_type(surf_obj):
-    """Colour surface by charge: charged N → blue, charged O → red, else grey80.
-
-    Only the functional atoms listed above contribute; the rest of the residue,
-    carbons included, stays grey.
+    """Charge-code the surface. Deep red carboxylate O, pale red amide/hydroxyl/
+    thiol; deep blue guanidinium/ammonium/HIP N, pale blue amide/indole/neutral
+    His N.  Backbone and everything else stay grey.
     """
+    _register_colors()
     try: cmd.unset("surface_color", surf_obj)
     except Exception: pass
     cmd.color("grey80", surf_obj)
-    for col, sel in (("tv_blue", _SURF_POS_N), ("tv_red", _SURF_NEG_O)):
+    # Weak tiers first, then the strong tiers paint over any overlap.
+    for col, sel in (("ci_surf_neg_wk", _SURF_NEG_WEAK),
+                     ("ci_surf_pos_wk", _SURF_POS_WEAK),
+                     ("ci_surf_neg",    _SURF_NEG_STRONG),
+                     ("ci_surf_pos",    _SURF_POS_STRONG)):
         try: cmd.color(col, f"({surf_obj}) and ({sel})")
         except Exception: pass
 
@@ -4503,7 +4522,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.8.2"
+__version__ = "1.8.3"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")

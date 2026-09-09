@@ -1,4 +1,4 @@
-# PoseViewer v1.8.2
+# PoseViewer v1.8.3
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -14,7 +14,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Auto-split**: load any PDB with multiple HETATM ligands and PoseViewer automatically separates them into individual objects for per-ligand browsing and per-pocket surface display
 - **Compare mode**: select any two poses simultaneously — including pose #3 of ligand A vs pose #7 of ligand B — to overlay them in the binding site with distinct colors
 - Per-ligand pocket surface: residue shell, CA labels, and transparent surface update to the current ligand's binding site in objects mode
-- **Charge-colored surface**: pocket surface is tinted where a charged functional atom presents at the wall — blue for basic N (ARG/LYS/HIS), red for acidic O (ASP/GLU) — rather than flat grey
+- **Charge-colored surface**: pocket surface is tinted where a charged/polar functional atom presents at the wall — blue for basic N, red for acidic O, saturated for formal charge and pale for partial — rather than flat grey
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
 - **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks are tied to the pose itself, so they stay put when objects are added, deleted or renumbered, and are visible in the pose table
 - **Table export**: copy the pose table to the clipboard or write it to CSV/TSV, from the GUI or via `ci_export`
@@ -53,15 +53,17 @@ Salt bridges and the ligand side of pi-cation need to know which ligand atoms ar
 
 Reference ligand interactions are drawn with the same color scheme but thinner dashes (65% radius) to distinguish them from pose interactions.
 
-### Surface residue color scheme
+### Surface charge color scheme
 
-Only a side chain's **charged functional atoms** drive the tint (toggle: *Color surface by residue type* in the Display group) — the guanidinium/amino nitrogens, the carboxylate oxygens — never the aliphatic carbons. So the surface stays grey except where a charge is actually presented at the pocket wall.
+Only a side chain's **charged/polar functional atoms** drive the tint (toggle: *Color surface by residue type* in the Display group) — never the aliphatic carbons or the backbone. Two intensities per sign: **saturated for a formal charge, pale for a partial one**, so a carboxylate and an amide oxygen don't read as the same thing.
 
 | Color | Contributing atoms |
 |---|---|
-| Blue | ARG NH1/NH2/NE, LYS NZ, HIS ND1/NE2 |
-| Red | ASP OD1/OD2, GLU OE1/OE2 |
-| Grey | everything else |
+| Deep blue | ARG NH1/NH2/NE, LYS NZ, protonated HIS ND1/NE2 (HIP, or explicit HD1+HE2) |
+| Pale blue | ASN ND2, GLN NE2, TRP NE1, neutral HIS ND1/NE2 |
+| Deep red | ASP OD1/OD2, GLU OE1/OE2 |
+| Pale red | ASN OD1, GLN OE1, SER OG, THR OG1, TYR OH, CYS SG |
+| Grey | everything else (backbone included) |
 
 ---
 
