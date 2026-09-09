@@ -81,7 +81,11 @@ VDW_RADII = {
 }
 
 HBOND_ELEMENTS = {"N", "O", "S", "F"}
-# H-bonds handled entirely by PyMOL's cmd.distance(mode=2)
+# H-bonds are found by PyMOL's cmd.distance(mode=2), then filtered on the real
+# D-H...A angle (see _hbond_dha_angle).  PyMOL's own h_bond_max_angle is measured
+# at the donor heavy atom, so its 63 deg default lets through contacts whose
+# proton points ~100 deg away from the acceptor.  0 disables the filter.
+HBOND_MIN_DHA_ANGLE = 130.0
 
 HALOGEN_DONORS = {"Cl", "Br", "I"}
 HALOGEN_ACCEPTORS = {"O", "N", "S"}
@@ -109,6 +113,7 @@ CLASH_UGLY_FRAC = 0.75        # severe steric overlap
 CLASH_DIST_MAX = 2.0 * max(VDW_RADII.values()) * CLASH_GOOD_FRAC
 
 SHELL_DIST = 5.0
+ZOOM_BUFFER = 2.0             # padding around the binding site when auto-zooming
 
 DASH_RADIUS = 0.06
 DASH_GAP = 0.35
@@ -477,8 +482,10 @@ class InteractionResult:
         # these in, so the summary can never disagree with the picture.
         self.hbond_count: int = 0
         self.hbonds: List[dict] = []
-        # (x, y, z) rounded to 2 dp -> atom label, for naming those endpoints.
-        self.atom_labels: Dict[tuple, str] = {}
+        self.hbonds_rejected: int = 0   # dropped by the D-H...A angle filter
+        # (x, y, z) rounded to 2 dp -> (label, element), so visualize() can both
+        # name the endpoints PyMOL chose and measure the geometry at them.
+        self.atom_info: Dict[tuple, tuple] = {}
         self.halogen: List[dict] = []
         self.salt_bridges: List[dict] = []
         self.arom_hbonds: List[dict] = []
@@ -557,10 +564,10 @@ def _detect_interactions(
 
     # Endpoint -> label map, so visualize() can name the atoms in the H-bonds
     # PyMOL drew for itself without going back to the PyMOL API to identify them.
-    for _i, a, c, _e in lig_atoms:
-        result.atom_labels[(round(c[0], 2), round(c[1], 2), round(c[2], 2))] = _il(a)
-    for _i, a, c, _e in prot_atoms:
-        result.atom_labels[(round(c[0], 2), round(c[1], 2), round(c[2], 2))] = _ip(a)
+    for _i, a, c, e in lig_atoms:
+        result.atom_info[(round(c[0], 2), round(c[1], 2), round(c[2], 2))] = (_il(a), e)
+    for _i, a, c, e in prot_atoms:
+        result.atom_info[(round(c[0], 2), round(c[1], 2), round(c[2], 2))] = (_ip(a), e)
 
     # --- Ligand rings and charges (the pairwise loop needs the charges) ------
     # Done once, up front, from the model already in hand.
@@ -918,9 +925,45 @@ def _distance_object_pairs(name, state=0):
         return []
 
 
+def _coord_key(p):
+    return (round(p[0], 2), round(p[1], 2), round(p[2], 2))
+
+
+def _hbond_dha_angle(p1, p2, info):
+    """True D-H...A angle in degrees for a drawn polar contact, or None.
+
+    PyMOL draws these proton-first when h_bond_from_proton is on, so one endpoint
+    is usually the hydrogen itself; the donor is then the nearest heavy atom to
+    it.  Returns None when there is no proton to measure from — a receptor loaded
+    without hydrogens, or h_bond_from_proton switched off — so those contacts are
+    left alone rather than silently dropped.
+    """
+    k1, k2 = _coord_key(p1), _coord_key(p2)
+    e1 = info.get(k1, ("", ""))[1]
+    e2 = info.get(k2, ("", ""))[1]
+    if e1 == "H":
+        h, acc = p1, p2
+    elif e2 == "H":
+        h, acc = p2, p1
+    else:
+        return None
+    donor, best = None, 1.35
+    for coord, (_label, elem) in info.items():
+        if elem == "H":
+            continue
+        d = _dist(coord, h)
+        if d < best:
+            best, donor = d, coord
+    if donor is None:
+        return None
+    v1 = _norm([donor[i] - h[i] for i in range(3)])
+    v2 = _norm([acc[i] - h[i] for i in range(3)])
+    return math.degrees(math.acos(min(1.0, max(-1.0, _dot(v1, v2)))))
+
+
 def visualize(lig_sel, prot_sel, result: InteractionResult,
               show_hbonds=True, show_labels=True, state=-1,
-              name_prefix="", clear=True):
+              name_prefix="", clear=True, hbond_min_angle=HBOND_MIN_DHA_ANGLE):
     """Visualize all interactions.
 
     H-bonds are created via PyMOL's built-in polar contact detection
@@ -931,6 +974,8 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
                  contacts are computed — the default computes every state of the
                  object, which on a 200-pose SDF costs 11.9 ms per call against
                  0.3 ms for one state.
+    hbond_min_angle: drop polar contacts whose D-H...A angle is below this (deg).
+                 0 keeps everything PyMOL reported.
     name_prefix: prepended to all PyMOL object names (used for reference
                  ligand so its objects are distinct from pose objects).
     clear:       call _clear_contacts() before drawing (set False when
@@ -944,42 +989,49 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
     r_scale = 0.65 if name_prefix else 1.0
     hb_state = state if state and state > 0 else 0
 
-    # --- H-bonds via PyMOL polar contacts (mode=2) ---
+    # --- H-bonds: PyMOL finds them, we vet the geometry, then we draw them ---
+    # The native mode=2 object is used only to *find* candidates and is deleted
+    # again; the survivors are redrawn through the same pseudoatom machinery as
+    # every other type.  Filtering without redrawing would put dashes on screen
+    # that the summary does not list, which is the divergence v1.6 removed.
     hb_name = name_prefix + _INTERACTION_NAMES["hbonds"]
     result.hbonds = []
     result.hbond_count = 0
+    result.hbonds_rejected = 0
+    hb_pairs: List[tuple] = []
     if show_hbonds:
         try:
             cmd.distance(hb_name, lig_sel, prot_sel, mode=2, state=hb_state)
-            pairs = _distance_object_pairs(hb_name, hb_state)
-            if pairs:
-                labels = result.atom_labels
-                # Collapse duplicate endpoints, the same way _dedup() does for
-                # every other type.  Altlocs produce them, and so does the
-                # source copy that _auto_split_ligands leaves in the session:
-                # a second ligand at identical coordinates makes PyMOL report
-                # each polar contact twice.  Unordered, since the two dashes
-                # can arrive donor-first and acceptor-first.
-                seen: Set[tuple] = set()
-                for p1, p2 in pairs:
-                    k1 = (round(p1[0], 2), round(p1[1], 2), round(p1[2], 2))
-                    k2 = (round(p2[0], 2), round(p2[1], 2), round(p2[2], 2))
-                    key = (k1, k2) if k1 <= k2 else (k2, k1)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    result.hbonds.append({
-                        "p1": p1, "p2": p2, "dist": _dist(p1, p2),
-                        "info1": labels.get(k1, ""), "info2": labels.get(k2, "")})
-                result.hbond_count = len(result.hbonds)
-                _track(hb_name)
-                _style(hb_name, "ci_hbond", radius=DASH_RADIUS * r_scale)
-            else:
-                try: cmd.delete(hb_name)
-                except Exception: pass
+            raw = _distance_object_pairs(hb_name, hb_state)
         except Exception:
-            try: cmd.delete(hb_name)
-            except Exception: pass
+            raw = []
+        try: cmd.delete(hb_name)
+        except Exception: pass
+
+        info = result.atom_info
+        # Collapse duplicate endpoints, the same way _dedup() does for every
+        # other type.  Altlocs produce them, and so does the source copy that
+        # _auto_split_ligands leaves in the session: a second ligand at
+        # identical coordinates makes PyMOL report each contact twice.
+        # Unordered, since the two dashes can arrive donor- and acceptor-first.
+        seen: Set[tuple] = set()
+        for p1, p2 in raw:
+            k1, k2 = _coord_key(p1), _coord_key(p2)
+            key = (k1, k2) if k1 <= k2 else (k2, k1)
+            if key in seen:
+                continue
+            seen.add(key)
+            angle = _hbond_dha_angle(p1, p2, info)
+            if (hbond_min_angle and angle is not None
+                    and angle < hbond_min_angle):
+                result.hbonds_rejected += 1
+                continue
+            hb_pairs.append((p1, p2))
+            result.hbonds.append({
+                "p1": p1, "p2": p2, "dist": _dist(p1, p2), "angle": angle,
+                "info1": info.get(k1, ("", ""))[0],
+                "info2": info.get(k2, ("", ""))[0]})
+        result.hbond_count = len(result.hbonds)
 
     # --- All other types via pseudoatom pairs ---
     pts = _OBJ_REF_PTS if name_prefix else _OBJ_PTS
@@ -996,6 +1048,12 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
         for it in items:
             pending.append((obj_name, it["p1"], it["p2"]))
         styles.append((obj_name, color, kw))
+
+    if hb_pairs:
+        _track(hb_name)
+        for _p1, _p2 in hb_pairs:
+            pending.append((hb_name, _p1, _p2))
+        styles.append((hb_name, "ci_hbond", dict(radius=DASH_RADIUS * r_scale)))
 
     _draw(result.halogen,      N["halogen"],  "ci_halogen",
           radius=DASH_RADIUS * r_scale)
@@ -1309,7 +1367,12 @@ class LigandStepper:
         self.show_clash_bad = False
         self.show_clash_ugly = False
         self.show_labels = True
+        self.hbond_min_angle: float = HBOND_MIN_DHA_ANGLE
         self.auto_zoom = True
+        # Frame the pocket rather than the ligand.  Set False to go back to
+        # zooming the ligand alone.
+        self.zoom_to_shell: bool = True
+        self.zoom_buffer: float = ZOOM_BUFFER
         self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
         self.all_properties: list = []  # one dict per pose, built at setup time
         self.poses: list = []          # [(obj_name, state_1based), ...]
@@ -1375,10 +1438,12 @@ class LigandStepper:
         _prepare_scene(prot, all_ligs)
         if self.ref_ligand:
             _color_ref_ligand(self.ref_ligand)
-        self._show_current()
-        # After _show_current, so the shell is built around the pose being shown
-        # rather than whatever state the slider happened to be on.
+        # Before _show_current, because the auto-zoom frames the shell: build it
+        # after and the very first pose would be framed on the ligand alone.
+        # The state is passed explicitly, so it no longer matters what the state
+        # slider happened to read when Setup was pressed.
         _create_shell(prot, all_ligs, state=self.poses[0][1] if self.poses else 1)
+        self._show_current()
         self._prefetch_all_properties()
         self._build_obj_colors()
 
@@ -1459,7 +1524,7 @@ class LigandStepper:
                     break
             obj, st2 = self.poses[self.current_index]
             if self.auto_zoom:
-                cmd.zoom(obj, buffer=3.0, animate=1, state=st2)
+                self._zoom_to_site(obj, st2)
             self._update(obj, state=st2)
         else:
             self._show_current()
@@ -1486,14 +1551,10 @@ class LigandStepper:
                     cmd.disable(self.ref_ligand)
             except Exception:
                 pass
-        if self.auto_zoom:
-            if self.show_pose:
-                cmd.zoom(obj, buffer=3.0, animate=1, state=st)
-            elif self.ref_ligand and self.show_ref:
-                cmd.zoom(self.ref_ligand, buffer=3.0, animate=1, state=1)
-        self._update(obj, state=st)
         # In objects mode each ligand may sit in a different pocket, so rebuild
         # the shell/surface around just the current ligand (+ ref if visible).
+        # Done before the zoom, which targets the shell and so needs it to
+        # describe the pose about to be shown rather than the previous one.
         if self.mode == "objects":
             visible = []
             if self.show_pose:
@@ -1505,6 +1566,33 @@ class LigandStepper:
                 if not self.show_surface and _OBJ_SURF in _created_objects:
                     try: cmd.hide("surface", _OBJ_SURF)
                     except Exception: pass
+        if self.auto_zoom:
+            self._zoom_to_site(obj, st)
+        self._update(obj, state=st)
+
+    def _zoom_to_site(self, obj, st):
+        """Frame the binding site rather than the ligand on its own.
+
+        Zooming the ligand puts the camera right on top of it and the pocket
+        falls outside the view, which is disorienting when stepping through
+        poses.  The residue shell is the useful frame, and in states mode it is
+        fixed, so the view stops jumping from pose to pose.  Falls back to the
+        ligand when there is no shell — nothing within SHELL_DIST, or shell
+        setup failed — or when zoom_to_shell is off.
+        """
+        target, state = None, st
+        if self.zoom_to_shell and _shell_sel is not None:
+            target, state = _shell_sel, 1
+        elif self.show_pose:
+            target = obj
+        elif self.ref_ligand and self.show_ref:
+            target, state = self.ref_ligand, 1
+        if target is None:
+            return
+        try:
+            cmd.zoom(target, buffer=self.zoom_buffer, animate=1, state=state)
+        except Exception:
+            pass
 
     def _build_obj_colors(self):
         seen = dict.fromkeys(obj for obj, _ in self.poses)
@@ -1652,7 +1740,8 @@ class LigandStepper:
             if self.show_pose:
                 visualize(lig, self.protein_sel, r,
                           show_hbonds=self.show_hbonds,
-                          show_labels=self.show_labels, state=state)
+                          show_labels=self.show_labels, state=state,
+                          hbond_min_angle=self.hbond_min_angle)
             else:
                 _clear_contacts()
             if self.ref_ligand and self.show_ref:
@@ -1669,7 +1758,8 @@ class LigandStepper:
                     visualize(self.ref_ligand, self.protein_sel, r_ref,
                               show_hbonds=self.show_hbonds,
                               show_labels=self.show_labels, state=1,
-                              name_prefix="ref_", clear=not self.show_pose)
+                              name_prefix="ref_", clear=not self.show_pose,
+                              hbond_min_angle=self.hbond_min_angle)
                 except Exception:
                     pass
         except Exception as e:
@@ -1803,7 +1893,11 @@ class LigandStepper:
                 i2 = it.get("info2", "")
                 lines.append(f"  {i1} -- {i2}  {it['dist']:.2f} A{ex}")
 
-        _s("H-bonds", r.hbonds)
+        _s("H-bonds", r.hbonds,
+           lambda x: f"  {x['angle']:.0f} deg" if x.get("angle") is not None else "")
+        if r.hbonds_rejected:
+            lines.append(f"  ({r.hbonds_rejected} polar contact(s) below "
+                         f"{self.hbond_min_angle:.0f} deg D-H...A not shown)")
         _s("Halogen bonds", r.halogen)
         _s("Salt bridges", r.salt_bridges)
         _s("Aromatic H-bonds", r.arom_hbonds)
@@ -3043,8 +3137,26 @@ EXAMPLES
         _stepper.setup_objects(protein, ligs, ref_lig=ref_lig)
         print(f"PoseViewer: {len(ligs)} ligand(s).")
 
+    _warn_if_no_scores()
     _print_summary()
     _bind_keys()
+
+
+def _warn_if_no_scores():
+    """Say why the Pose Data table is bare, instead of leaving it a mystery.
+
+    SD tags are read straight off a loaded SDF only by Incentive PyMOL; anywhere
+    else the Scores field (or ci_load_scores) is what fills the table.
+    """
+    if _stepper.sdf_records or not _stepper.all_properties:
+        return
+    identity = {"_name", "resn", "resi", "chain"}
+    if any(set(props) - identity for props in _stepper.all_properties):
+        return
+    print("PoseViewer: no per-pose score columns found. SD data is read from a "
+          "loaded SDF only by Incentive PyMOL — otherwise point the "
+          "Scores (SDF) field at the poses file (or run ci_load_scores <path>) "
+          "and press Setup again.")
 
 
 def _print_summary():
@@ -3136,6 +3248,40 @@ USAGE
         print(f"PoseViewer: {field:9s} {n}/{len(job.pose_keys)} poses")
 
 
+def ci_hbond_angle(degrees=""):
+    """Show or set the minimum D-H...A angle for H-bonds.
+
+USAGE
+    ci_hbond_angle          # show the current value
+    ci_hbond_angle 130      # only keep contacts at 130 deg or straighter
+    ci_hbond_angle 0        # off: keep whatever PyMOL's polar contacts report
+
+    PyMOL's own h_bond_max_angle is measured at the donor heavy atom, between
+    the D-H bond and the D...A vector, so its 63 deg default admits contacts
+    whose proton points ~100 deg away from the acceptor — a good N...O distance
+    with the hydrogen aimed elsewhere.  This filter measures the angle at the
+    proton instead.  Contacts with no explicit hydrogen are never filtered,
+    since there is nothing to measure.
+    """
+    if degrees == "":
+        print(f"PoseViewer: hbond_min_angle = {_stepper.hbond_min_angle:.0f} deg"
+              f"{' (off)' if not _stepper.hbond_min_angle else ''}")
+        return
+    try:
+        value = float(degrees)
+    except (TypeError, ValueError):
+        print(f"PoseViewer: '{degrees}' is not a number.")
+        return
+    if not 0.0 <= value <= 180.0:
+        print("PoseViewer: angle must be between 0 and 180 degrees.")
+        return
+    _stepper.hbond_min_angle = value
+    print(f"PoseViewer: hbond_min_angle = {value:.0f} deg"
+          f"{' (off)' if not value else ''}")
+    if _stepper.poses:
+        ci_update()
+
+
 def ci_clear():
     _clear_all(); _unbind_keys(); print("PoseViewer: cleared.")
 
@@ -3207,6 +3353,7 @@ cmd.extend("ci_calc", ci_calc)
 cmd.extend("ci_clear", ci_clear)
 cmd.extend("ci_bookmarks", ci_bookmarks)
 cmd.extend("ci_export", ci_export)
+cmd.extend("ci_hbond_angle", ci_hbond_angle)
 cmd.extend("ci_gui", ci_gui)
 
 
@@ -3455,6 +3602,21 @@ def _open_gui():
     # Non-covalent bonds
     g1, g1_en, _g1b, l1 = _section("Non-covalent bonds", enabled=True, expanded=False)
     cb_hb = _cb(l1, "Hydrogen bonds",  "#ffd900")
+    hl_hba = QtWidgets.QHBoxLayout()
+    hl_hba.addSpacing(20)
+    _lbl_hba = QtWidgets.QLabel("min D–H···A angle:")
+    sp_hba = QtWidgets.QDoubleSpinBox()
+    sp_hba.setRange(0.0, 180.0); sp_hba.setDecimals(0); sp_hba.setSingleStep(5.0)
+    sp_hba.setValue(_stepper.hbond_min_angle); sp_hba.setSuffix("°")
+    sp_hba.setFixedWidth(70)
+    _tip = ("Drop polar contacts whose hydrogen points away from the acceptor.\n"
+            "PyMOL's own h_bond_max_angle is measured at the donor heavy atom, "
+            "so its\n63° default admits contacts with a D–H···A angle near 100° — "
+            "a good\nN···O distance with the proton aimed elsewhere.\n"
+            "0 = off. Contacts with no explicit hydrogen are never filtered.")
+    sp_hba.setToolTip(_tip); _lbl_hba.setToolTip(_tip)
+    hl_hba.addWidget(_lbl_hba); hl_hba.addWidget(sp_hba); hl_hba.addStretch()
+    l1.addLayout(hl_hba)
     cb_xb = _cb(l1, "Halogen bonds",   "#9933e6")
     cb_sb = _cb(l1, "Salt bridges",    "#e633e6")
     cb_ah = _cb(l1, "Aromatic H-Bond", "#4dd97f")
@@ -3479,7 +3641,10 @@ def _open_gui():
     cb_lb   = QtWidgets.QCheckBox("Show distance labels");  cb_lb.setChecked(True)
     cb_surf = QtWidgets.QCheckBox("Show surface");          cb_surf.setChecked(True)
     cb_rlbl = QtWidgets.QCheckBox("Show residue labels");   cb_rlbl.setChecked(True)
-    cb_zoom = QtWidgets.QCheckBox("Auto-zoom to pose");           cb_zoom.setChecked(True)
+    cb_zoom = QtWidgets.QCheckBox("Auto-zoom to binding site");   cb_zoom.setChecked(True)
+    cb_zoom.setToolTip("Frame the residue shell around the ligand on every pose "
+                       "change.\nSet _stepper.zoom_to_shell = False to zoom the "
+                       "ligand alone instead.")
     cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
     cb_cstype = QtWidgets.QCheckBox("Color surface by residue type"); cb_cstype.setChecked(True)
     for _w in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h, cb_cstype):
@@ -3992,6 +4157,9 @@ def _open_gui():
 
 
     cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds"))
+    sp_hba.valueChanged.connect(lambda v: [
+        setattr(_stepper, "hbond_min_angle", float(v)),
+        ci_update(), update_ui()])
     cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen"))
     cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt"))
     cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb"))
@@ -4313,4 +4481,6 @@ print("  ci_refresh     - sync to current PyMOL state / state slider")
 print("  ci_load_scores - load per-pose properties from SDF file")
 print("  ci_calc        - compute MCS_RMSD / Shape_Sim / Ref_Sim / PLIF_Sim / PB_Flags")
 print("  ci_export      - write the pose table to CSV/TSV")
+print("  ci_hbond_angle - min D-H...A angle for H-bonds (default "
+      f"{HBOND_MIN_DHA_ANGLE:.0f} deg, 0 = off)")
 print("  LEFT/RIGHT arrow keys after setup")

@@ -42,7 +42,13 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 | Clashes | Bad clashes (< 0.89× VDW sum) | Orange |
 | Clashes | Ugly clashes (< 0.75× VDW sum) | Red |
 
-H-bond dashes are drawn via PyMOL's `cmd.distance(mode=2)` polar contact detection, and the console summary lists exactly those pairs — they are read back off the distance object, so the listing can never disagree with the picture. (Before v1.6 the summary used a separate proximity rule — any N/O/S/F pair within 3.5 Å — which counted acceptor–acceptor pairs such as two carbonyl oxygens as H-bonds and could also miss ones PyMOL drew.) All other interaction types are detected geometrically.
+H-bonds are found by PyMOL's `cmd.distance(mode=2)` polar contact detection, then vetted on geometry and redrawn, so the picture and the console listing are always the same set.
+
+**The angle filter.** PyMOL's `h_bond_max_angle` (default 63°) is measured *at the donor heavy atom* — between the D–H bond and the D···A vector — not on the D–H···A angle that gets quoted in papers. A 63° cone at the donor admits D–H···A angles down to about 100°, i.e. a perfect-looking donor–acceptor distance with the hydrogen pointing somewhere else entirely. PoseViewer therefore measures the angle at the proton and drops anything below **`hbond_min_angle`, 130° by default** (`ci_hbond_angle`, or the spin box beside the Hydrogen bonds checkbox; 0 disables it). The summary reports each surviving H-bond's angle and says how many were filtered out.
+
+A real example, a uracil fragment in UNG2: the ring N–H sits 2.91 Å from a backbone carbonyl O — textbook distance — but at a D–H···A angle of 102°, so the proton is not pointing at the acceptor at all. PyMOL draws it because the angle at the donor is 58°, inside its 63° default. The filter removes it; the two genuine H-bonds in that site (144° and 169°) are untouched.
+
+**This needs explicit hydrogens.** A contact with no hydrogen on either endpoint has nothing to measure, and is passed through unfiltered rather than guessed at — so the filter does its work on protonated or MD-minimised structures and stays out of the way on a bare PDB from the RCSB. (Before v1.6 the summary used a separate proximity rule — any N/O/S/F pair within 3.5 Å — which counted acceptor–acceptor pairs such as two carbonyl oxygens as H-bonds and could also miss ones PyMOL drew.) All other interaction types are detected geometrically.
 
 Salt bridges and the ligand side of pi-cation need to know which ligand atoms are charged. SDF and mol2 carry formal charges and are used as-is; PDB has no charge column, so a ligand read out of a complex arrives neutral. In that case PoseViewer infers the groups that are ionised at physiological pH — carboxylate/phosphate/sulfonate as anions, quaternary N, guanidinium/amidinium and non-aromatic aliphatic amines as cations — and deliberately stays silent on ring nitrogens, anilines and ureas, whose basicity depends on context. Non-polar hydrogens (C-H) are excluded from clash detection. Contacts/clashes are hidden by default.
 
@@ -112,6 +118,7 @@ ci_gui
 | `ci_calc [metrics]` | Compute pose metrics (see [Pose metrics](#pose-metrics)) |
 | `ci_bookmarks` | List all bookmarked poses to the console |
 | `ci_export <path> [, bookmarked]` | Write the pose table (SD properties plus computed metrics) to CSV; a `.tsv`/`.txt` extension switches to tab-separated |
+| `ci_hbond_angle [degrees]` | Show or set the minimum D–H···A angle for H-bonds (default 130°, 0 = off) |
 | `ci_clear` | Remove all PoseViewer objects |
 
 ### `ci_setup` parameters
@@ -134,6 +141,8 @@ ci_calc all
 ci_calc mcs_rmsd,plif_sim
 ci_export /path/to/poses.csv
 ci_export /path/to/marked.tsv, bookmarked
+ci_hbond_angle 145              # stricter H-bond geometry
+ci_hbond_angle 0                # off: show whatever PyMOL reports
 ```
 
 ---
@@ -186,7 +195,9 @@ Reference ligand interaction lines respect the same **Show distance labels** tog
 
 ### Pose Data group
 
-Sortable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Column headers are movable. Rank columns are excluded. Requires a scores SDF to be loaded, or Incentive PyMOL.
+Sortable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Column headers are movable. Rank columns are excluded.
+
+**Where the columns come from.** Only Incentive PyMOL reads SD tags off a loaded SDF automatically; open-source PyMOL discards them at load. Everywhere else you must point the **Scores (SDF)** field at the poses file (or run `ci_load_scores`) *before* pressing Setup, otherwise the table shows only the identity columns (`Ligand_ID`, `resn`, `resi`, `chain`) and none of the docking scores. Setup prints a note to the console when it ends up in that state.
 
 When browsing auto-split ligands from a protein structure (no SDF), the table shows `resn`, `resi`, and `chain` columns derived from the original PDB residue identity of each ligand.
 
@@ -222,6 +233,8 @@ Each group has:
 
 Individual interaction types can be toggled within each group. Contacts/Clashes are disabled by default.
 
+The **Non-covalent bonds** group carries a `min D–H···A angle` spin box under the Hydrogen bonds checkbox, which is the same setting as `ci_hbond_angle` (see [Interaction types](#interaction-types)). Changing it re-detects immediately.
+
 ### Display group
 
 | Option | Default | Description |
@@ -229,7 +242,7 @@ Individual interaction types can be toggled within each group. Contacts/Clashes 
 | Show distance labels | On | Show/hide Å labels on interaction dashes |
 | Show surface | On | Show/hide the transparent pocket surface |
 | Show residue labels | On | Show/hide CA residue name+number labels on the shell |
-| Auto-zoom to pose | On | Zoom to binding site on each pose change |
+| Auto-zoom to binding site | On | Frame the residue shell on each pose change, rather than the ligand alone. Zooming the ligand puts the camera on top of it and the pocket falls out of view; on this test case the shell spans 20 Å against 7 Å for a single pose. Set `_stepper.zoom_to_shell = False` for the old ligand-only framing, or `_stepper.zoom_buffer` to change the padding (2 Å default) |
 | Show nonpolar H on ligands | Off | Show all hydrogens (including nonpolar C-H) on pose and reference ligands as sticks. Off by default (only polar H on N/O/S shown). |
 
 The Display group enable checkbox hides all display elements at once (surface, labels). Unticking it remembers what was on; ticking it again restores exactly that, rather than switching everything on — which used to turn on nonpolar ligand H even though it defaults to off.
@@ -349,7 +362,7 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 
 | Interaction | Criterion |
 |---|---|
-| H-bonds (dashes and console listing) | PyMOL polar contacts `cmd.distance(mode=2)`, read back off the distance object so both agree |
+| H-bonds (dashes and console listing) | PyMOL polar contacts `cmd.distance(mode=2)`, then D–H···A ≥ `hbond_min_angle` (130° default) wherever an explicit hydrogen exists |
 | Halogen bonds | Cl/Br/I donor ··· O/N/S acceptor, ≤ 3.5 Å |
 | Salt bridges | Cationic ligand N ··· Asp/Glu O, or Arg/Lys/His N ··· anionic ligand O, ≤ 4.0 Å. Ligand charges come from the file when it has them, otherwise inferred (see above) |
 | Aromatic H-bonds | Aromatic C ··· O/N/S acceptor, ≤ 3.5 Å, C-H···A angle > 120° |
