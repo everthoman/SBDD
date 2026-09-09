@@ -1,4 +1,4 @@
-# PoseViewer v1.7.2
+# PoseViewer v1.8
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -237,6 +237,7 @@ The **Non-covalent bonds** group carries a `min D–H···A angle` spin box und
 |---|---|---|
 | Show distance labels | On | Show/hide Å labels on interaction dashes |
 | Show surface | On | Show/hide the transparent pocket surface |
+| surface reach | 5.0 Å | How far the pocket surface extends around the ligand. The surface is carved from the protein's molecular surface at this radius; larger shows more of the pocket wall. Rebuilds the surface on change. |
 | Show residue labels | On | Show/hide CA residue name+number labels on the shell |
 | Auto-zoom to binding site | On | Frame the residue shell on each pose change, rather than the ligand alone. Zooming the ligand puts the camera on top of it and the pocket falls out of view; on this test case the shell spans 20 Å against 7 Å for a single pose. Set `_stepper.zoom_to_shell = False` for the old ligand-only framing, or `_stepper.zoom_buffer` to change the padding (2 Å default) |
 | Show nonpolar H on ligands | Off | Show all hydrogens (including nonpolar C-H) on pose and reference ligands as sticks. Off by default (only polar H on N/O/S shown). |
@@ -379,7 +380,7 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 - `numpy` is optional. It is used only for the best-fit-plane SVD in the aromatic ring planarity test, which falls back to Newell's method without it. The per-pair geometry is deliberately scalar Python — numpy's per-call overhead dominates on 3-vectors and made pose stepping about twice as slow
 - **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no scores file needed, leave the Scores field blank
 - **Open-source PyMOL**: SDF data fields are stripped on load. Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
-- The shell shows residues within 5 Å of the current ligand as lines with CA labels. The pocket surface is a carved patch of the real protein molecular surface: the solvent-excluded surface is computed on a wider residue shell (8 Å) for correct geometry, then trimmed to the wall within 5 Å of the ligand — so it hugs the binding site rather than closing over into a blob around whole side chains. In objects mode shell and surface update per ligand step; in states mode they are computed once at setup, around the first pose
+- The shell shows residues within 5 Å of the current ligand as lines with CA labels. The pocket surface is a carved patch of the real protein molecular surface: the solvent-excluded surface is computed on a wider residue shell (8 Å) for correct geometry, then trimmed to the wall within the **surface reach** distance of the ligand (5 Å default, adjustable in the Display group) — so it hugs the binding site rather than closing over into a blob around whole side chains. In objects mode shell and surface update per ligand step; in states mode they are computed once at setup, around the first pose
 - **Large pose sets** are fine: Setup on a 1600-pose SDF takes well under a second, and stepping is ~20 ms per pose. Every distance-based selection is evaluated against a single-state copy of the current pose and pinned to state 1, because PyMOL's default evaluates `within` once per state in the session — 0.001 s at one state, 0.13 s at 800 — which is what used to make PyMOL appear to hang on a full docking run. A corollary: the shell and surface follow the pose on screen rather than the union of every pose
 - Duplicate interactions caused by alternate conformations (altloc atoms) in PDB structures are automatically removed by spatial deduplication
 - Water bridges require HOH residues in the loaded structure. HOH is searched globally (not limited to `polymer.protein`), so crystallographic waters in the protein PDB are detected even when the protein selection excludes them

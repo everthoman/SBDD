@@ -1,6 +1,6 @@
 """
-PoseViewer - PyMOL Plugin  v1.7.2
-=================================
+PoseViewer - PyMOL Plugin  v1.8
+==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
 stepping for docking pose review.
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.7.2
+Version: 1.8
 License: MIT
 """
 
@@ -118,8 +118,8 @@ SHELL_DIST = 5.0
 # the pocket) and then carved back to just the wall facing the ligand.  Surfacing
 # only the atoms within SHELL_DIST instead produced a closed blob around a bag of
 # clipped side chains that swallowed the pocket residues whole.
-SURF_SHELL_DIST = SHELL_DIST + 3.0   # atoms fed to the surface calculation
-SURF_CARVE_DIST = SHELL_DIST         # surface kept within this distance of the ligand
+SURF_CARVE_DIST = SHELL_DIST         # default surface reach; GUI-tunable per session
+SURF_SHELL_PAD  = 3.0                # extra reach for the SES scratch geometry
 ZOOM_BUFFER = 2.0             # padding around the binding site when auto-zooming
 
 DASH_RADIUS = 0.06
@@ -1308,8 +1308,9 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     """
     global _shell_sel, _shell_key
     lig_union = _lig_union(ligand_sels)
+    surf_dist = _stepper.surf_dist
 
-    key = (protein_sel, lig_union, dist, state)
+    key = (protein_sel, lig_union, dist, state, surf_dist)
     if key == _shell_key and _shell_sel is not None and _OBJ_SURF in _created_objects:
         return
 
@@ -1340,14 +1341,15 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     # SHELL_DIST closed the mesh over into a blob that swallowed the pocket
     # residues; instead build the SES on a wide residue shell (so it is correct
     # at the pocket wall), keep a single-state ligand copy to carve against, and
-    # trim to the wall within SURF_CARVE_DIST of the ligand (the negative
-    # normal-cutoff keeps the patch continuous rather than dropping to fragments).
+    # trim to the wall within surf_dist of the ligand (the negative normal-cutoff
+    # keeps the patch continuous rather than dropping to fragments).  surf_dist is
+    # _stepper.surf_dist, tunable from the Display group.
     try:
         cmd.create(_OBJ_CARVE, snap_sel, 1, 1)
         _track(_OBJ_CARVE)
         cmd.disable(_OBJ_CARVE)
         cmd.select(_OBJ_SHELL_ATOMS,
-                   f"byres (({protein_sel}) within {SURF_SHELL_DIST} "
+                   f"byres (({protein_sel}) within {surf_dist + SURF_SHELL_PAD} "
                    f"of ({snap_sel}))",
                    enable=0, state=1)
         cmd.create(_OBJ_SURF, _OBJ_SHELL_ATOMS, 1, 1)
@@ -1356,7 +1358,7 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
         cmd.hide("everything", _OBJ_SURF)
         cmd.show("surface", _OBJ_SURF)
         cmd.set("surface_carve_selection", _OBJ_CARVE, _OBJ_SURF)
-        cmd.set("surface_carve_cutoff", SURF_CARVE_DIST, _OBJ_SURF)
+        cmd.set("surface_carve_cutoff", surf_dist, _OBJ_SURF)
         cmd.set("surface_carve_normal_cutoff", -0.5, _OBJ_SURF)
         if _stepper.color_surf_by_type:
             _color_surface_by_type(_OBJ_SURF)
@@ -1403,6 +1405,8 @@ class LigandStepper:
         # zooming the ligand alone.
         self.zoom_to_shell: bool = True
         self.zoom_buffer: float = ZOOM_BUFFER
+        # How far the pocket surface reaches around the ligand (Display group).
+        self.surf_dist: float = SURF_CARVE_DIST
         self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
         self.all_properties: list = []  # one dict per pose, built at setup time
         self.poses: list = []          # [(obj_name, state_1based), ...]
@@ -1558,6 +1562,28 @@ class LigandStepper:
             self._update(obj, state=st2)
         else:
             self._show_current()
+
+    def rebuild_shell(self):
+        """Rebuild the residue shell + pocket surface for the current pose.
+
+        For use when something behind the shell changes mid-session (the
+        surface reach).  Objects mode reuses _show_current, which rebuilds the
+        shell anyway; states mode has to build it explicitly because there it
+        is otherwise static after setup.
+        """
+        global _shell_key
+        if not self.poses:
+            return
+        _shell_key = None
+        if self.mode != "states":
+            self._show_current()
+            return
+        _, st = self.poses[self.current_index]
+        ligs = [self.state_object] + ([self.ref_ligand] if self.ref_ligand else [])
+        _create_shell(self.protein_sel, ligs, state=st)
+        if not self.show_surface and _OBJ_SURF in _created_objects:
+            try: cmd.hide("surface", _OBJ_SURF)
+            except Exception: pass
 
     def _show_current(self):
         self._cleanup_cmp()
@@ -3635,7 +3661,22 @@ def _open_gui():
                        "ligand alone instead.")
     cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
     cb_cstype = QtWidgets.QCheckBox("Color surface by residue type"); cb_cstype.setChecked(True)
-    for _w in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h, cb_cstype):
+    l_disp.addWidget(cb_lb)
+    l_disp.addWidget(cb_surf)
+    hl_sd = QtWidgets.QHBoxLayout()
+    hl_sd.addSpacing(20)
+    _lbl_sd = QtWidgets.QLabel("surface reach:")
+    sp_sd = QtWidgets.QDoubleSpinBox()
+    sp_sd.setRange(2.0, 12.0); sp_sd.setDecimals(1); sp_sd.setSingleStep(0.5)
+    sp_sd.setValue(_stepper.surf_dist); sp_sd.setSuffix(" Å")
+    sp_sd.setFixedWidth(70)
+    _tip_sd = ("How far the pocket surface extends around the ligand.\n"
+               "It is carved from the protein's molecular surface at this "
+               "radius; larger shows more of the pocket wall.")
+    sp_sd.setToolTip(_tip_sd); _lbl_sd.setToolTip(_tip_sd)
+    hl_sd.addWidget(_lbl_sd); hl_sd.addWidget(sp_sd); hl_sd.addStretch()
+    l_disp.addLayout(hl_sd)
+    for _w in (cb_rlbl, cb_zoom, cb_lig_h, cb_cstype):
         l_disp.addWidget(_w)
     bot_l.addWidget(g_disp)
     bot_l.addStretch()
@@ -4200,6 +4241,12 @@ def _open_gui():
                 cmd.hide("surface", _OBJ_SURF)
     cb_surf.stateChanged.connect(do_toggle_surf)
 
+    def do_surf_dist(v):
+        _stepper.surf_dist = float(v)
+        if _stepper.poses:
+            _stepper.rebuild_shell()
+    sp_sd.valueChanged.connect(do_surf_dist)
+
     def do_toggle_rlbl(state=None):
         if _shell_sel is not None:
             sel = f"({_shell_sel}) and name CA"
@@ -4461,7 +4508,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.7.2"
+__version__ = "1.8"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
