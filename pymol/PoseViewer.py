@@ -124,6 +124,9 @@ _shell_sel: Optional[str] = None   # selection used for lines/labels (no copy ob
 _shell_key: Optional[tuple] = None # inputs the current shell was built from
 
 _OBJ_PTS        = "_ci_pts"
+_OBJ_SNAP       = "_ci_snap"     # single-state pose copies used by `within`
+_OBJ_SHELL      = "_ci_shell"    # materialised shell selection
+_OBJ_SHELL_ATOMS = "_ci_shell_atoms"
 _OBJ_REF_PTS    = "_ci_ref_pts"
 _OBJ_SURF       = "_ci_surf"
 
@@ -154,6 +157,8 @@ def _clear_shell():
             cmd.hide("labels", f"({_shell_sel}) and name CA")
         except Exception:
             pass
+        try: cmd.delete(_OBJ_SHELL)
+        except Exception: pass
         _shell_sel = None
     if _OBJ_SURF in _created_objects:
         try: cmd.delete(_OBJ_SURF)
@@ -496,6 +501,24 @@ def detect_interactions(
     do_clash_good=False, do_clash_bad=False, do_clash_ugly=False,
     do_water=True,
 ) -> InteractionResult:
+    """Detect every enabled interaction type between one pose and the receptor."""
+    # Every `within` below must run against a single-state stand-in for the pose,
+    # or PyMOL walks all 1600 states of a docking run for each one.
+    snap_sel, snaps = _snapshot_ligands(lig_sel, state)
+    try:
+        return _detect_interactions(
+            lig_sel, snap_sel, prot_sel, state,
+            do_halogen, do_salt, do_arom_hb, do_pipi, do_pi_cation,
+            do_clash_good, do_clash_bad, do_clash_ugly, do_water)
+    finally:
+        _delete_snapshots(snaps)
+
+
+def _detect_interactions(
+    lig_sel, snap_sel, prot_sel, state,
+    do_halogen, do_salt, do_arom_hb, do_pipi, do_pi_cation,
+    do_clash_good, do_clash_bad, do_clash_ugly, do_water,
+) -> InteractionResult:
 
     result = InteractionResult()
     search = max(HALOGEN_DIST_MAX, SALT_BRIDGE_DIST_MAX,
@@ -506,7 +529,8 @@ def detect_interactions(
         lig_model = cmd.get_model(lig_sel, state=state)
         # cmd.select evaluates proximity at the current global state (ligand pose),
         # then cmd.get_model extracts protein coords at state=1 (protein is single-state).
-        cmd.select(_TMP, f"({prot_sel}) within {search} of ({lig_sel})")
+        cmd.select(_TMP, f"({prot_sel}) within {search} of ({snap_sel})",
+                   state=1)
         prot_model = cmd.get_model(_TMP, state=1)
     finally:
         try: cmd.delete(_TMP)
@@ -626,9 +650,9 @@ def detect_interactions(
     _prm_adj = None
     if need_rings:
         try:
-            prs = (f"({prot_sel} within {PI_CATION_DIST_MAX+3} of ({lig_sel}))"
+            prs = (f"({prot_sel} within {PI_CATION_DIST_MAX+3} of ({snap_sel}))"
                    f" and (resn PHE+TYR+TRP+HIS+HIE+HID+HIP)")
-            cmd.select(_TMP, prs)
+            cmd.select(_TMP, prs, state=1)
             _prm = cmd.get_model(_TMP, state=1)
             prot_rings_info, _prm_adj = _get_rings_info(_prm)
         except Exception:
@@ -701,10 +725,10 @@ def detect_interactions(
 
     # Pi-cation
     if do_pi_cation:
-        pcs = (f"({prot_sel} within {PI_CATION_DIST_MAX+1} of ({lig_sel}))"
+        pcs = (f"({prot_sel} within {PI_CATION_DIST_MAX+1} of ({snap_sel}))"
                f" and ((resn ARG and name CZ) or (resn LYS and name NZ))")
         try:
-            cmd.select(_TMP, pcs)
+            cmd.select(_TMP, pcs, state=1)
             pcm = cmd.get_model(_TMP, state=1)
             for pa in pcm.atom:
                 pac = tuple(pa.coord)
@@ -757,7 +781,8 @@ def detect_interactions(
         _TMP_W = "_ci_tmp_w"
         try:
             cmd.select(_TMP_W,
-                       f"(resn HOH+WAT+H2O+SOL) within 3.5 of ({lig_sel})")
+                       f"(resn HOH+WAT+H2O+SOL) within 3.5 of ({snap_sel})",
+                       state=1)
             wat_model = cmd.get_model(_TMP_W, state=1)
             for wa in wat_model.atom:
                 if _sym(wa) != "O":
@@ -1102,6 +1127,67 @@ def _lig_union(ligand_sels):
     return " or ".join(f"({l})" for l in ligand_sels)
 
 
+def _snapshot_ligands(ligand_sels, state=0):
+    """Single-state copies of the ligand(s), for use inside `within` selections.
+
+    PyMOL evaluates a distance operator against *every* state of a multi-state
+    object, and the cost is superlinear in the state count: selecting the
+    residues within 5 A of a pose object measured 0.001 s at one state, 0.15 s
+    at 100 and 6.9 s at 400.  At 1600 poses that is what makes PyMOL look hung.
+
+    Pinning the selection to one state is not the fix — the two sides have
+    different state counts, and PyMOL does not clamp, so a single-state receptor
+    matches nothing at state 7 and the shell comes back empty.  Copying the
+    current state of each ligand into its own single-state object makes every
+    side single-state, which is correct *and* independent of how many poses are
+    loaded.
+
+    The snapshot is only half the fix.  cmd.select's default state=0 means "every
+    state in the session", so it loops 1..max_states even when both operands are
+    single-state — 0.13 s per call in a session whose largest object has 800
+    states.  Every selection here therefore also passes state=1, which is only
+    safe *because* of the snapshot: PyMOL does not clamp, so asking for state 7
+    of a single-state receptor selects nothing at all.
+
+    Returns (selection, temp_names); the caller must pass temp_names to
+    _delete_snapshots().  Falls back to the plain union if copying fails, so a
+    surprise here costs speed rather than function.
+    """
+    names = [ligand_sels] if isinstance(ligand_sels, str) else list(ligand_sels)
+    temps, parts = [], []
+    for i, name in enumerate(names):
+        tmp = f"{_OBJ_SNAP}{i}"
+        try:
+            cmd.delete(tmp)
+            # A single-state object — a reference ligand — is always at state 1,
+            # whatever the pose slider currently reads.
+            src = state if (state and state > 0) else -1
+            try:
+                if cmd.count_states(name) <= 1:
+                    src = 1
+            except Exception:
+                pass
+            cmd.create(tmp, name, src, 1)
+            if cmd.count_atoms(tmp, state=1) == 0:
+                cmd.delete(tmp)
+                continue
+            cmd.disable(tmp)
+            temps.append(tmp)
+            parts.append(f"({tmp})")
+        except Exception:
+            try: cmd.delete(tmp)
+            except Exception: pass
+    if not parts:
+        return _lig_union(ligand_sels), []
+    return " or ".join(parts), temps
+
+
+def _delete_snapshots(temps):
+    for tmp in temps:
+        try: cmd.delete(tmp)
+        except Exception: pass
+
+
 # ---------------------------------------------------------------------------
 # Residue shell
 # ---------------------------------------------------------------------------
@@ -1136,7 +1222,7 @@ def _color_surface_by_type(surf_obj):
     except Exception: pass
 
 
-def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
+def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     """Show lines + labels for residues near the ligand, with a surface on top.
 
     Rebuilding means re-running cmd.create and a full surface recalculation, so
@@ -1148,26 +1234,39 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
     global _shell_sel, _shell_key
     lig_union = _lig_union(ligand_sels)
 
-    key = (protein_sel, lig_union, dist)
+    key = (protein_sel, lig_union, dist, state)
     if key == _shell_key and _shell_sel is not None and _OBJ_SURF in _created_objects:
         return
 
     _clear_shell()
 
-    sel = f"byres (({protein_sel}) within {dist} of ({lig_union}))"
+    # Single-state stand-in for the pose, then materialise the result as a named
+    # selection.  Both matter: `within` against a multi-state object is
+    # superlinear in the state count (see _snapshot_ligands), and keeping the
+    # shell as an expression string meant every later use of it — the residue
+    # label toggle, _clear_shell — paid for that `within` all over again.
+    snap_sel, snaps = _snapshot_ligands(ligand_sels, state)
     try:
-        cmd.show("lines", sel)
-        cmd.hide("lines", f"({sel}) and elem H and not (neighbor (elem N+O+S))")
-        cmd.label(f"({sel}) and name CA", '"%s %s" % (resn, resi)')
-        _shell_sel = sel
+        cmd.select(_OBJ_SHELL,
+                   f"byres (({protein_sel}) within {dist} of ({snap_sel}))",
+                   enable=0, state=1)
+        cmd.show("lines", _OBJ_SHELL)
+        cmd.hide("lines",
+                 f"({_OBJ_SHELL}) and elem H and not (neighbor (elem N+O+S))")
+        cmd.label(f"({_OBJ_SHELL}) and name CA", '"%s %s" % (resn, resi)')
+        _shell_sel = _OBJ_SHELL
     except Exception as e:
         print(f"PoseViewer: shell setup warning: {e}")
+        _delete_snapshots(snaps)
         return
 
     # Transparent surface on the atom-based shell (no byres expansion)
-    atom_surf_sel = f"({protein_sel}) within {dist} of ({lig_union})"
     try:
-        cmd.create(_OBJ_SURF, atom_surf_sel)
+        cmd.select(_OBJ_SHELL_ATOMS,
+                   f"({protein_sel}) within {dist} of ({snap_sel})",
+                   enable=0, state=1)
+        cmd.create(_OBJ_SURF, _OBJ_SHELL_ATOMS)
+        cmd.delete(_OBJ_SHELL_ATOMS)
         _track(_OBJ_SURF)
         cmd.hide("everything", _OBJ_SURF)
         cmd.show("surface", _OBJ_SURF)
@@ -1178,6 +1277,8 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
         cmd.set("transparency", 0.4, _OBJ_SURF)
     except Exception:
         pass
+    finally:
+        _delete_snapshots(snaps)
 
     _shell_key = key
 
@@ -1262,8 +1363,8 @@ class LigandStepper:
             if n == obj or n in _created_objects:
                 continue
             try:
-                if (cmd.count_atoms(f"{n} and organic") > 0 and
-                        cmd.count_atoms(f"{n} and polymer.protein") == 0):
+                if (cmd.count_atoms(f"{n} and organic", state=1) > 0 and
+                        cmd.count_atoms(f"{n} and polymer.protein", state=1) == 0):
                     extras.append(n)
             except Exception:
                 pass
@@ -1274,8 +1375,10 @@ class LigandStepper:
         _prepare_scene(prot, all_ligs)
         if self.ref_ligand:
             _color_ref_ligand(self.ref_ligand)
-        _create_shell(prot, all_ligs)
         self._show_current()
+        # After _show_current, so the shell is built around the pose being shown
+        # rather than whatever state the slider happened to be on.
+        _create_shell(prot, all_ligs, state=self.poses[0][1] if self.poses else 1)
         self._prefetch_all_properties()
         self._build_obj_colors()
 
@@ -1398,7 +1501,7 @@ class LigandStepper:
             if self.ref_ligand and self.show_ref:
                 visible.append(self.ref_ligand)
             if visible:
-                _create_shell(self.protein_sel, visible)
+                _create_shell(self.protein_sel, visible, state=st)
                 if not self.show_surface and _OBJ_SURF in _created_objects:
                     try: cmd.hide("surface", _OBJ_SURF)
                     except Exception: pass
@@ -1622,10 +1725,17 @@ class LigandStepper:
         """Build all_properties from the SDF records / PyMOL object properties."""
         if not self.sdf_records:
             result = []
+            # resn/resi/chain are a property of the object, not of the state, and
+            # the selection behind them costs ~40 ms once a session holds 1600
+            # poses — so resolve them once per object instead of once per pose,
+            # which is the difference between 0.04 s and 64 s at that size.
+            resinfo: Dict[str, dict] = {}
             for obj, st in self.poses:
                 props = _get_pose_properties(obj, st)
                 props.setdefault("_name", obj)
-                for k, v in _get_ligand_resinfo(obj).items():
+                if obj not in resinfo:
+                    resinfo[obj] = _get_ligand_resinfo(obj)
+                for k, v in resinfo[obj].items():
                     props.setdefault(k, v)
                 result.append(props)
             self.all_properties = result
@@ -2730,7 +2840,7 @@ def _collect_metric_inputs(metrics):
     if any(m in RECEPTOR_METRICS for m in metrics):
         prot = _stepper.protein_sel or "polymer.protein"
         try:
-            if cmd.count_atoms(f"({prot})") == 0:
+            if cmd.count_atoms(f"({prot})", state=1) == 0:
                 raise RuntimeError(f"Receptor selection '{prot}' has no atoms.")
             receptor_path = os.path.join(workdir, "receptor.pdb")
             cmd.save(receptor_path, f"({prot})", 1)
@@ -2855,8 +2965,8 @@ EXAMPLES
                 if n in _created_objects:
                     continue
                 try:
-                    if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
-                            cmd.count_atoms(f"{n} and polymer.protein") == 0 and
+                    if (cmd.count_atoms(f"{n} and ({ligands})", state=1) > 0 and
+                            cmd.count_atoms(f"{n} and polymer.protein", state=1) == 0 and
                             cmd.count_states(n) > 1):
                         multi_state.append(n)
                 except CmdException:
@@ -2882,8 +2992,8 @@ EXAMPLES
                 if n in _created_objects:
                     continue
                 try:
-                    if (cmd.count_atoms(f"{n} and ({ligands})") > 0 and
-                            cmd.count_atoms(f"{n} and polymer.protein") == 0):
+                    if (cmd.count_atoms(f"{n} and ({ligands})", state=1) > 0 and
+                            cmd.count_atoms(f"{n} and polymer.protein", state=1) == 0):
                         (multi_ligs if cmd.count_states(n) > 1 else single_ligs).append(n)
                 except CmdException:
                     pass
@@ -3609,7 +3719,7 @@ def _open_gui():
             if n.startswith("_"):
                 continue
             try:
-                if cmd.count_atoms(f"{n} and polymer.protein") > 0:
+                if cmd.count_atoms(f"{n} and polymer.protein", state=1) > 0:
                     e_prot.addItem(n)
             except Exception:
                 pass
@@ -3630,8 +3740,8 @@ def _open_gui():
             if n.startswith("_ci_") or n in _created_objects:
                 continue
             try:
-                if (cmd.count_atoms(f"{n} and organic") > 0 and
-                        cmd.count_atoms(f"{n} and polymer.protein") == 0):
+                if (cmd.count_atoms(f"{n} and organic", state=1) > 0 and
+                        cmd.count_atoms(f"{n} and polymer.protein", state=1) == 0):
                     ref_combo.addItem(n)
             except Exception:
                 pass
@@ -4072,9 +4182,10 @@ def _open_gui():
                     if n in _created_objects:
                         continue
                     try:
-                        if (cmd.count_atoms(f"{n} and organic") > 0 and
+                        if (cmd.count_atoms(f"{n} and organic", state=1) > 0 and
                                 cmd.count_atoms(
-                                    f"{n} and ({_stepper.protein_sel or 'polymer.protein'})") == 0):
+                                    f"{n} and ({_stepper.protein_sel or 'polymer.protein'})",
+                                    state=1) == 0):
                             new_ligs.append(n)
                     except Exception:
                         pass
