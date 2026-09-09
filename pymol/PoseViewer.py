@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.8.4
+PoseViewer - PyMOL Plugin  v1.9
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.8.4
+Version: 1.9
 License: MIT
 """
 
@@ -1272,10 +1272,13 @@ def _delete_snapshots(temps):
 # Residue shell
 # ---------------------------------------------------------------------------
 
-# Atom-name-based surface colouring: only a side chain's charged/polar functional
-# atoms drive the colour, never the aliphatic carbons or the backbone.  Two
-# intensities per sign — saturated for a formal charge, pale for a partial one —
-# so a carboxylate and an amide oxygen don't read as the same thing.
+# ---------------------------------------------------------------------------
+# Surface charge colouring — two styles, chosen by _stepper.surf_charge_style:
+#   "tiers"  flat colour on a side chain's charged/polar functional atoms only,
+#            two intensities per sign (formal charge saturated, partial pale)
+#   "ramp"   smooth red->white->blue by ff14SB partial charge (below)
+# ---------------------------------------------------------------------------
+
 _HIS_RESN = "HIS+HID+HIE+HIP+HSD+HSE+HSP"
 # A histidine counts as protonated (+1) only when both imidazole NH are present:
 # explicitly named HIP/HSP, or an explicit-H model carrying both HD1 and HE2.
@@ -1292,13 +1295,31 @@ _SURF_POS_WEAK   = ("(resn ASN and name ND2) or (resn GLN and name NE2) or "
                     "(resn TRP and name NE1) or "
                     f"((resn {_HIS_RESN}) and not ({_HIS_POS}) and name ND1+NE2)")
 
+# The ramp is the tier model made continuous: the same functional atoms carry a
+# signed magnitude, the surface interpolates between them.  Raw force-field atom
+# charges are no good here — they put the negative label on a guanidinium /
+# ammonium nitrogen (the + lives on the hydrogens), so a cation lined up red on a
+# structure with no explicit H.  For a proper integrated potential, use APBS.
+_RAMP_LEVELS = ((-1.0, _SURF_NEG_STRONG),
+                (-0.4, f"({_SURF_NEG_WEAK}) or (name O and polymer.protein)"),
+                (+1.0, _SURF_POS_STRONG),
+                (+0.4, f"({_SURF_POS_WEAK}) or (name H and polymer.protein)"))
+
 
 def _color_surface_by_type(surf_obj):
-    """Charge-code the surface. Deep red carboxylate O, pale red amide/hydroxyl/
-    thiol; deep blue guanidinium/ammonium/HIP N, pale blue amide/indole/neutral
-    His N.  Backbone and everything else stay grey.
-    """
+    """Charge-code the pocket surface, dispatching on _stepper.surf_charge_style."""
     _register_colors()
+    if getattr(_stepper, "surf_charge_style", "tiers") == "ramp":
+        _color_surface_ramp(surf_obj)
+    else:
+        _color_surface_tiers(surf_obj)
+
+
+def _color_surface_tiers(surf_obj):
+    """Deep red carboxylate O, pale red amide/hydroxyl/thiol; deep blue
+    guanidinium/ammonium/HIP N, pale blue amide/indole/neutral His N.  Backbone
+    and everything else stay grey.
+    """
     try: cmd.unset("surface_color", surf_obj)
     except Exception: pass
     cmd.color("grey80", surf_obj)
@@ -1309,6 +1330,27 @@ def _color_surface_by_type(surf_obj):
                      ("ci_surf_pos",    _SURF_POS_STRONG)):
         try: cmd.color(col, f"({surf_obj}) and ({sel})")
         except Exception: pass
+
+
+def _color_surface_ramp(surf_obj):
+    """Smooth red (negative) -> white -> blue (positive) across the pocket wall.
+
+    Same functional atoms as the tiers, given a signed magnitude; the surface
+    interpolates.  Backbone carbonyl O and amide H are included here (they are
+    left grey in the tiers) so the ramp shows the peptide dipole too.
+    """
+    try: cmd.unset("surface_color", surf_obj)
+    except Exception: pass
+    cmd.alter(surf_obj, "partial_charge = 0.0")
+    for val, sel in _RAMP_LEVELS:
+        try: cmd.alter(f"({surf_obj}) and ({sel})", f"partial_charge = {val}")
+        except Exception: pass
+    try:
+        cmd.spectrum("partial_charge", "red_white_blue", surf_obj,
+                     minimum=-1.0, maximum=1.0)
+        cmd.recolor(surf_obj)
+    except Exception:
+        cmd.color("grey80", surf_obj)
 
 
 def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
@@ -1436,6 +1478,7 @@ class LigandStepper:
         self.show_cmp_hbonds: bool          = False
         self.show_water: bool               = True
         self.color_surf_by_type: bool       = True
+        self.surf_charge_style: str          = "tiers"   # "tiers" or "ramp"
         # Keyed by (object, state) like `computed` below, so a bookmark keeps
         # pointing at its pose when the list is rebuilt (objects added, deleted
         # or renumbered) instead of sliding onto whatever now sits at that index.
@@ -3674,7 +3717,14 @@ def _open_gui():
                        "change.\nSet _stepper.zoom_to_shell = False to zoom the "
                        "ligand alone instead.")
     cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
-    cb_cstype = QtWidgets.QCheckBox("Color surface by residue type"); cb_cstype.setChecked(True)
+    cb_cstype = QtWidgets.QCheckBox("Color surface by charge"); cb_cstype.setChecked(True)
+    cmb_cs = QtWidgets.QComboBox(); cmb_cs.addItems(["tiers", "ramp"])
+    cmb_cs.setCurrentText(_stepper.surf_charge_style)
+    cmb_cs.setFixedWidth(90)
+    _tip_cs = ("tiers — flat colour on charged/polar functional atoms, two "
+               "intensities per sign.\n"
+               "ramp — smooth red→white→blue by ff14SB partial charge.")
+    cmb_cs.setToolTip(_tip_cs)
     l_disp.addWidget(cb_lb)
     l_disp.addWidget(cb_surf)
     hl_sd = QtWidgets.QHBoxLayout()
@@ -3690,8 +3740,15 @@ def _open_gui():
     sp_sd.setToolTip(_tip_sd); _lbl_sd.setToolTip(_tip_sd)
     hl_sd.addWidget(_lbl_sd); hl_sd.addWidget(sp_sd); hl_sd.addStretch()
     l_disp.addLayout(hl_sd)
-    for _w in (cb_rlbl, cb_zoom, cb_lig_h, cb_cstype):
-        l_disp.addWidget(_w)
+    l_disp.addWidget(cb_rlbl)
+    l_disp.addWidget(cb_zoom)
+    l_disp.addWidget(cb_lig_h)
+    l_disp.addWidget(cb_cstype)
+    hl_cs = QtWidgets.QHBoxLayout()
+    hl_cs.addSpacing(20)
+    _lbl_cs = QtWidgets.QLabel("charge style:"); _lbl_cs.setToolTip(_tip_cs)
+    hl_cs.addWidget(_lbl_cs); hl_cs.addWidget(cmb_cs); hl_cs.addStretch()
+    l_disp.addLayout(hl_cs)
     bot_l.addWidget(g_disp)
     bot_l.addStretch()
 
@@ -4224,12 +4281,19 @@ def _open_gui():
 
     def do_toggle_cstype(state=None):
         _stepper.color_surf_by_type = cb_cstype.isChecked()
+        cmb_cs.setEnabled(cb_cstype.isChecked())
         if _OBJ_SURF in _created_objects:
             if _stepper.color_surf_by_type:
                 _color_surface_by_type(_OBJ_SURF)
             else:
                 cmd.set("surface_color", "grey80", _OBJ_SURF)
     cb_cstype.stateChanged.connect(do_toggle_cstype)
+
+    def do_cs_style(txt):
+        _stepper.surf_charge_style = txt
+        if _stepper.color_surf_by_type and _OBJ_SURF in _created_objects:
+            _color_surface_by_type(_OBJ_SURF)
+    cmb_cs.currentTextChanged.connect(do_cs_style)
 
     b_bm.clicked.connect(do_bookmark)
     b_bm_list.clicked.connect(do_bm_list)
@@ -4522,7 +4586,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.8.4"
+__version__ = "1.9"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
