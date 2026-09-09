@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.8
+PoseViewer - PyMOL Plugin  v1.8.1
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.8
+Version: 1.8.1
 License: MIT
 """
 
@@ -1267,34 +1267,22 @@ def _delete_snapshots(temps):
 # Residue shell
 # ---------------------------------------------------------------------------
 
-# Atom-name-based surface coloring: colors the functional atoms, not whole residues.
-# All C atoms → wheat; specific charged/polar O/N/S atoms get their own color.
-_SURF_POS_N  = ("(resn ARG and name NH1+NH2+NE) or "
-                "(resn LYS and name NZ) or "
-                "(resn HIS+HID+HIE+HIP and name ND1+NE2)")
-
-_SURF_NEG_O  = ("(resn ASP and name OD1+OD2) or "
-                "(resn GLU and name OE1+OE2)")
-
-_SURF_POLAR  = ("(resn SER and name OG) or "
-                "(resn THR and name OG1) or "
-                "(resn TYR and name OH) or "
-                "(resn ASN and name OD1+ND2) or "
-                "(resn GLN and name OE1+NE2) or "
-                "(resn TRP and name NE1) or "
-                "(resn CYS and name SG) or "
-                "name O+N")          # backbone carbonyl O and amide N
+# Charge-code the surface by residue, not by functional atom.  Colouring only the
+# ARG N / ASP O tips left a grey surface with a coloured freckle where each side
+# chain happened to own a surface vertex — the charge read inconsistently from
+# pocket to pocket.  Whole-residue colouring gives one coherent patch per charge.
+_SURF_BASIC  = "resn ARG+LYS+HIS+HID+HIE+HIP"
+_SURF_ACIDIC = "resn ASP+GLU"
 
 
 def _color_surface_by_type(surf_obj):
-    """Color surface by charge: charged N → blue, charged O → red, all else → grey80."""
+    """Charge-code the pocket surface: basic residues blue, acidic red, rest grey."""
     try: cmd.unset("surface_color", surf_obj)
     except Exception: pass
     cmd.color("grey80", surf_obj)
-    try: cmd.color("tv_blue", f"({surf_obj}) and ({_SURF_POS_N})")
-    except Exception: pass
-    try: cmd.color("tv_red",  f"({surf_obj}) and ({_SURF_NEG_O})")
-    except Exception: pass
+    for col, sel in (("tv_blue", _SURF_BASIC), ("tv_red", _SURF_ACIDIC)):
+        try: cmd.color(col, f"({surf_obj}) and ({sel})")
+        except Exception: pass
 
 
 def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
@@ -4508,7 +4496,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.8"
+__version__ = "1.8.1"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")

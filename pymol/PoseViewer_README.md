@@ -1,4 +1,4 @@
-# PoseViewer v1.8
+# PoseViewer v1.8.1
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -14,7 +14,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Auto-split**: load any PDB with multiple HETATM ligands and PoseViewer automatically separates them into individual objects for per-ligand browsing and per-pocket surface display
 - **Compare mode**: select any two poses simultaneously — including pose #3 of ligand A vs pose #7 of ligand B — to overlay them in the binding site with distinct colors
 - Per-ligand pocket surface: residue shell, CA labels, and transparent surface update to the current ligand's binding site in objects mode
-- **Charge-colored surface**: pocket surface is colored by charged atom (blue for cationic N, red for anionic O) rather than flat grey
+- **Charge-colored surface**: pocket surface is colored per residue — blue for basic (ARG/LYS/HIS), red for acidic (ASP/GLU), grey otherwise — rather than flat grey
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
 - **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks are tied to the pose itself, so they stay put when objects are added, deleted or renumbered, and are visible in the pose table
 - **Table export**: copy the pose table to the clipboard or write it to CSV/TSV, from the GUI or via `ci_export`
@@ -54,6 +54,8 @@ Salt bridges and the ligand side of pi-cation need to know which ligand atoms ar
 Reference ligand interactions are drawn with the same color scheme but thinner dashes (65% radius) to distinguish them from pose interactions.
 
 ### Surface residue color scheme
+
+The pocket surface is charge-coded by **whole residue** (toggle: *Color surface by residue type* in the Display group). Colouring only the functional-atom tips left the surface mostly grey with a coloured freckle per side chain, which read inconsistently pocket to pocket.
 
 | Color | Residue type | Residues |
 |---|---|---|
