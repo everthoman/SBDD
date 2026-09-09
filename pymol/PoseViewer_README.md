@@ -14,7 +14,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Auto-split**: load any PDB with multiple HETATM ligands and PoseViewer automatically separates them into individual objects for per-ligand browsing and per-pocket surface display
 - **Compare mode**: select any two poses simultaneously — including pose #3 of ligand A vs pose #7 of ligand B — to overlay them in the binding site with distinct colors
 - Per-ligand pocket surface: residue shell, CA labels, and transparent surface update to the current ligand's binding site in objects mode
-- **Residue-colored surface**: pocket surface is colored by residue type (hydrophobic/polar/charged) rather than flat grey
+- **Charge-colored surface**: pocket surface is colored by charged atom (blue for cationic N, red for anionic O) rather than flat grey
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
 - **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks are tied to the pose itself, so they stay put when objects are added, deleted or renumbered, and are visible in the pose table
 - **Table export**: copy the pose table to the clipboard or write it to CSV/TSV, from the GUI or via `ci_export`
@@ -349,15 +349,14 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 
 | Interaction | Criterion |
 |---|---|
-| H-bonds (visual dashes) | PyMOL polar contacts `cmd.distance(mode=2)` |
-| H-bonds (console listing) | N/O/S/F ··· N/O/S/F donor-acceptor distance ≤ 3.5 Å |
+| H-bonds (dashes and console listing) | PyMOL polar contacts `cmd.distance(mode=2)`, read back off the distance object so both agree |
 | Halogen bonds | Cl/Br/I donor ··· O/N/S acceptor, ≤ 3.5 Å |
-| Salt bridges | Formal charged N ··· Asp/Glu O or Arg/Lys/His N ··· formal charged O, ≤ 4.0 Å |
+| Salt bridges | Cationic ligand N ··· Asp/Glu O, or Arg/Lys/His N ··· anionic ligand O, ≤ 4.0 Å. Ligand charges come from the file when it has them, otherwise inferred (see above) |
 | Aromatic H-bonds | Aromatic C ··· O/N/S acceptor, ≤ 3.5 Å, C-H···A angle > 120° |
 | Water bridges | HOH oxygen simultaneously within 3.5 Å of ligand N/O/S/F and protein N/O/S/F |
 | Pi-pi face-to-face | Centroid distance ≤ 4.8 Å, normal angle ≤ 40° |
 | Pi-pi edge-to-face | Centroid distance ≤ 5.5 Å, normal angle 45–90° |
-| Pi-cation | Ring centroid ··· Arg CZ / Lys NZ or formal+ atom, ≤ 6.0 Å |
+| Pi-cation | Ligand ring centroid ··· Arg CZ / Lys NZ, or cationic ligand atom ··· Phe/Tyr/Trp/His ring centroid, ≤ 6.0 Å |
 | Good contact | d ≤ 1.30× VDW sum, heavy atoms only |
 | Bad clash | d < 0.89× VDW sum |
 | Ugly clash | d < 0.75× VDW sum |
@@ -368,10 +367,10 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 
 - Requires PyMOL with Qt support (PyMOL 2.x+)
 - `rdkit` is required only for the Calculate group; it is imported on first use, so the plugin loads normally without it
-- `numpy` is used if available; falls back to pure Python otherwise
+- `numpy` is optional. It is used only for the best-fit-plane SVD in the aromatic ring planarity test, which falls back to Newell's method without it. The per-pair geometry is deliberately scalar Python — numpy's per-call overhead dominates on 3-vectors and made pose stepping about twice as slow
 - **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no scores file needed, leave the Scores field blank
 - **Open-source PyMOL**: SDF data fields are stripped on load. Scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`
 - The shell shows residues within 5 Å of the current ligand as lines with CA labels; the surface covers atoms within 5 Å. In objects mode both update per ligand step; in states mode they are computed once at setup
 - Duplicate interactions caused by alternate conformations (altloc atoms) in PDB structures are automatically removed by spatial deduplication
 - Water bridges require HOH residues in the loaded structure. HOH is searched globally (not limited to `polymer.protein`), so crystallographic waters in the protein PDB are detected even when the protein selection excludes them
-- Bookmarks are per-session only and are cleared by `ci_clear` or a new `ci_setup`
+- Bookmarks are per-session only, and are keyed to the pose itself — `(object, state)` — so they follow their pose when the pose list is rebuilt (objects added, deleted or renumbered) and survive a re-`ci_setup` of the same poses. The GUI **Clear** button drops them; `ci_clear` only removes PoseViewer's objects
