@@ -1,6 +1,6 @@
 """
-PoseViewer - PyMOL Plugin  v1.7
-================================
+PoseViewer - PyMOL Plugin  v1.7.1
+=================================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
 stepping for docking pose review.
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.7
+Version: 1.7.1
 License: MIT
 """
 
@@ -1135,6 +1135,11 @@ def _color_rainbow_elem(sel):
 def _prepare_scene(protein_sel, ligand_sels):
     """Color protein rainbow (C atoms) + element colors, cartoon, hide non-polar H."""
     try:
+        # PoseViewer frames the view itself (_zoom_to_site).  With PyMOL's own
+        # auto_zoom left on, every distance object and pseudoatom that visualize()
+        # creates while stepping triggers a zoom-to-fit, so the camera lurches
+        # toward each pose — the "zooms on the ligand every step" complaint.
+        cmd.set("auto_zoom", 0)
         cmd.hide("surface")   # remove any pre-existing surfaces before adding ours
         cmd.show("cartoon", protein_sel)
         _color_rainbow_elem(protein_sel)
@@ -4431,7 +4436,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.7"
+__version__ = "1.7.1"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
