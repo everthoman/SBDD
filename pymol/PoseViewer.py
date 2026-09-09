@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9
+PoseViewer - PyMOL Plugin  v1.9.1
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.9
+Version: 1.9.1
 License: MIT
 """
 
@@ -1309,10 +1309,10 @@ _RAMP_LEVELS = ((-1.0, _SURF_NEG_STRONG),
 def _color_surface_by_type(surf_obj):
     """Charge-code the pocket surface, dispatching on _stepper.surf_charge_style."""
     _register_colors()
-    if getattr(_stepper, "surf_charge_style", "tiers") == "ramp":
-        _color_surface_ramp(surf_obj)
-    else:
+    if getattr(_stepper, "surf_charge_style", "ramp") == "tiers":
         _color_surface_tiers(surf_obj)
+    else:
+        _color_surface_ramp(surf_obj)
 
 
 def _color_surface_tiers(surf_obj):
@@ -1478,7 +1478,7 @@ class LigandStepper:
         self.show_cmp_hbonds: bool          = False
         self.show_water: bool               = True
         self.color_surf_by_type: bool       = True
-        self.surf_charge_style: str          = "tiers"   # "tiers" or "ramp"
+        self.surf_charge_style: str          = "ramp"   # "ramp" or "tiers"
         # Keyed by (object, state) like `computed` below, so a bookmark keeps
         # pointing at its pose when the list is rebuilt (objects added, deleted
         # or renumbered) instead of sliding onto whatever now sits at that index.
@@ -3718,7 +3718,7 @@ def _open_gui():
                        "ligand alone instead.")
     cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
     cb_cstype = QtWidgets.QCheckBox("Color surface by charge"); cb_cstype.setChecked(True)
-    cmb_cs = QtWidgets.QComboBox(); cmb_cs.addItems(["tiers", "ramp"])
+    cmb_cs = QtWidgets.QComboBox(); cmb_cs.addItems(["ramp", "tiers"])
     cmb_cs.setCurrentText(_stepper.surf_charge_style)
     cmb_cs.setFixedWidth(90)
     _tip_cs = ("tiers — flat colour on charged/polar functional atoms, two "
@@ -4586,7 +4586,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9"
+__version__ = "1.9.1"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")

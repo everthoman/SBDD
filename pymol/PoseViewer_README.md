@@ -1,4 +1,4 @@
-# PoseViewer v1.9
+# PoseViewer v1.9.1
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -14,7 +14,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Auto-split**: load any PDB with multiple HETATM ligands and PoseViewer automatically separates them into individual objects for per-ligand browsing and per-pocket surface display
 - **Compare mode**: select any two poses simultaneously — including pose #3 of ligand A vs pose #7 of ligand B — to overlay them in the binding site with distinct colors
 - Per-ligand pocket surface: residue shell, CA labels, and transparent surface update to the current ligand's binding site in objects mode
-- **Charge-colored surface**: two styles — *tiers* (flat blue/red on charged/polar functional atoms, saturated for formal charge, pale for partial) or *ramp* (smooth red→white→blue electrostatic-style gradient) — rather than flat grey
+- **Charge-colored surface**: two styles — *ramp* (default; smooth red→white→blue electrostatic-style gradient) or *tiers* (flat blue/red on charged/polar functional atoms, saturated for formal charge, pale for partial) — rather than flat grey
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
 - **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks are tied to the pose itself, so they stay put when objects are added, deleted or renumbered, and are visible in the pose table
 - **Table export**: copy the pose table to the clipboard or write it to CSV/TSV, from the GUI or via `ci_export`
@@ -57,6 +57,8 @@ Reference ligand interactions are drawn with the same color scheme but thinner d
 
 Toggle *Color surface by charge* in the Display group, with a **charge style** picker:
 
+**ramp** (default) — the functional atoms below given a signed magnitude (formal charge ±1, partial ±0.4) plus the backbone peptide dipole (carbonyl O, amide H), then `spectrum` interpolates a smooth **red → white → blue** across the wall. It's the tier model made continuous, not a real force field — raw FF atom charges put the minus sign on a guanidinium/ammonium nitrogen and read a cation as red, so for a true integrated potential use APBS.
+
 **tiers** — flat colour on a side chain's charged/polar **functional atoms only** (never the aliphatic carbons or the backbone), two intensities per sign so a carboxylate and an amide oxygen don't read as the same thing:
 
 | Color | Contributing atoms |
@@ -66,8 +68,6 @@ Toggle *Color surface by charge* in the Display group, with a **charge style** p
 | Deep red | ASP OD1/OD2, GLU OE1/OE2 |
 | Pale red | ASN OD1, GLN OE1, SER OG, THR OG1, TYR OH, CYS SG |
 | Grey | everything else (backbone included) |
-
-**ramp** — the same functional atoms given a signed magnitude (formal charge ±1, partial ±0.4) plus the backbone peptide dipole (carbonyl O, amide H), then `spectrum` interpolates a smooth **red → white → blue** across the wall. It's the tier model made continuous, not a real force field — raw FF atom charges put the minus sign on a guanidinium/ammonium nitrogen and read a cation as red, so for a true integrated potential use APBS.
 
 ---
 
@@ -250,7 +250,7 @@ The **Non-covalent bonds** group carries a `min D–H···A angle` spin box und
 | Auto-zoom to binding site | On | Frame the residue shell on each pose change, rather than the ligand alone. Zooming the ligand puts the camera on top of it and the pocket falls out of view; on this test case the shell spans 20 Å against 7 Å for a single pose. Set `_stepper.zoom_to_shell = False` for the old ligand-only framing, or `_stepper.zoom_buffer` to change the padding (2 Å default) |
 | Show nonpolar H on ligands | Off | Show all hydrogens (including nonpolar C-H) on pose and reference ligands as sticks. Off by default (only polar H on N/O/S shown). |
 | Color surface by charge | On | Charge-code the pocket surface (see [Surface charge color scheme](#surface-charge-color-scheme)) |
-| charge style | tiers | `tiers` (flat blue/red on functional atoms) or `ramp` (smooth red→white→blue gradient) |
+| charge style | ramp | `ramp` (smooth red→white→blue gradient) or `tiers` (flat blue/red on functional atoms) |
 
 The Display group enable checkbox hides all display elements at once (surface, labels). Unticking it remembers what was on; ticking it again restores exactly that, rather than switching everything on — which used to turn on nonpolar ligand H even though it defaults to off.
 
