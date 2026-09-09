@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.6
+PoseViewer - PyMOL Plugin  v1.7
 ================================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-09
-Version: 1.6
+Version: 1.7
 License: MIT
 """
 
@@ -1815,18 +1815,9 @@ class LigandStepper:
         """Build all_properties from the SDF records / PyMOL object properties."""
         if not self.sdf_records:
             result = []
-            # resn/resi/chain are a property of the object, not of the state, and
-            # the selection behind them costs ~40 ms once a session holds 1600
-            # poses — so resolve them once per object instead of once per pose,
-            # which is the difference between 0.04 s and 64 s at that size.
-            resinfo: Dict[str, dict] = {}
             for obj, st in self.poses:
                 props = _get_pose_properties(obj, st)
                 props.setdefault("_name", obj)
-                if obj not in resinfo:
-                    resinfo[obj] = _get_ligand_resinfo(obj)
-                for k, v in resinfo[obj].items():
-                    props.setdefault(k, v)
                 result.append(props)
             self.all_properties = result
             return
@@ -1992,38 +1983,6 @@ def _get_pose_properties(lig_name: str, state: int) -> dict:
     except Exception:
         pass
     return props
-
-
-def _get_ligand_resinfo(obj: str) -> dict:
-    """Return {resn, resi, chain} for the unique residue(s) in obj.
-
-    resn/resi/chain are the original PDB residue identity of the ligand,
-    preserved even after the atom was extracted into a new object.
-    chain is omitted when empty for all residues.
-    """
-    space: dict = {"residues": []}
-    try:
-        cmd.iterate(f"({obj}) and not elem H",
-                    "residues.append((resn, resi, chain))",
-                    space=space)
-    except Exception:
-        return {}
-    unique = list(dict.fromkeys(space["residues"]))
-    if not unique:
-        return {}
-    if len(unique) == 1:
-        resn, resi, chain = unique[0]
-        out: dict = {"resn": resn.strip(), "resi": resi.strip()}
-        if chain.strip():
-            out["chain"] = chain.strip()
-        return out
-    resns  = "+".join(r[0].strip() for r in unique)
-    resis  = "+".join(r[1].strip() for r in unique)
-    chains = "+".join(r[2].strip() for r in unique if r[2].strip())
-    out = {"resn": resns, "resi": resis}
-    if chains:
-        out["chain"] = chains
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3150,8 +3109,7 @@ def _warn_if_no_scores():
     """
     if _stepper.sdf_records or not _stepper.all_properties:
         return
-    identity = {"_name", "resn", "resi", "chain"}
-    if any(set(props) - identity for props in _stepper.all_properties):
+    if any(set(props) - {"_name"} for props in _stepper.all_properties):
         return
     print("PoseViewer: no per-pose score columns found. SD data is read from a "
           "loaded SDF only by Incentive PyMOL — otherwise point the "
@@ -4473,7 +4431,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.6"
+__version__ = "1.7"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")

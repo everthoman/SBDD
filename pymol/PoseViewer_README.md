@@ -1,4 +1,4 @@
-# PoseViewer v1.6
+# PoseViewer v1.7
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -18,7 +18,6 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
 - **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks are tied to the pose itself, so they stay put when objects are added, deleted or renumbered, and are visible in the pose table
 - **Table export**: copy the pose table to the clipboard or write it to CSV/TSV, from the GUI or via `ci_export`
-- **Residue identity in pose table**: extracted ligands (auto-split from a protein structure) show their original `resn`, `resi`, and `chain` columns in the pose data table
 - **Protein selector**: the Protein field is a dropdown listing all loaded protein objects, enabling quick switching between multiple structures in the same session
 - **Docking poses mode**: explicit toggle that gates H-bond compare — avoids meaningless cross-pocket H-bond overlays when browsing extracted ligands from a multi-ligand crystal structure
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
@@ -92,8 +91,7 @@ ci_gui
 
 1. Load the PDB: `load 5VDH.pdb`
 2. Run `ci_gui` and click **Setup** — PoseViewer auto-splits the organic ligands into `obj01`, `obj02`, ... and steps through each with its own pocket surface
-3. The pose data table shows each ligand's original residue name and number (`resn`, `resi`, `chain`)
-4. No manual extraction needed
+3. No manual extraction needed
 
 ### Two protein structures in the same session
 
@@ -197,9 +195,7 @@ Reference ligand interaction lines respect the same **Show distance labels** tog
 
 Sortable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Column headers are movable. Rank columns are excluded.
 
-**Where the columns come from.** Only Incentive PyMOL reads SD tags off a loaded SDF automatically; open-source PyMOL discards them at load. Everywhere else you must point the **Scores (SDF)** field at the poses file (or run `ci_load_scores`) *before* pressing Setup, otherwise the table shows only the identity columns (`Ligand_ID`, `resn`, `resi`, `chain`) and none of the docking scores. Setup prints a note to the console when it ends up in that state.
-
-When browsing auto-split ligands from a protein structure (no SDF), the table shows `resn`, `resi`, and `chain` columns derived from the original PDB residue identity of each ligand.
+**Where the columns come from.** Only Incentive PyMOL reads SD tags off a loaded SDF automatically; open-source PyMOL discards them at load. Everywhere else you must point the **Scores (SDF)** field at the poses file (or run `ci_load_scores`) *before* pressing Setup, otherwise the table shows only the `Ligand_ID` column and none of the docking scores. Setup prints a note to the console when it ends up in that state.
 
 **Single-click** a row to navigate to that pose. **Ctrl-click** (or click a second row) to enter compare mode — the two most recently selected rows are shown simultaneously. A third selection automatically drops the oldest, maintaining a rolling window of two. Clicking Prev/Next or Go exits compare mode and resumes single-pose navigation.
 
