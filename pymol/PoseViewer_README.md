@@ -1,4 +1,4 @@
-# PoseViewer v1.5
+# PoseViewer v1.6
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -16,7 +16,8 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - Per-ligand pocket surface: residue shell, CA labels, and transparent surface update to the current ligand's binding site in objects mode
 - **Residue-colored surface**: pocket surface is colored by residue type (hydrophobic/polar/charged) rather than flat grey
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
-- **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks persist across navigation and are visible in the pose table
+- **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks are tied to the pose itself, so they stay put when objects are added, deleted or renumbered, and are visible in the pose table
+- **Table export**: copy the pose table to the clipboard or write it to CSV/TSV, from the GUI or via `ci_export`
 - **Residue identity in pose table**: extracted ligands (auto-split from a protein structure) show their original `resn`, `resi`, and `chain` columns in the pose data table
 - **Protein selector**: the Protein field is a dropdown listing all loaded protein objects, enabling quick switching between multiple structures in the same session
 - **Docking poses mode**: explicit toggle that gates H-bond compare — avoids meaningless cross-pocket H-bond overlays when browsing extracted ligands from a multi-ligand crystal structure
@@ -41,7 +42,9 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 | Clashes | Bad clashes (< 0.89× VDW sum) | Orange |
 | Clashes | Ugly clashes (< 0.75× VDW sum) | Red |
 
-H-bond dashes are drawn via PyMOL's `cmd.distance(mode=2)` polar contact detection. Individual H-bond pairs are also listed in the console summary via geometric D-A distance detection (N/O/S/F within 3.5 Å). All other interaction types are detected geometrically. Non-polar hydrogens (C-H) are excluded from clash detection. Contacts/clashes are hidden by default.
+H-bond dashes are drawn via PyMOL's `cmd.distance(mode=2)` polar contact detection, and the console summary lists exactly those pairs — they are read back off the distance object, so the listing can never disagree with the picture. (Before v1.6 the summary used a separate proximity rule — any N/O/S/F pair within 3.5 Å — which counted acceptor–acceptor pairs such as two carbonyl oxygens as H-bonds and could also miss ones PyMOL drew.) All other interaction types are detected geometrically.
+
+Salt bridges and the ligand side of pi-cation need to know which ligand atoms are charged. SDF and mol2 carry formal charges and are used as-is; PDB has no charge column, so a ligand read out of a complex arrives neutral. In that case PoseViewer infers the groups that are ionised at physiological pH — carboxylate/phosphate/sulfonate as anions, quaternary N, guanidinium/amidinium and non-aromatic aliphatic amines as cations — and deliberately stays silent on ring nitrogens, anilines and ureas, whose basicity depends on context. Non-polar hydrogens (C-H) are excluded from clash detection. Contacts/clashes are hidden by default.
 
 Reference ligand interactions are drawn with the same color scheme but thinner dashes (65% radius) to distinguish them from pose interactions.
 
@@ -108,6 +111,7 @@ ci_gui
 | `ci_load_scores <path>` | Load per-pose SD properties from an SDF file |
 | `ci_calc [metrics]` | Compute pose metrics (see [Pose metrics](#pose-metrics)) |
 | `ci_bookmarks` | List all bookmarked poses to the console |
+| `ci_export <path> [, bookmarked]` | Write the pose table (SD properties plus computed metrics) to CSV; a `.tsv`/`.txt` extension switches to tab-separated |
 | `ci_clear` | Remove all PoseViewer objects |
 
 ### `ci_setup` parameters
@@ -128,6 +132,8 @@ ci_load_scores /path/to/gnina_output.sdf
 ci_calc                         # MCS_RMSD, Shape_Sim, Ref_Sim
 ci_calc all
 ci_calc mcs_rmsd,plif_sim
+ci_export /path/to/poses.csv
+ci_export /path/to/marked.tsv, bookmarked
 ```
 
 ---
@@ -186,6 +192,16 @@ When browsing auto-split ligands from a protein structure (no SDF), the table sh
 
 **Single-click** a row to navigate to that pose. **Ctrl-click** (or click a second row) to enter compare mode — the two most recently selected rows are shown simultaneously. A third selection automatically drops the oldest, maintaining a rolling window of two. Clicking Prev/Next or Go exits compare mode and resumes single-pose navigation.
 
+#### Getting the data out
+
+| Control | Description |
+|---|---|
+| Copy all | Copies the whole table to the clipboard as tab-separated text — paste straight into Excel, Numbers or a notebook |
+| Ctrl+C | With the table focused, copies just the selected rows |
+| Export… | Writes the table to a file; `.csv` gives commas, `.tsv`/`.txt` gives tabs |
+
+All three follow what you see: the current sort order, any columns you have dragged around, and the ★ column (exported as a `Bookmarked` field). Numeric cells are written at full precision rather than the two decimals the table displays, so computed metrics survive the trip into a spreadsheet. The `ci_export` command does the same thing without the GUI.
+
 ### Calculate group
 
 Computes the pose metrics described in [Pose metrics](#pose-metrics) for every pose in
@@ -216,7 +232,7 @@ Individual interaction types can be toggled within each group. Contacts/Clashes 
 | Auto-zoom to pose | On | Zoom to binding site on each pose change |
 | Show nonpolar H on ligands | Off | Show all hydrogens (including nonpolar C-H) on pose and reference ligands as sticks. Off by default (only polar H on N/O/S shown). |
 
-The Display group enable checkbox hides all display elements at once (surface, labels) without changing individual settings.
+The Display group enable checkbox hides all display elements at once (surface, labels). Unticking it remembers what was on; ticking it again restores exactly that, rather than switching everything on — which used to turn on nonpolar ligand H even though it defaults to off.
 
 ---
 

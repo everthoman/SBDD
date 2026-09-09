@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.5
+PoseViewer - PyMOL Plugin  v1.6
 ================================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -19,23 +19,24 @@ Installation:
   2. run /path/to/PoseViewer.py   then   ci_gui
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
-Date:    2026-03-24
-Version: 1.0
+Date:    2026-09-09
+Version: 1.6
 License: MIT
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
-import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import defaultdict
 from typing import List, Dict, Optional, Set
 
@@ -103,6 +104,10 @@ CLASH_GOOD_FRAC = 1.30        # comfortable VDW contact (up to 130% of VDW sum)
 CLASH_BAD_FRAC = 0.89         # mild steric overlap
 CLASH_UGLY_FRAC = 0.75        # severe steric overlap
 
+# Widest separation at which any clash can still register, derived from the
+# table above so it stays correct if a larger radius is ever added.
+CLASH_DIST_MAX = 2.0 * max(VDW_RADII.values()) * CLASH_GOOD_FRAC
+
 SHELL_DIST = 5.0
 
 DASH_RADIUS = 0.06
@@ -116,6 +121,7 @@ LABEL_SIZE = 14
 
 _created_objects: Set[str] = set()
 _shell_sel: Optional[str] = None   # selection used for lines/labels (no copy object)
+_shell_key: Optional[tuple] = None # inputs the current shell was built from
 
 _OBJ_PTS        = "_ci_pts"
 _OBJ_REF_PTS    = "_ci_ref_pts"
@@ -140,7 +146,8 @@ def _track(name):
     _created_objects.add(name)
 
 def _clear_shell():
-    global _shell_sel
+    global _shell_sel, _shell_key
+    _shell_key = None
     if _shell_sel is not None:
         try:
             cmd.hide("lines",  _shell_sel)
@@ -173,28 +180,32 @@ def _cleanup_autosplit():
 # Vector helpers
 # ---------------------------------------------------------------------------
 
+# These run tens of thousands of times per pose, always on 3-vectors, where
+# numpy's per-call overhead dominates: np.linalg.norm(np.array(a) - np.array(b))
+# measures ~2.8 us against ~0.14 us for the scalar form below.  numpy is still
+# used where it pays for itself (the SVD in _ring_planarity_rmsd).
+
 def _norm(v):
-    if np is not None:
-        n = np.linalg.norm(v)
-        return v / n if n > 1e-9 else v
-    mag = math.sqrt(sum(x * x for x in v))
-    return [x / mag for x in v] if mag > 1e-9 else v
+    mag = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    return [v[0] / mag, v[1] / mag, v[2] / mag] if mag > 1e-9 else list(v)
 
 def _dot(a, b):
-    if np is not None:
-        return float(np.dot(a, b))
-    return sum(x * y for x, y in zip(a, b))
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 def _dist(a, b):
-    if np is not None:
-        return float(np.linalg.norm(np.array(a) - np.array(b)))
-    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+    dx = a[0] - b[0]; dy = a[1] - b[1]; dz = a[2] - b[2]
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+def _dist2(a, b):
+    """Squared distance — lets the pairwise loop reject most pairs without sqrt."""
+    dx = a[0] - b[0]; dy = a[1] - b[1]; dz = a[2] - b[2]
+    return dx * dx + dy * dy + dz * dz
 
 def _centroid(pts):
-    if np is not None:
-        return np.mean(pts, axis=0)
     n = len(pts)
-    return [sum(p[i] for p in pts) / n for i in range(3)]
+    return (sum(p[0] for p in pts) / n,
+            sum(p[1] for p in pts) / n,
+            sum(p[2] for p in pts) / n)
 
 def _angle_normals(n1, n2):
     c = abs(_dot(_norm(n1), _norm(n2)))
@@ -204,18 +215,28 @@ def _angle_normals(n1, n2):
 # Ring detection
 # ---------------------------------------------------------------------------
 
-def _nonpolar_h_indices(model):
-    """Return indices of H atoms bonded only to C (nonpolar H, excluded from clash detection)."""
+def _sym(atom):
+    """Element symbol, normalised.  PDB writes 'CL'/'BR', SDF writes 'Cl'/'Br'."""
+    return atom.symbol.strip().capitalize()
+
+
+def _adjacency(model):
+    """Bond adjacency of a chempy model as {index: {neighbour indices}}."""
     adj = defaultdict(set)
     for bond in model.bond:
         i, j = bond.index
         adj[i].add(j); adj[j].add(i)
+    return adj
+
+
+def _nonpolar_h_indices(model):
+    """Return indices of H atoms bonded only to C (nonpolar H, excluded from clash detection)."""
+    adj = _adjacency(model)
     nonpolar = set()
     for i, a in enumerate(model.atom):
-        if a.symbol.strip().capitalize() != "H":
+        if _sym(a) != "H":
             continue
-        if not any(model.atom[nb].symbol.strip().capitalize() in {"N", "O", "S", "F"}
-                   for nb in adj[i]):
+        if not any(_sym(model.atom[nb]) in {"N", "O", "S", "F"} for nb in adj[i]):
             nonpolar.add(i)
     return nonpolar
 
@@ -253,17 +274,14 @@ def _ring_planarity_rmsd(coords):
 
 def _find_aromatic_rings(model):
     n = len(model.atom)
-    adj: Dict[int, Set[int]] = defaultdict(set)
-    for bond in model.bond:
-        i, j = bond.index
-        adj[i].add(j); adj[j].add(i)
+    adj = _adjacency(model)
 
     ring_elems = {"C", "N", "O", "S"}
     rings: List[List[int]] = []
     seen: Set[frozenset] = set()
 
     for start in range(n):
-        if model.atom[start].symbol not in ring_elems:
+        if _sym(model.atom[start]) not in ring_elems:
             continue
         _dfs_rings(adj, start, start, [start], set(), rings, seen, model, 6)
 
@@ -274,11 +292,11 @@ def _find_aromatic_rings(model):
         ok = True
         for idx in ring:
             a = model.atom[idx]
-            if a.symbol not in ring_elems:
+            if _sym(a) not in ring_elems:
                 ok = False; break
             # sp2 carbon: exactly 3 total bonds (2 ring + 1 substituent/H)
             # sp3 carbon: 4 total bonds → not aromatic
-            if a.symbol == "C":
+            if _sym(a) == "C":
                 total_nb = len(adj[idx])
                 if total_nb > 3:
                     ok = False; break
@@ -334,13 +352,113 @@ def _get_aromatic_ch_atoms(model, rings, adj):
     ch_atoms = []
     for idx in ring_atoms:
         a = model.atom[idx]
-        if a.symbol != "C":
+        if _sym(a) != "C":
             continue
         for nb in adj[idx]:
-            if model.atom[nb].symbol == "H":
+            if _sym(model.atom[nb]) == "H":
                 ch_atoms.append((a, tuple(a.coord), tuple(model.atom[nb].coord)))
                 break
     return ch_atoms
+
+
+# ---------------------------------------------------------------------------
+# Ligand formal charges
+# ---------------------------------------------------------------------------
+
+def _cyclic_atoms(heavy, indices):
+    """Atoms surviving iterative removal of terminal atoms — the cyclic core.
+
+    A cheap stand-in for full ring perception: every ring atom survives, and so
+    do linkers running between two rings.  Used only to keep ring nitrogens out
+    of the "basic amine" bucket, where a linker N is an amide or aniline anyway.
+    """
+    deg = {i: len(heavy[i] & indices) for i in indices}
+    stack = [i for i in indices if deg[i] <= 1]
+    pruned = set()
+    while stack:
+        i = stack.pop()
+        if i in pruned:
+            continue
+        pruned.add(i)
+        for j in heavy[i] & indices:
+            if j not in pruned:
+                deg[j] -= 1
+                if deg[j] <= 1:
+                    stack.append(j)
+    return indices - pruned
+
+
+def _ligand_charges(model, aromatic_atoms=frozenset()):
+    """(positive, negative) atom-index sets for a ligand model.
+
+    When the file supplies formal charges — SDF, mol2 — they are used verbatim.
+    PDB has no charge column, so a ligand read out of a complex arrives entirely
+    neutral, and every salt bridge plus the ligand side of pi-cation silently
+    stops firing.  In that case infer the groups ionised at physiological pH,
+    conservatively:
+
+      negative   carboxylate / phosphate / sulfonate: a terminal O on a C, P or
+                 S that carries at least two such terminal O
+      positive   quaternary N; guanidinium / amidinium (N on a carbon bearing
+                 two or more N); aliphatic amines outside the ring system that
+                 are neither amides nor anilines
+
+    Deliberately silent on ring nitrogens (imidazole, pyridine) and on anilines:
+    their basicity depends on the ring, and guessing wrong invents interactions
+    that are not there.
+    """
+    n = len(model.atom)
+    charges = [int(getattr(a, "formal_charge", 0) or 0) for a in model.atom]
+    if any(charges):
+        return ({i for i in range(n) if charges[i] > 0},
+                {i for i in range(n) if charges[i] < 0})
+
+    adj = _adjacency(model)
+    el = [_sym(a) for a in model.atom]
+    heavy = {i: {j for j in adj[i] if el[j] != "H"} for i in range(n)}
+    heavy_idx = {i for i in range(n) if el[i] != "H"}
+    core = _cyclic_atoms(heavy, heavy_idx)
+
+    pos: Set[int] = set()
+    neg: Set[int] = set()
+    for i in range(n):
+        e = el[i]
+        hv = heavy[i]
+        if e == "O":
+            if len(hv) != 1:
+                continue
+            (x,) = tuple(hv)
+            if el[x] not in ("C", "P", "S"):
+                continue
+            if sum(1 for o in heavy[x]
+                   if el[o] == "O" and len(heavy[o]) == 1) >= 2:
+                neg.add(i)
+        elif e == "N":
+            if len(adj[i]) >= 4:
+                pos.add(i)          # quaternary / protonated primary amine
+                continue
+            if any(el[x] in ("N", "O", "S") for x in hv):
+                continue            # nitro, sulfonamide, hydrazine, N-oxide
+            amide = guanidine = False
+            for x in hv:
+                if el[x] != "C":
+                    continue
+                # A carbon double-bonded to a terminal O or S is an amide,
+                # thioamide, urea or thiourea centre.  Testing this *before*
+                # the two-nitrogen rule matters: a urea (N-CO-N) has the same
+                # N-C-N skeleton as an amidine but is not basic at all —
+                # biotin's ureido nitrogens were being called cations.
+                if any(el[o] in ("O", "S") and len(heavy[o]) == 1
+                       for o in heavy[x]):
+                    amide = True
+                elif sum(1 for nn in heavy[x] if el[nn] == "N") >= 2:
+                    guanidine = True
+            if guanidine and i not in aromatic_atoms:
+                pos.add(i)
+            elif (not amide and hv and i not in core and i not in aromatic_atoms
+                  and all(el[x] == "C" and x not in aromatic_atoms for x in hv)):
+                pos.add(i)
+    return pos, neg
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +467,13 @@ def _get_aromatic_ch_atoms(model, rings, adj):
 
 class InteractionResult:
     def __init__(self):
-        self.hbond_count: int = 0   # set by visualize() from cmd.distance return value
+        # H-bonds are whatever PyMOL's polar-contact detection actually drew:
+        # visualize() reads the pairs back off the distance object and fills
+        # these in, so the summary can never disagree with the picture.
+        self.hbond_count: int = 0
         self.hbonds: List[dict] = []
+        # (x, y, z) rounded to 2 dp -> atom label, for naming those endpoints.
+        self.atom_labels: Dict[tuple, str] = {}
         self.halogen: List[dict] = []
         self.salt_bridges: List[dict] = []
         self.arom_hbonds: List[dict] = []
@@ -379,17 +502,24 @@ def detect_interactions(
                  PI_CATION_DIST_MAX, PIPI_ETF_DIST_MAX) + 2.0
 
     _TMP = "_ci_tmp"
-    lig_model = cmd.get_model(lig_sel, state=state)
-    # cmd.select evaluates proximity at the current global state (ligand pose),
-    # then cmd.get_model extracts protein coords at state=1 (protein is single-state).
-    cmd.select(_TMP, f"({prot_sel}) within {search} of ({lig_sel})")
-    prot_model = cmd.get_model(_TMP, state=1)
-    cmd.delete(_TMP)
+    try:
+        lig_model = cmd.get_model(lig_sel, state=state)
+        # cmd.select evaluates proximity at the current global state (ligand pose),
+        # then cmd.get_model extracts protein coords at state=1 (protein is single-state).
+        cmd.select(_TMP, f"({prot_sel}) within {search} of ({lig_sel})")
+        prot_model = cmd.get_model(_TMP, state=1)
+    finally:
+        try: cmd.delete(_TMP)
+        except Exception: pass
     if not lig_model.atom or not prot_model.atom:
         return result
 
-    lig_atoms = [(i, a, tuple(a.coord)) for i, a in enumerate(lig_model.atom)]
-    prot_atoms = [(i, a, tuple(a.coord)) for i, a in enumerate(prot_model.atom)]
+    # (index, atom, coord, element).  The element is normalised once here rather
+    # than inside the pairwise loop, which runs tens of thousands of times.
+    lig_atoms = [(i, a, tuple(a.coord), _sym(a))
+                 for i, a in enumerate(lig_model.atom)]
+    prot_atoms = [(i, a, tuple(a.coord), _sym(a))
+                  for i, a in enumerate(prot_model.atom)]
 
     do_any_clash = do_clash_good or do_clash_bad or do_clash_ugly
     if do_any_clash:
@@ -398,47 +528,79 @@ def detect_interactions(
     else:
         lig_nonpolar_h = prot_nonpolar_h = set()
 
-    def _el(a): return a.symbol.strip().capitalize()
     def _il(a): return f"{a.resn} {a.name}"
     def _ip(a): return f"{a.chain}/{a.resn}{a.resi}.{a.name}"
 
-    # --- Pairwise ---
-    for li, la, lc in lig_atoms:
-        le = _el(la)
-        for pi, pa, pc in prot_atoms:
-            pe = _el(pa)
-            d = _dist(lc, pc)
+    # Endpoint -> label map, so visualize() can name the atoms in the H-bonds
+    # PyMOL drew for itself without going back to the PyMOL API to identify them.
+    for _i, a, c, _e in lig_atoms:
+        result.atom_labels[(round(c[0], 2), round(c[1], 2), round(c[2], 2))] = _il(a)
+    for _i, a, c, _e in prot_atoms:
+        result.atom_labels[(round(c[0], 2), round(c[1], 2), round(c[2], 2))] = _ip(a)
 
-            if le in HBOND_ELEMENTS and pe in HBOND_ELEMENTS and d <= 3.5:
-                result.hbonds.append({
-                    "p1": lc, "p2": pc, "dist": d,
-                    "info1": _il(la), "info2": _ip(pa)})
+    # --- Ligand rings and charges (the pairwise loop needs the charges) ------
+    # Done once, up front, from the model already in hand.
+    need_rings = do_pipi or do_arom_hb or do_pi_cation
+    lig_rings_info: list = []
+    lig_adj = None
+    if need_rings:
+        try:
+            lig_rings_info, lig_adj = _get_rings_info(lig_model)
+        except Exception:
+            pass
+    lig_aromatic = {i for r, _, _ in lig_rings_info for i in r}
+
+    lig_pos: Set[int] = set()
+    lig_neg: Set[int] = set()
+    if do_salt or do_pi_cation:
+        try:
+            lig_pos, lig_neg = _ligand_charges(lig_model, lig_aromatic)
+        except Exception:
+            pass
+
+    # --- Pairwise ---
+    # A single squared cutoff gates every per-pair test, so the large majority of
+    # pairs cost three subtractions and one comparison rather than a sqrt and a
+    # chain of element lookups.
+    pair_cut = max(HALOGEN_DIST_MAX, SALT_BRIDGE_DIST_MAX,
+                   CLASH_DIST_MAX if do_any_clash else 0.0)
+    pair_cut2 = pair_cut * pair_cut
+
+    for li, la, lc, le in lig_atoms:
+        lx, ly, lz = lc
+        l_halogen = le in HALOGEN_DONORS
+        l_hal_acc = le in HALOGEN_ACCEPTORS
+        l_pos = li in lig_pos
+        l_neg = li in lig_neg
+        l_clashable = do_any_clash and li not in lig_nonpolar_h
+        l_vdw = VDW_RADII.get(le, 1.70)
+        for pi, pa, pc, pe in prot_atoms:
+            dx = lx - pc[0]; dy = ly - pc[1]; dz = lz - pc[2]
+            d2 = dx * dx + dy * dy + dz * dz
+            if d2 > pair_cut2:
+                continue
+            d = math.sqrt(d2)
 
             if do_halogen and d <= HALOGEN_DIST_MAX:
-                if ((le in HALOGEN_DONORS and pe in HALOGEN_ACCEPTORS) or
-                    (pe in HALOGEN_DONORS and le in HALOGEN_ACCEPTORS)):
+                if ((l_halogen and pe in HALOGEN_ACCEPTORS) or
+                        (pe in HALOGEN_DONORS and l_hal_acc)):
                     result.halogen.append({
                         "p1": lc, "p2": pc, "dist": d,
                         "info1": _il(la), "info2": _ip(pa)})
 
-            if do_salt and d <= SALT_BRIDGE_DIST_MAX:
-                lpos = (le == "N" and la.formal_charge > 0)
-                lneg = (le == "O" and la.formal_charge < 0)
-                ppos = (pa.resn in ("ARG","LYS","HIS","HID","HIE","HIP")
-                        and pa.name in ("NH1","NH2","NE","NZ","ND1","NE2"))
-                pneg = ((pa.resn == "ASP" and pa.name in ("OD1","OD2"))
-                        or (pa.resn == "GLU" and pa.name in ("OE1","OE2")))
-                if (lpos and pneg) or (lneg and ppos):
+            if do_salt and (l_pos or l_neg) and d <= SALT_BRIDGE_DIST_MAX:
+                ppos = (pa.resn in ("ARG", "LYS", "HIS", "HID", "HIE", "HIP")
+                        and pa.name in ("NH1", "NH2", "NE", "NZ", "ND1", "NE2"))
+                pneg = ((pa.resn == "ASP" and pa.name in ("OD1", "OD2"))
+                        or (pa.resn == "GLU" and pa.name in ("OE1", "OE2")))
+                if (l_pos and pneg) or (l_neg and ppos):
                     result.salt_bridges.append({
                         "p1": lc, "p2": pc, "dist": d,
                         "info1": _il(la), "info2": _ip(pa)})
 
-            if (do_any_clash
-                    and li not in lig_nonpolar_h
-                    and pi not in prot_nonpolar_h):
-                vdw = VDW_RADII.get(le, 1.70) + VDW_RADII.get(pe, 1.70)
-                max_d = vdw * CLASH_GOOD_FRAC
-                if d <= max_d:
+            if l_clashable and pi not in prot_nonpolar_h:
+                vdw = l_vdw + VDW_RADII.get(pe, 1.70)
+                if d <= vdw * CLASH_GOOD_FRAC:
                     frac = d / vdw if vdw > 0 else 1.0
                     if frac < CLASH_UGLY_FRAC:
                         if do_clash_ugly:
@@ -452,37 +614,28 @@ def detect_interactions(
                                 "p1": lc, "p2": pc, "dist": d, "vdw": vdw,
                                 "quality": "bad",
                                 "info1": _il(la), "info2": _ip(pa)})
-                    elif le != "H" and pe != "H":
-                        if do_clash_good:
-                            result.clash_good.append({
-                                "p1": lc, "p2": pc, "dist": d, "vdw": vdw,
-                                "quality": "good",
-                                "info1": _il(la), "info2": _ip(pa)})
+                    elif do_clash_good and le != "H" and pe != "H":
+                        result.clash_good.append({
+                            "p1": lc, "p2": pc, "dist": d, "vdw": vdw,
+                            "quality": "good",
+                            "info1": _il(la), "info2": _ip(pa)})
 
-    # --- Ring-based ---
-    lig_rings_info = []
-    prot_rings_info = []
+    # --- Protein ring detection ---
+    prot_rings_info: list = []
     _prm = None
     _prm_adj = None
-    _lm = None
-    _lm_adj = None
-
-    need_rings = do_pipi or do_arom_hb or do_pi_cation
     if need_rings:
-        try:
-            _lm = cmd.get_model(lig_sel, state=state)
-            lig_rings_info, _lm_adj = _get_rings_info(_lm)
-        except Exception:
-            pass
         try:
             prs = (f"({prot_sel} within {PI_CATION_DIST_MAX+3} of ({lig_sel}))"
                    f" and (resn PHE+TYR+TRP+HIS+HIE+HID+HIP)")
             cmd.select(_TMP, prs)
             _prm = cmd.get_model(_TMP, state=1)
-            cmd.delete(_TMP)
             prot_rings_info, _prm_adj = _get_rings_info(_prm)
         except Exception:
             pass
+        finally:
+            try: cmd.delete(_TMP)
+            except Exception: pass
 
     # Pi-pi
     if do_pipi and lig_rings_info and prot_rings_info:
@@ -495,21 +648,23 @@ def detect_interactions(
                 if d <= PIPI_FTF_DIST_MAX and ang <= PIPI_FTF_ANGLE_MAX:
                     result.pipi.append({
                         "p1": list(lrc), "p2": list(prc), "dist": d,
-                        "angle": ang, "type": "face-to-face", "info2": info})
+                        "angle": ang, "type": "face-to-face",
+                        "info1": "lig ring", "info2": info})
                 elif (d <= PIPI_ETF_DIST_MAX and
                       PIPI_ETF_ANGLE_MIN <= ang <= PIPI_ETF_ANGLE_MAX):
                     result.pipi.append({
                         "p1": list(lrc), "p2": list(prc), "dist": d,
-                        "angle": ang, "type": "edge-to-face", "info2": info})
+                        "angle": ang, "type": "edge-to-face",
+                        "info1": "lig ring", "info2": info})
 
     # Aromatic H-bonds: aromatic C-H ... acceptor (O/N/S)
     if do_arom_hb:
-        if _lm and _lm_adj and lig_rings_info:
+        if lig_adj and lig_rings_info:
             lig_ring_indices = [r for r, _, _ in lig_rings_info]
-            lig_ch = _get_aromatic_ch_atoms(_lm, lig_ring_indices, _lm_adj)
+            lig_ch = _get_aromatic_ch_atoms(lig_model, lig_ring_indices, lig_adj)
             for ca, cc, hc in lig_ch:
-                for _pi, pa, pc in prot_atoms:
-                    if _el(pa) not in AROM_HBOND_ACCEPTORS:
+                for _pi, pa, pc, pe in prot_atoms:
+                    if pe not in AROM_HBOND_ACCEPTORS:
                         continue
                     d = _dist(cc, pc)
                     if d <= AROM_HBOND_DIST_MAX:
@@ -528,8 +683,8 @@ def detect_interactions(
             prot_ring_indices = [r for r, _, _ in prot_rings_info]
             prot_ch = _get_aromatic_ch_atoms(_prm, prot_ring_indices, _prm_adj)
             for ca, cc, hc in prot_ch:
-                for _li, la, lc in lig_atoms:
-                    if _el(la) not in AROM_HBOND_ACCEPTORS:
+                for _li, la, lc, le in lig_atoms:
+                    if le not in AROM_HBOND_ACCEPTORS:
                         continue
                     d = _dist(cc, lc)
                     if d <= AROM_HBOND_DIST_MAX:
@@ -551,7 +706,6 @@ def detect_interactions(
         try:
             cmd.select(_TMP, pcs)
             pcm = cmd.get_model(_TMP, state=1)
-            cmd.delete(_TMP)
             for pa in pcm.atom:
                 pac = tuple(pa.coord)
                 for _, lrc, _ in lig_rings_info:
@@ -562,9 +716,12 @@ def detect_interactions(
                             "info1": "lig ring", "info2": _ip(pa)})
         except Exception:
             pass
+        finally:
+            try: cmd.delete(_TMP)
+            except Exception: pass
         if _prm:
-            for _li, la, lc in lig_atoms:
-                if la.formal_charge > 0:
+            for _li, la, lc, _le in lig_atoms:
+                if _li in lig_pos:
                     for pri, prc, _ in prot_rings_info:
                         d = _dist(lc, prc)
                         if d <= PI_CATION_DIST_MAX:
@@ -586,7 +743,6 @@ def detect_interactions(
                 out.append(it)
         return out
 
-    result.hbonds       = _dedup(result.hbonds)
     result.halogen      = _dedup(result.halogen)
     result.salt_bridges = _dedup(result.salt_bridges)
     result.arom_hbonds  = _dedup(result.arom_hbonds)
@@ -603,20 +759,19 @@ def detect_interactions(
             cmd.select(_TMP_W,
                        f"(resn HOH+WAT+H2O+SOL) within 3.5 of ({lig_sel})")
             wat_model = cmd.get_model(_TMP_W, state=1)
-            cmd.delete(_TMP_W)
             for wa in wat_model.atom:
-                if wa.symbol.strip().capitalize() != "O":
+                if _sym(wa) != "O":
                     continue
                 wc = tuple(wa.coord)
                 lig_match = min(
-                    ((la, lc, _dist(wc, lc)) for _, la, lc in lig_atoms
-                     if _el(la) in HBOND_ELEMENTS),
+                    ((la, lc, _dist(wc, lc)) for _, la, lc, le in lig_atoms
+                     if le in HBOND_ELEMENTS),
                     key=lambda x: x[2], default=None)
                 if lig_match is None or lig_match[2] > 3.5:
                     continue
                 prot_match = min(
-                    ((pa, pc, _dist(wc, pc)) for _, pa, pc in prot_atoms
-                     if _el(pa) in HBOND_ELEMENTS),
+                    ((pa, pc, _dist(wc, pc)) for _, pa, pc, pe in prot_atoms
+                     if pe in HBOND_ELEMENTS),
                     key=lambda x: x[2], default=None)
                 if prot_match is None or prot_match[2] > 3.5:
                     continue
@@ -673,13 +828,69 @@ def _style(name, color, radius=DASH_RADIUS, gap=DASH_GAP, length=DASH_LENGTH):
     cmd.set("label_size", LABEL_SIZE, name)
 
 
-def _add_pair(pts, pid, p1, p2, dist_name):
-    r = str(pid)
-    cmd.pseudoatom(pts, pos=list(p1), resi=r, name="L", chain="X")
-    cmd.pseudoatom(pts, pos=list(p2), resi=r, name="P", chain="X")
-    cmd.distance(dist_name,
-                 f"{pts} and resi {r} and name L",
-                 f"{pts} and resi {r} and name P")
+def _add_pair_points(pts, pairs):
+    """Create the anchor pseudoatoms for every pair in one PyMOL call.
+
+    cmd.pseudoatom rebuilds the whole object on each call, so adding the points
+    one at a time costs about twice what a single load_model of the finished set
+    does (0.62 s vs 0.27 s for 600 pairs).  Symbol "PS" keeps the points out of
+    the organic/polymer selectors the rest of the plugin relies on.
+    """
+    from chempy import Atom
+    from chempy.models import Indexed
+
+    model = Indexed()
+    for i, (_name, p1, p2) in enumerate(pairs):
+        for atom_name, pos in (("L", p1), ("P", p2)):
+            a = Atom()
+            a.name = atom_name
+            a.resn = "PSD"
+            a.resi = str(i)
+            a.chain = "X"
+            a.symbol = "PS"
+            a.hetatm = 1
+            a.coord = [float(pos[0]), float(pos[1]), float(pos[2])]
+            model.atom.append(a)
+    try: cmd.delete(pts)
+    except Exception: pass
+    cmd.load_model(model, pts, 1)
+
+
+def _distance_object_pairs(name, state=0):
+    """Endpoint coordinate pairs of a PyMOL distance object, for one state.
+
+    cmd.distance returns the *average* distance — not a count — and offers no
+    way to ask which pairs it drew, so read them back out of the session data.
+    The object carries one point set per state (None for states it never
+    computed); state <= 0 means the current global state.  Returns [] if the
+    session layout is not the one we expect, so a PyMOL version change degrades
+    to "no listing" rather than to wrong listings.
+    """
+    try:
+        dsets = cmd.get_session(name, partial=1)["names"][0][5][2]
+    except Exception:
+        return []
+    if not dsets:
+        return []
+    if not state or state <= 0:
+        try: state = cmd.get_state()
+        except Exception: state = 1
+    dset = None
+    if 0 <= state - 1 < len(dsets) and dsets[state - 1]:
+        dset = dsets[state - 1]
+    else:
+        present = [d for d in dsets if d]
+        if len(present) == 1:      # single-state object shown at any state
+            dset = present[0]
+    if not dset:
+        return []
+    try:
+        flat = dset[1] or []
+        npts = min(int(dset[0]), len(flat) // 3)
+        return [(tuple(flat[i * 3:i * 3 + 3]), tuple(flat[i * 3 + 3:i * 3 + 6]))
+                for i in range(0, npts - 1, 2)]
+    except Exception:
+        return []
 
 
 def visualize(lig_sel, prot_sel, result: InteractionResult,
@@ -688,8 +899,13 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
     """Visualize all interactions.
 
     H-bonds are created via PyMOL's built-in polar contact detection
-    (cmd.distance mode=2). All other types use pseudoatom pairs.
+    (cmd.distance mode=2), then read back off the resulting object so that
+    result.hbonds lists exactly the contacts that were drawn.
 
+    state:       pose state.  Passed to cmd.distance so only that state's polar
+                 contacts are computed — the default computes every state of the
+                 object, which on a 200-pose SDF costs 11.9 ms per call against
+                 0.3 ms for one state.
     name_prefix: prepended to all PyMOL object names (used for reference
                  ligand so its objects are distinct from pose objects).
     clear:       call _clear_contacts() before drawing (set False when
@@ -701,41 +917,61 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
 
     # Thinner dashes for reference ligand interactions (visual distinction)
     r_scale = 0.65 if name_prefix else 1.0
+    hb_state = state if state and state > 0 else 0
 
     # --- H-bonds via PyMOL polar contacts (mode=2) ---
     hb_name = name_prefix + _INTERACTION_NAMES["hbonds"]
+    result.hbonds = []
+    result.hbond_count = 0
     if show_hbonds:
         try:
-            n_hb = cmd.distance(hb_name, lig_sel, prot_sel, mode=2)
-            if n_hb is not None and n_hb > 0:
-                result.hbond_count = int(n_hb)
+            cmd.distance(hb_name, lig_sel, prot_sel, mode=2, state=hb_state)
+            pairs = _distance_object_pairs(hb_name, hb_state)
+            if pairs:
+                labels = result.atom_labels
+                # Collapse duplicate endpoints, the same way _dedup() does for
+                # every other type.  Altlocs produce them, and so does the
+                # source copy that _auto_split_ligands leaves in the session:
+                # a second ligand at identical coordinates makes PyMOL report
+                # each polar contact twice.  Unordered, since the two dashes
+                # can arrive donor-first and acceptor-first.
+                seen: Set[tuple] = set()
+                for p1, p2 in pairs:
+                    k1 = (round(p1[0], 2), round(p1[1], 2), round(p1[2], 2))
+                    k2 = (round(p2[0], 2), round(p2[1], 2), round(p2[2], 2))
+                    key = (k1, k2) if k1 <= k2 else (k2, k1)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    result.hbonds.append({
+                        "p1": p1, "p2": p2, "dist": _dist(p1, p2),
+                        "info1": labels.get(k1, ""), "info2": labels.get(k2, "")})
+                result.hbond_count = len(result.hbonds)
                 _track(hb_name)
                 _style(hb_name, "ci_hbond", radius=DASH_RADIUS * r_scale)
             else:
-                result.hbond_count = 0
                 try: cmd.delete(hb_name)
                 except Exception: pass
         except Exception:
-            result.hbond_count = 0
             try: cmd.delete(hb_name)
             except Exception: pass
 
     # --- All other types via pseudoatom pairs ---
     pts = _OBJ_REF_PTS if name_prefix else _OBJ_PTS
-    _track(pts)
-    pid = 0
+    N = {k: name_prefix + v for k, v in _INTERACTION_NAMES.items()}
+
+    # Collect every pair first, then build the anchor object in a single call.
+    pending: List[tuple] = []
+    styles: List[tuple] = []
 
     def _draw(items, obj_name, color, **kw):
-        nonlocal pid
         if not items:
             return
         _track(obj_name)
         for it in items:
-            _add_pair(pts, pid, it["p1"], it["p2"], obj_name)
-            pid += 1
-        _style(obj_name, color, **kw)
+            pending.append((obj_name, it["p1"], it["p2"]))
+        styles.append((obj_name, color, kw))
 
-    N = {k: name_prefix + v for k, v in _INTERACTION_NAMES.items()}
     _draw(result.halogen,      N["halogen"],  "ci_halogen",
           radius=DASH_RADIUS * r_scale)
     _draw(result.salt_bridges, N["salt"],     "ci_salt",
@@ -755,25 +991,32 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
     _draw(result.clash_ugly,   N["clash_ugly"],  "ci_clash_ugly",
           gap=0.15, length=0.10, radius=DASH_RADIUS * r_scale)
 
-    # Water bridges: two dashes per bridge (lig→water, water→prot)
+    # Water bridges: two dashes per bridge (lig->water, water->prot)
     wb_name = name_prefix + _INTERACTION_NAMES["water"]
     if result.water_bridges:
         _track(wb_name)
         for b in result.water_bridges:
-            _add_pair(pts, pid, b["p1"],    b["p_wat"], wb_name)
-            pid += 1
-            _add_pair(pts, pid, b["p_wat"], b["p2"],    wb_name)
-            pid += 1
-        _style(wb_name, "ci_water",
-               radius=DASH_RADIUS * 0.8 * r_scale, gap=0.20, length=0.15)
+            pending.append((wb_name, b["p1"],    b["p_wat"]))
+            pending.append((wb_name, b["p_wat"], b["p2"]))
+        styles.append((wb_name, "ci_water",
+                       dict(radius=DASH_RADIUS * 0.8 * r_scale,
+                            gap=0.20, length=0.15)))
+
+    if pending:
+        _track(pts)
+        _add_pair_points(pts, pending)
+        for i, (obj_name, _p1, _p2) in enumerate(pending):
+            cmd.distance(obj_name,
+                         f"{pts} and resi {i} and name L",
+                         f"{pts} and resi {i} and name P")
+        for obj_name, color, kw in styles:
+            _style(obj_name, color, **kw)
+        cmd.hide("everything", pts)
 
     # Contacts/clashes: never show distance labels (too cluttered)
     for q in ("clash_good", "clash_bad", "clash_ugly"):
         if N[q] in _created_objects:
             cmd.hide("labels", N[q])
-
-    if pid > 0:
-        cmd.hide("everything", pts)
 
     if not show_labels:
         for n in N.values():
@@ -894,8 +1137,20 @@ def _color_surface_by_type(surf_obj):
 
 
 def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
-    global _shell_sel
+    """Show lines + labels for residues near the ligand, with a surface on top.
+
+    Rebuilding means re-running cmd.create and a full surface recalculation, so
+    skip it when nothing that feeds the shell has changed — every checkbox
+    toggle routes through _show_current() and would otherwise pay for it.
+    Surface colour and visibility are handled by their own toggles and so are
+    deliberately not part of the key.
+    """
+    global _shell_sel, _shell_key
     lig_union = _lig_union(ligand_sels)
+
+    key = (protein_sel, lig_union, dist)
+    if key == _shell_key and _shell_sel is not None and _OBJ_SURF in _created_objects:
+        return
 
     _clear_shell()
 
@@ -923,6 +1178,8 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST):
         cmd.set("transparency", 0.4, _OBJ_SURF)
     except Exception:
         pass
+
+    _shell_key = key
 
 
 
@@ -952,7 +1209,6 @@ class LigandStepper:
         self.show_clash_ugly = False
         self.show_labels = True
         self.auto_zoom = True
-        self.last_properties: dict = {}
         self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
         self.all_properties: list = []  # one dict per pose, built at setup time
         self.poses: list = []          # [(obj_name, state_1based), ...]
@@ -968,11 +1224,15 @@ class LigandStepper:
         self.show_cmp_hbonds: bool          = False
         self.show_water: bool               = True
         self.color_surf_by_type: bool       = True
-        self._bookmarks: Set[int]           = set()
+        # Keyed by (object, state) like `computed` below, so a bookmark keeps
+        # pointing at its pose when the list is rebuilt (objects added, deleted
+        # or renumbered) instead of sliding onto whatever now sits at that index.
+        self._bookmarks: Set[tuple]         = set()
         # Metrics computed by _MetricsJob, keyed by (object, state) so they
         # survive the pose list being rebuilt (objects added/removed/renumbered).
         self.computed: Dict[tuple, dict]    = {}
         self._table_dirty: bool             = False
+        self._sdf_mismatch: Optional[tuple] = None
 
     def setup_objects(self, prot, ligs, ref_lig=None):
         self.protein_sel = prot
@@ -1021,6 +1281,39 @@ class LigandStepper:
 
     def _count(self):
         return len(self.poses)
+
+    def pose_key(self, index=None):
+        """(object, state) identity of a pose index, or None when out of range."""
+        if index is None:
+            index = self.current_index
+        if 0 <= index < len(self.poses):
+            return self.poses[index]
+        return None
+
+    def is_bookmarked(self, index=None):
+        key = self.pose_key(index)
+        return key is not None and key in self._bookmarks
+
+    def toggle_bookmark(self, index=None):
+        """Add/remove a bookmark; returns True when the pose is now bookmarked."""
+        key = self.pose_key(index)
+        if key is None:
+            return False
+        if key in self._bookmarks:
+            self._bookmarks.discard(key)
+            return False
+        self._bookmarks.add(key)
+        return True
+
+    def table_columns(self):
+        """Data column keys for the pose table, in display order."""
+        seen: dict = {}
+        for props in self.all_properties:
+            for k in props:
+                seen.setdefault(k, None)
+        cols = list(seen)
+        return (["_name"] if "_name" in cols else []) + [
+            c for c in cols if c != "_name" and "rank" not in c.lower()]
 
     def _label(self):
         if not self.poses:
@@ -1253,14 +1546,6 @@ class LigandStepper:
                 do_clash_ugly=self.show_clash_ugly,
                 do_water=self.show_water)
             self.last_result = r
-            if self.sdf_records:
-                idx = self.current_index
-                self.last_properties = (self.sdf_records[idx]
-                                        if 0 <= idx < len(self.sdf_records)
-                                        else {})
-            else:
-                self.last_properties = _get_pose_properties(
-                    lig, state if state > 0 else 1)
             if self.show_pose:
                 visualize(lig, self.protein_sel, r,
                           show_hbonds=self.show_hbonds,
@@ -1347,8 +1632,16 @@ class LigandStepper:
             return
 
         if self.mode == "states":
-            # Single-object states mode: records are 1-to-1 with poses in SDF order
-            self.all_properties = list(self.sdf_records)
+            # Single-object states mode: records are 1-to-1 with poses in SDF
+            # order.  Pad/truncate to the pose count so the table can never grow
+            # rows that address no pose, or leave poses without a row.
+            n = len(self.poses)
+            recs = list(self.sdf_records)
+            if len(recs) != n and self._sdf_mismatch != (len(recs), n):
+                self._sdf_mismatch = (len(recs), n)
+                print(f"PoseViewer: {len(recs)} SDF record(s) for {n} state(s) "
+                      f"— table aligned to the states.")
+            self.all_properties = (recs + [{}] * n)[:n]
             return
 
         # Objects mode with SDF loaded: match records to poses by _name.
@@ -1375,7 +1668,7 @@ class LigandStepper:
             counters: dict = defaultdict(int)
             self.all_properties = []
             for obj, _st in self.poses:
-                recs = by_name[obj]
+                recs = by_name.get(obj, [])
                 i = counters[obj]
                 self.all_properties.append(recs[i] if i < len(recs) else {"_name": obj})
                 counters[obj] += 1
@@ -1999,7 +2292,7 @@ def _candidate_pythons():
     roots = []
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
-        roots.append(os.path.join(os.path.dirname(conda_prefix)))
+        roots.append(os.path.dirname(conda_prefix))
     home = os.path.expanduser("~")
     roots += [os.path.join(home, "miniconda3", "envs"),
               os.path.join(home, "anaconda3", "envs"),
@@ -2069,61 +2362,63 @@ def _looks_like_missing_module(error: str) -> bool:
                                     "No module named", "worker produced no result"))
 
 
+def _kill_child(proc, hard=False):
+    """Terminate proc and anything it spawned (PoseBusters starts its own pool).
+
+    Falls back to killing just the child where process groups do not exist.
+    """
+    try:
+        if os.name == "posix" and hasattr(os, "killpg"):
+            os.killpg(os.getpgid(proc.pid),
+                      signal.SIGKILL if hard else signal.SIGTERM)
+            return
+    except Exception:
+        pass
+    try:
+        proc.kill() if hard else proc.terminate()
+    except Exception:
+        pass
+
+
 def _stream_process(proc, cancel, on_line):
     """Feed proc's stdout lines to on_line until it exits; kill it if cancelled.
 
-    Reads the raw fds through select so a cancel is noticed within ~0.2 s even
-    when the child is silent for minutes (PLIF emits nothing until it is done).
+    A reader thread per pipe rather than select(), which on Windows works only
+    on sockets — the previous version failed there before reading a byte and the
+    caller could only report the generic "worker produced no result".  Polling
+    the exit status means a cancel is noticed within ~0.1 s even when the child
+    stays silent for minutes (PLIF emits nothing until it is done).
+
     Returns collected stderr text.
     """
-    fds = {proc.stdout.fileno(): ("out", b""), proc.stderr.fileno(): ("err", b"")}
-    err_chunks = []
+    err_chunks: List[str] = []
 
-    def emit(kind, text):
-        if kind == "out":
-            on_line(text)
-        else:
-            err_chunks.append(text)
-
-    while fds:
-        if cancel is not None and cancel.is_set():
-            try:
-                # PoseBusters spawns its own workers; kill the whole group.
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except Exception:
-                proc.terminate()
-            break
+    def reader(stream, sink):
         try:
-            ready, _, _ = select.select(list(fds), [], [], 0.2)
+            for raw in iter(stream.readline, b""):
+                sink(raw.decode("utf-8", "replace").rstrip())
         except Exception:
+            pass
+
+    threads = [threading.Thread(target=reader, args=(proc.stdout, on_line),
+                                daemon=True),
+               threading.Thread(target=reader, args=(proc.stderr, err_chunks.append),
+                                daemon=True)]
+    for t in threads:
+        t.start()
+
+    while proc.poll() is None:
+        if cancel is not None and cancel.is_set():
+            _kill_child(proc)
             break
-        for fd in ready:
-            kind, buf = fds[fd]
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError:
-                chunk = b""
-            if not chunk:
-                # EOF: drop the fd, otherwise select keeps reporting it ready
-                # and this loop spins forever after the child exits.
-                if buf:
-                    emit(kind, buf.decode("utf-8", "replace").rstrip())
-                del fds[fd]
-                continue
-            buf += chunk
-            *lines, buf = buf.split(b"\n")
-            fds[fd] = (kind, buf)
-            for raw in lines:
-                emit(kind, raw.decode("utf-8", "replace").rstrip())
-        if not ready and proc.poll() is not None:
-            break
+        time.sleep(0.1)
+
     try:
         proc.wait(timeout=10)
     except Exception:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            proc.kill()
+        _kill_child(proc, hard=True)
+    for t in threads:
+        t.join(timeout=2)
     for stream in (proc.stdout, proc.stderr):
         try:
             stream.close()
@@ -2150,7 +2445,9 @@ def _run_external_metric(metric, python_exe, workdir, poses_sdf, ref_sdf,
         proc = subprocess.Popen(
             [python_exe, worker_py, job_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True)
+            # POSIX only: gives the worker its own process group so cancelling
+            # takes PoseBusters' worker pool down with it.
+            start_new_session=(os.name == "posix"))
     except Exception as e:
         return None, "", f"could not start {python_exe}: {e}"
 
@@ -2502,11 +2799,10 @@ def _auto_split_ligands(ligands_sel):
     created = []
     info = []
     next_idx = [1]   # shared counter so each object gets the next free obj## slot
-    for i, (chain, resn, resi) in enumerate(unique):
+    for chain, resn, resi in unique:
         # Mirror PyMOL's own obj01/obj02/... naming for manually extracted objects.
         # Scan upward so collisions with existing objects always yield obj## (never obj01_1).
-        while (name := f"{_AUTOSPLIT_PREFIX}{next_idx[0]:02d}") in existing \
-                and name not in _created_objects:
+        while (name := f"{_AUTOSPLIT_PREFIX}{next_idx[0]:02d}") in existing:
             next_idx[0] += 1
         next_idx[0] += 1
         chain_part = f"chain {chain} and " if chain.strip() else ""
@@ -2735,16 +3031,57 @@ def ci_clear():
 
 def ci_bookmarks():
     """List all bookmarked poses to the console."""
-    bm = sorted(_stepper._bookmarks)
-    if not bm:
+    marked = [(i, key) for i, key in enumerate(_stepper.poses)
+              if key in _stepper._bookmarks]
+    if not marked:
         print("PoseViewer: no bookmarks.")
         return
-    print(f"PoseViewer: {len(bm)} bookmark(s):")
-    for i in bm:
-        if 0 <= i < len(_stepper.poses):
-            obj, st = _stepper.poses[i]
-            label = f"{obj} state {st}" if cmd.count_states(obj) > 1 else obj
-            print(f"  [{i + 1}] {label}")
+    print(f"PoseViewer: {len(marked)} bookmark(s):")
+    for i, (obj, st) in marked:
+        label = f"{obj} state {st}" if cmd.count_states(obj) > 1 else obj
+        print(f"  [{i + 1}] {label}")
+
+
+def ci_export(path="", selection="all"):
+    """Write the pose table — SDF properties plus anything ci_calc computed — to CSV.
+
+USAGE
+    ci_export /path/to/poses.csv
+    ci_export /path/to/marked.csv, bookmarked
+
+    A .tsv or .txt extension switches the delimiter to tab.
+    """
+    if not path:
+        print("PoseViewer: ci_export requires a file path.")
+        return
+    if not _stepper.all_properties:
+        print("PoseViewer: no pose data to export — run ci_setup first.")
+        return
+    only_marked = str(selection).strip().lower() in ("bookmarked", "bookmarks", "marked")
+    cols = _stepper.table_columns()
+    headers = ["Pose", "State", "Bookmarked"] + [
+        "Ligand_ID" if c == "_name" else c for c in cols]
+    rows = []
+    for i, props in enumerate(_stepper.all_properties):
+        key = _stepper.pose_key(i)
+        if key is None:
+            continue
+        if only_marked and key not in _stepper._bookmarks:
+            continue
+        obj, st = key
+        rows.append([obj, st, "yes" if key in _stepper._bookmarks else ""] +
+                    [props.get(c, "") for c in cols])
+    delim = "\t" if path.lower().endswith((".tsv", ".txt")) else ","
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh, delimiter=delim)
+            writer.writerow(headers)
+            writer.writerows(rows)
+    except OSError as e:
+        print(f"PoseViewer: could not write '{path}': {e}")
+        return
+    print(f"PoseViewer: exported {len(rows)} pose(s) x {len(headers)} column(s) "
+          f"to '{path}'.")
 
 def ci_gui():
     _open_gui()
@@ -2759,6 +3096,7 @@ cmd.extend("ci_load_scores", ci_load_scores)
 cmd.extend("ci_calc", ci_calc)
 cmd.extend("ci_clear", ci_clear)
 cmd.extend("ci_bookmarks", ci_bookmarks)
+cmd.extend("ci_export", ci_export)
 cmd.extend("ci_gui", ci_gui)
 
 
@@ -2774,7 +3112,7 @@ def __init_plugin__(app=None):
 
 
 def _open_gui():
-    global _gui_window, _stepper
+    global _gui_window
 
     if _gui_window is not None:
         try:
@@ -2910,6 +3248,21 @@ def _open_gui():
     tw_pd.verticalHeader().setDefaultSectionSize(18)
     tw_pd.setAlternatingRowColors(True)
     l_pd.addWidget(tw_pd)
+
+    hl_pd = QtWidgets.QHBoxLayout()
+    b_copy = QtWidgets.QPushButton("Copy all")
+    b_copy.setToolTip("Copy the whole table as tab-separated text, ready to "
+                      "paste into a spreadsheet.\nCtrl+C in the table copies "
+                      "just the selected rows.")
+    b_export = QtWidgets.QPushButton("Export…")
+    b_export.setToolTip("Write the table to a CSV or TSV file")
+    b_copy.setFixedWidth(90)
+    b_export.setFixedWidth(80)
+    lbl_pd = QtWidgets.QLabel("")
+    lbl_pd.setStyleSheet("color: grey;")
+    hl_pd.addWidget(b_copy); hl_pd.addWidget(b_export)
+    hl_pd.addWidget(lbl_pd, 1)
+    l_pd.addLayout(hl_pd)
     top_l.addWidget(g_pd, 1)
 
     # Swatch+checkbox helper
@@ -3038,14 +3391,7 @@ def _open_gui():
         if not all_props:
             tw_pd.setColumnCount(0)
             return
-        seen: dict = {}
-        for p in all_props:
-            for k in p:
-                if k not in seen:
-                    seen[k] = None
-        data_cols = list(seen.keys())
-        data_cols = (["_name"] if "_name" in data_cols else []) + [
-            c for c in data_cols if c != "_name" and "rank" not in c.lower()]
+        data_cols = _stepper.table_columns()
         # Column 0 = bookmark ★, then data columns
         tw_pd.setColumnCount(1 + len(data_cols))
         headers = ["★"] + ["Ligand_ID" if c == "_name" else c for c in data_cols]
@@ -3053,7 +3399,7 @@ def _open_gui():
         tw_pd.setRowCount(len(all_props))
         for r, props in enumerate(all_props):
             # Bookmark column
-            bm_item = _SortItem("★" if r in _stepper._bookmarks else "")
+            bm_item = _SortItem("★" if _stepper.is_bookmarked(r) else "")
             bm_item.setData(QtCore.Qt.UserRole, r)
             bm_item.setTextAlignment(QtCore.Qt.AlignCenter | QtCore.Qt.AlignVCenter)
             tw_pd.setItem(r, 0, bm_item)
@@ -3081,6 +3427,84 @@ def _open_gui():
         _sel_order.clear()
         _highlight_current_row()
 
+    def _table_snapshot(selected_only):
+        """(headers, rows) exactly as the table currently reads.
+
+        Follows the visual order, so a re-sorted or re-ordered table exports the
+        way it looks.  Numeric cells fall back to the value stashed in
+        UserRole+1 rather than the 2-decimal display text, so precision survives
+        the trip into a spreadsheet.
+        """
+        header = tw_pd.horizontalHeader()
+        cols = [header.logicalIndex(v) for v in range(tw_pd.columnCount())]
+        cols = [c for c in cols if c >= 0 and not tw_pd.isColumnHidden(c)]
+        headers = []
+        for c in cols:
+            item = tw_pd.horizontalHeaderItem(c)
+            headers.append("Bookmarked" if c == 0 else (item.text() if item else ""))
+        if selected_only:
+            row_idx = sorted({ix.row() for ix in
+                              tw_pd.selectionModel().selectedRows()})
+        else:
+            row_idx = list(range(tw_pd.rowCount()))
+        rows = []
+        for r in row_idx:
+            row = []
+            for c in cols:
+                item = tw_pd.item(r, c)
+                if item is None:
+                    row.append("")
+                    continue
+                raw = item.data(QtCore.Qt.UserRole + 1)
+                row.append(str(raw) if isinstance(raw, (int, float))
+                           else item.text())
+            rows.append(row)
+        return headers, rows
+
+    def do_copy(selected_only=False):
+        """Whole table from the button, selected rows from Ctrl+C.
+
+        Kept as two explicit paths rather than one that guesses: the current
+        pose is always selected in the table, so "copy the selection when there
+        is one" would never copy more than a single row.
+        """
+        if tw_pd.rowCount() == 0:
+            lbl_pd.setText("Nothing to copy.")
+            return
+        headers, rows = _table_snapshot(selected_only)
+        if not rows:
+            lbl_pd.setText("No rows selected.")
+            return
+        text = "\n".join(["\t".join(headers)] + ["\t".join(r) for r in rows])
+        try:
+            QtWidgets.QApplication.clipboard().setText(text)
+        except Exception as e:
+            lbl_pd.setText(f"Clipboard unavailable: {e}")
+            return
+        lbl_pd.setText(f"Copied {len(rows)} row(s)"
+                       f"{' (selection)' if selected_only else ''}.")
+
+    def do_export():
+        if tw_pd.rowCount() == 0:
+            lbl_pd.setText("Nothing to export.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            win, "Export pose table", "pose_table.csv",
+            "CSV files (*.csv);;Tab-separated (*.tsv);;All files (*)")
+        if not path:
+            return
+        headers, rows = _table_snapshot(False)
+        delim = "\t" if path.lower().endswith((".tsv", ".txt")) else ","
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh, delimiter=delim)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except OSError as e:
+            lbl_pd.setText(f"Could not write file: {e}")
+            return
+        lbl_pd.setText(f"Exported {len(rows)} row(s) to {os.path.basename(path)}")
+
     def _update_bookmark_col():
         """Refresh ★ column text to reflect current _stepper._bookmarks."""
         for r in range(tw_pd.rowCount()):
@@ -3088,7 +3512,7 @@ def _open_gui():
             if item0 is not None:
                 pi = item0.data(QtCore.Qt.UserRole)
                 if pi is not None:
-                    item0.setText("★" if pi in _stepper._bookmarks else "")
+                    item0.setText("★" if _stepper.is_bookmarked(pi) else "")
 
     def _highlight_current_row():
         """Sync table selection to current single-pose index (no-op in compare mode)."""
@@ -3158,7 +3582,7 @@ def _open_gui():
                 sp.setMaximum(c)
                 sp.setValue(_stepper.current_index + 1)
                 cur = _stepper.current_index
-                b_bm.setText("★ Unbookmark" if cur in _stepper._bookmarks
+                b_bm.setText("★ Unbookmark" if _stepper.is_bookmarked(cur)
                              else "☆ Bookmark")
             else:
                 lbl.setText("Ready - click Setup")
@@ -3293,6 +3717,8 @@ def _open_gui():
         _stepper.sdf_records = []
         _stepper.all_properties = []
         _stepper.computed.clear()
+        _stepper._bookmarks.clear()
+        _stepper._sdf_mismatch = None
         _stepper.ref_ligand = None
         _sel_order.clear()
         ref_combo.blockSignals(True)
@@ -3468,11 +3894,7 @@ def _open_gui():
     cb_zoom.stateChanged.connect(lambda s: setattr(_stepper, "auto_zoom", cb_zoom.isChecked()))
 
     def do_bookmark():
-        cur = _stepper.current_index
-        if cur in _stepper._bookmarks:
-            _stepper._bookmarks.discard(cur)
-        else:
-            _stepper._bookmarks.add(cur)
+        _stepper.toggle_bookmark()
         update_ui()
         _update_bookmark_col()
 
@@ -3521,15 +3943,29 @@ def _open_gui():
                 cmd.hide("labels", sel)
     cb_rlbl.stateChanged.connect(do_toggle_rlbl)
 
+    _disp_saved: dict = {}
+
     def do_disp_group_tog(checked):
-        for cb in (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h, cb_cstype):
+        """Turn every display option off together, then put them back as they were.
+
+        Ticking the group used to switch everything on, which silently enabled
+        nonpolar ligand H even though that defaults to off.
+        """
+        boxes = (cb_lb, cb_surf, cb_rlbl, cb_zoom, cb_lig_h, cb_cstype)
+        if checked:
+            wanted = [_disp_saved.get(cb, cb is not cb_lig_h) for cb in boxes]
+        else:
+            _disp_saved.clear()
+            _disp_saved.update({cb: cb.isChecked() for cb in boxes})
+            wanted = [False] * len(boxes)
+        for cb, want in zip(boxes, wanted):
             cb.blockSignals(True)
-            cb.setChecked(checked)
+            cb.setChecked(want)
             cb.blockSignals(False)
-        _stepper.show_labels = checked
-        _stepper.show_lig_h  = checked
-        _stepper.auto_zoom   = checked
-        _stepper.color_surf_by_type = checked
+        _stepper.show_labels = cb_lb.isChecked()
+        _stepper.show_lig_h  = cb_lig_h.isChecked()
+        _stepper.auto_zoom   = cb_zoom.isChecked()
+        _stepper.color_surf_by_type = cb_cstype.isChecked()
         do_toggle_surf()
         do_toggle_rlbl()
         do_toggle_cstype()
@@ -3559,6 +3995,12 @@ def _open_gui():
             _stepper.show_comparison(_stepper._cmp_indices)
             update_ui()
     cb_cmp_hb.stateChanged.connect(on_cmp_hb)
+
+    b_copy.clicked.connect(lambda: do_copy(False))
+    b_export.clicked.connect(do_export)
+    sc_copy = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+C"), tw_pd)
+    sc_copy.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+    sc_copy.activated.connect(lambda: do_copy(True))
 
     tw_pd.itemSelectionChanged.connect(on_selection_changed)
 
@@ -3759,4 +4201,5 @@ print("  ci_setup   - setup from command line")
 print("  ci_refresh     - sync to current PyMOL state / state slider")
 print("  ci_load_scores - load per-pose properties from SDF file")
 print("  ci_calc        - compute MCS_RMSD / Shape_Sim / Ref_Sim / PLIF_Sim / PB_Flags")
+print("  ci_export      - write the pose table to CSV/TSV")
 print("  LEFT/RIGHT arrow keys after setup")
