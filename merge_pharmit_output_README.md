@@ -51,6 +51,8 @@ token came from:
 | `ZINC_ID` | `ZINC\d+` or bare digits | `ZINC000069514405`, `69514405` → normalized to `ZINC000069514405` |
 | `PubChem_ID` | `PubChem-\d+` | `PubChem-53573646` |
 | `CHEMBL_ID` | `CHEMBL\d+` | `CHEMBL281593` |
+| `CBCS_ID` | `CBK\d+[A-Z]?(_\d+)?` | `CBK041472`, `CBK012257C`, `CBK040808_1` — Chemical Biology Consortium Sweden plate compounds (optional salt-form letter and/or `_N` batch suffix) |
+| `EUOS_ID` | `EOS\d+` | `EOS86639` — EU-OPENSCREEN / European Chemical Biology Library (ECBL) |
 | `MCULE_ID` | `MCULE-\d+` | `MCULE-4125027661` |
 | `MolPort_ID` | `(MolPort\|Molport)-\d{3}-\d{3}-\d{3}` | `MolPort-020-137-979` |
 | `CSC_ID` | `CSC\d+` | `CSC025928578` |
@@ -94,7 +96,7 @@ Vendor cells hold comma-separated IDs when a compound has more than one for that
 
 | Property | Description |
 |---|---|
-| `_Name` | Best available vendor ID for display (priority: CHEMBL > Enamine > ZINC > PubChem > MCULE > MolPort > CSC > ChemDiv > ChemSpace > LabNetwork > NSC > MCULE-Ultimate > other_IDs > InChIKey) |
+| `_Name` | Best available vendor ID for display (priority: CBCS > EUOS > CHEMBL > Enamine > ZINC > PubChem > MCULE > MolPort > CSC > ChemDiv > ChemSpace > LabNetwork > NSC > MCULE-Ultimate > other_IDs > InChIKey) |
 | `Compound_ID` / `Structure_ID` | Same sequential value (`ID_000001`, …), guaranteed unique regardless of vendor ID availability; `Structure_ID` matches `gnina.py --id-column Structure_ID` |
 | `minimizedAffinity`, `minimizedRMSD`, … | Carried through unmodified from the winning pose's original SDF fields |
 | one property per vendor with at least one ID | e.g. `ZINC_ID`, `PubChem_ID`, comma-separated if multiple |

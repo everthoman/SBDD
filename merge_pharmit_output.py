@@ -19,9 +19,10 @@ Each output molecule is assigned a sequential Compound_ID (ID_000001,
 ID_000002, …) that is guaranteed unique regardless of vendor ID availability.
 Structure_ID is set to the same value for compatibility with downstream tools
 such as gnina.py (--id-column Structure_ID). The molecule _Name retains the
-best available vendor ID for display in molecule viewers (priority: CHEMBL >
-Enamine > ZINC > PubChem > MCULE > MolPort > CSC > ChemDiv > ChemSpace >
-LabNetwork > NSC > MCULE-Ultimate > other > InChIKey). MCULE-Ultimate is a
+best available vendor ID for display in molecule viewers (priority: CBCS >
+EU-OPENSCREEN > CHEMBL > Enamine > ZINC > PubChem > MCULE > MolPort > CSC >
+ChemDiv > ChemSpace > LabNetwork > NSC > MCULE-Ultimate > other > InChIKey).
+MCULE-Ultimate is a
 virtual make-on-demand space with no persistent catalog numbers — its
 compounds are addressed by InChIKey, so InChIKey-shaped tokens now get their
 own column instead of being silently discarded as noise.
@@ -82,6 +83,13 @@ VENDOR_PATTERNS = {
     "ZINC_ID":        re.compile(r'^(?:ZINC\d+|\d+)$'),
     "PubChem_ID":     re.compile(r'^PubChem-\d+$'),
     "CHEMBL_ID":      re.compile(r'^CHEMBL\d+$'),
+    # Chemical Biology Consortium Sweden (CBCS) plate compounds. The base
+    # accession may carry a single-letter salt/form code (CBK012257C,
+    # CBK028433T) and/or a "_N" batch suffix (CBK040808_1); all forms of one
+    # accession desalt to the same InChIKey and are unioned into CBCS_ID.
+    "CBCS_ID":        re.compile(r'^CBK\d+[A-Z]?(?:_\d+)?$'),
+    # EU-OPENSCREEN / European Chemical Biology Library (ECBL).
+    "EUOS_ID":        re.compile(r'^EOS\d+$'),
     "MCULE_ID":       re.compile(r'^MCULE-\d+$'),
     "MolPort_ID":     re.compile(r'^(?:MolPort|Molport)-\d{3}-\d{3}-\d{3}$'),
     "CSC_ID":         re.compile(r'^CSC\d+$'),
@@ -94,8 +102,8 @@ VENDOR_PATTERNS = {
     "MCULE-Ultimate_ID": re.compile(r'^[A-Z]{14}-[A-Z]{10}-[A-Z]$'),
 }
 
-NAME_PRIORITY = ["CHEMBL_ID", "Enamine_ID", "ZINC_ID", "PubChem_ID",
-                 "MCULE_ID", "MolPort_ID", "CSC_ID", "ChemDiv_ID",
+NAME_PRIORITY = ["CBCS_ID", "EUOS_ID", "CHEMBL_ID", "Enamine_ID", "ZINC_ID",
+                 "PubChem_ID", "MCULE_ID", "MolPort_ID", "CSC_ID", "ChemDiv_ID",
                  "ChemSpace_ID", "LabNetwork_ID", "NSC_ID", "MCULE-Ultimate_ID"]
 
 
