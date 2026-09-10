@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.1
+PoseViewer - PyMOL Plugin  v1.9.2
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -19,8 +19,8 @@ Installation:
   2. run /path/to/PoseViewer.py   then   ci_gui
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
-Date:    2026-09-09
-Version: 1.9.1
+Date:    2026-09-10
+Version: 1.9.2
 License: MIT
 """
 
@@ -1578,7 +1578,11 @@ class LigandStepper:
         if not self.poses:
             return "none"
         obj, st = self.poses[self.current_index]
-        return f"{obj} state {st}" if cmd.count_states(obj) > 1 else obj
+        base = f"{obj} state {st}" if cmd.count_states(obj) > 1 else obj
+        i = self.current_index
+        name = (self.all_properties[i].get("_name")
+                if 0 <= i < len(self.all_properties) else None)
+        return f"{base}  [{name}]" if name and name != obj else base
 
     def next(self):
         c = self._count()
@@ -1930,7 +1934,8 @@ class LigandStepper:
             result = []
             for obj, st in self.poses:
                 props = _get_pose_properties(obj, st)
-                props.setdefault("_name", obj)
+                if not props.get("_name"):
+                    props["_name"] = _pose_title(obj, st) or obj
                 result.append(props)
             self.all_properties = result
             return
@@ -2096,6 +2101,23 @@ def _get_pose_properties(lig_name: str, state: int) -> dict:
     except Exception:
         pass
     return props
+
+
+def _pose_title(lig_name: str, state: int) -> str:
+    """Per-state molecule title of a loaded object, or "" if none.
+
+    PyMOL loads a multi-record SDF as one object named after the file, but it
+    keeps each record's title line (MOL block line 1) as that state's title.
+    cmd.get_title works in open-source PyMOL, so this is the per-pose name even
+    when no scores SDF has been loaded.  Docking output sometimes repeats one
+    title across every pose of a compound, or leaves it blank — hence "" when
+    the title is empty or just echoes the object name.
+    """
+    try:
+        title = (cmd.get_title(lig_name, state) or "").strip()
+    except Exception:
+        return ""
+    return "" if title == lig_name else title
 
 
 # ---------------------------------------------------------------------------
@@ -4586,7 +4608,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
