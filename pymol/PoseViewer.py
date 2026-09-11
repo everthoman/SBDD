@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.5
+PoseViewer - PyMOL Plugin  v1.9.6
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -2552,8 +2552,19 @@ def run_posebusters(job):
         for col, k in (df[cols] == False).sum().items():  # noqa: E712
             fail_totals[col] = fail_totals.get(col, 0) + int(k)
 
+    # PoseBusters' own _run_parallel_over_poses opens a fresh ProcessPoolExecutor
+    # per bust() call and tears it down when it returns -- it does NOT reuse a
+    # pool across calls. Batching in chunks of 20 (as before) paid that pool
+    # startup/shutdown cost once per chunk instead of once per run, which for
+    # hundreds of poses dwarfed the actual busting time and looked like the job
+    # kept restarting every few seconds. PoseBusters already parallelizes a
+    # single bust() call internally (config chunk_size=100, across max_workers
+    # processes), so batch at that same size here -- far fewer pool spin-ups
+    # than chunks of 20, while still giving the progress bar periodic updates
+    # on a large run. process()'s bisection still isolates a bad molecule
+    # on failure within a batch.
+    batch = 100
     done = 0
-    batch = 20
     for start in range(0, n, batch):
         idx = list(range(start, min(start + batch, n)))
         process(idx)
@@ -4761,7 +4772,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.5"
+__version__ = "1.9.6"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
