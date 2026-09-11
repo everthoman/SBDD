@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.2
+PoseViewer - PyMOL Plugin  v1.9.3
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -3443,6 +3443,80 @@ USAGE
     print(f"PoseViewer: exported {len(rows)} pose(s) x {len(headers)} column(s) "
           f"to '{path}'.")
 
+
+def _export_poses_sdf(path, only_marked=True):
+    """Write poses (bookmarked-only by default) to path as a combined SDF.
+
+    One record per pose, geometry straight from the live PyMOL state (no
+    RDKit needed — same `cmd.get_str("mol", ...)` used to feed the external
+    metrics). Each record's title line becomes its Ligand_ID (SDF-supplied
+    name, per-state SDF title, or the PyMOL object name, in that order) so
+    downstream tools can identify poses by name. Pose-table properties —
+    scores loaded from SDF plus anything ci_calc computed — are carried over
+    as SD tags. Returns the number of poses written.
+    """
+    cols = [c for c in _stepper.table_columns() if c != "_name"]
+    n = 0
+    with open(path, "w") as fh:
+        for i, key in enumerate(_stepper.poses):
+            if only_marked and key not in _stepper._bookmarks:
+                continue
+            obj, st = key
+            try:
+                block = cmd.get_str("mol", f"({obj})", st)
+            except Exception:
+                block = ""
+            if not block:
+                continue
+            props = _stepper.all_properties[i] if i < len(_stepper.all_properties) else {}
+            name = str(props.get("_name") or _pose_title(obj, st) or obj)
+            name = name.replace("\n", " ").strip()
+            nl = block.find("\n")
+            if nl != -1:
+                block = name + block[nl:]
+            fh.write(block if block.endswith("\n") else block + "\n")
+            tags = ([("Pose", obj), ("State", st),
+                     ("Bookmarked", "yes" if key in _stepper._bookmarks else "")] +
+                    [(c, props.get(c, "")) for c in cols])
+            for tag, val in tags:
+                if val in ("", None):
+                    continue
+                fh.write(f"> <{tag}>\n{val}\n\n")
+            fh.write("$$$$\n")
+            n += 1
+    return n
+
+
+def ci_export_sdf(path="", selection="bookmarked"):
+    """Write poses to a combined SDF, one record per pose, titled by Ligand_ID.
+
+USAGE
+    ci_export_sdf /path/to/bookmarks.sdf
+    ci_export_sdf /path/to/all_poses.sdf, all
+
+    Geometry is read straight from the live PyMOL state. Pose-table
+    properties (SDF-loaded scores, ci_calc results) are written as SD tags.
+    Default selection is the bookmarked poses; pass "all" for every pose.
+    """
+    if not path:
+        print("PoseViewer: ci_export_sdf requires a file path.")
+        return
+    if not _stepper.poses:
+        print("PoseViewer: no poses loaded — run ci_setup first.")
+        return
+    only_marked = str(selection).strip().lower() not in ("all", "*")
+    if only_marked and not _stepper._bookmarks:
+        print("PoseViewer: no bookmarks to export "
+              "(pass selection='all' to export every pose).")
+        return
+    try:
+        n = _export_poses_sdf(path, only_marked)
+    except OSError as e:
+        print(f"PoseViewer: could not write '{path}': {e}")
+        return
+    print(f"PoseViewer: exported {n} pose(s) to '{path}'.")
+
+
 def ci_gui():
     _open_gui()
 
@@ -3457,6 +3531,7 @@ cmd.extend("ci_calc", ci_calc)
 cmd.extend("ci_clear", ci_clear)
 cmd.extend("ci_bookmarks", ci_bookmarks)
 cmd.extend("ci_export", ci_export)
+cmd.extend("ci_export_sdf", ci_export_sdf)
 cmd.extend("ci_hbond_angle", ci_hbond_angle)
 cmd.extend("ci_gui", ci_gui)
 
@@ -3569,7 +3644,10 @@ def _open_gui():
     b_bm = QtWidgets.QPushButton("☆ Bookmark")
     b_bm.setFixedWidth(120)
     b_bm_list = QtWidgets.QPushButton("List bookmarks")
-    hl_bm.addWidget(b_bm); hl_bm.addWidget(b_bm_list); hl_bm.addStretch()
+    b_bm_export = QtWidgets.QPushButton("Export bookmarks…")
+    b_bm_export.setToolTip("Write bookmarked poses to a combined SDF (title = Ligand_ID)")
+    hl_bm.addWidget(b_bm); hl_bm.addWidget(b_bm_list); hl_bm.addWidget(b_bm_export)
+    hl_bm.addStretch()
     l_n.addLayout(hl_bm)
     top_l.addWidget(g_n)
 
@@ -4312,6 +4390,22 @@ def _open_gui():
     def do_bm_list():
         ci_bookmarks()
 
+    def do_bm_export():
+        if not _stepper._bookmarks:
+            lbl_pd.setText("No bookmarks to export.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            win, "Export bookmarked poses", "bookmarks.sdf",
+            "SDF files (*.sdf);;All files (*)")
+        if not path:
+            return
+        try:
+            n = _export_poses_sdf(path, only_marked=True)
+        except OSError as e:
+            lbl_pd.setText(f"Could not write file: {e}")
+            return
+        lbl_pd.setText(f"Exported {n} bookmarked pose(s) to {os.path.basename(path)}")
+
     def do_toggle_cstype(state=None):
         _stepper.color_surf_by_type = cb_cstype.isChecked()
         cmb_cs.setEnabled(cb_cstype.isChecked())
@@ -4330,6 +4424,7 @@ def _open_gui():
 
     b_bm.clicked.connect(do_bookmark)
     b_bm_list.clicked.connect(do_bm_list)
+    b_bm_export.clicked.connect(do_bm_export)
 
     g1_en.stateChanged.connect(_group_tog(g1_en, [
         (cb_hb, "show_hbonds"), (cb_xb, "show_halogen"),
@@ -4619,7 +4714,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.2"
+__version__ = "1.9.3"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
@@ -4627,6 +4722,7 @@ print("  ci_refresh     - sync to current PyMOL state / state slider")
 print("  ci_load_scores - load per-pose properties from SDF file")
 print("  ci_calc        - compute MCS_RMSD / Shape_Sim / Ref_Sim / PLIF_Sim / PB_Flags")
 print("  ci_export      - write the pose table to CSV/TSV")
+print("  ci_export_sdf  - write bookmarked (or all) poses to a combined SDF")
 print("  ci_hbond_angle - min D-H...A angle for H-bonds (default "
       f"{HBOND_MIN_DHA_ANGLE:.0f} deg, 0 = off)")
 print("  LEFT/RIGHT arrow keys after setup")
