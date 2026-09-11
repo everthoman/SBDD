@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.6
+PoseViewer - PyMOL Plugin  v1.9.7
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -2593,7 +2593,8 @@ def main():
         json.dump(out, fh)
 
 
-main()
+if __name__ == "__main__":
+    main()
 '''
 
 _EXTERNAL_PYTHON: dict = {}
@@ -4772,7 +4773,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.6"
+__version__ = "1.9.7"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
