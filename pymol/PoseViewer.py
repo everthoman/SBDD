@@ -2600,7 +2600,11 @@ def _candidate_pythons():
     import glob as _glob
     for root in roots:
         if root and os.path.isdir(root):
-            cands += sorted(_glob.glob(os.path.join(root, "*", "bin", "python")))
+            if os.name == "nt":
+                # Windows conda envs put the interpreter directly in the env root.
+                cands += sorted(_glob.glob(os.path.join(root, "*", "python.exe")))
+            else:
+                cands += sorted(_glob.glob(os.path.join(root, "*", "bin", "python")))
     seen, out = set(), []
     for c in cands:
         if c and c not in seen and os.path.exists(c):
@@ -2624,9 +2628,16 @@ def _python_has_modules(python_exe: str, modules) -> bool:
     if key in _HAS_MODULES_CACHE:
         return _HAS_MODULES_CACHE[key]
     import glob as _glob
-    prefix = os.path.dirname(os.path.dirname(python_exe))
-    site_dirs = _glob.glob(os.path.join(prefix, "lib", "python*", "site-packages"))
-    site_dirs += _glob.glob(os.path.join(prefix, "lib", "site-packages"))
+    if os.name == "nt":
+        # Windows conda env: interpreter sits directly in the env root, and
+        # site-packages is "<env>\Lib\site-packages" (unversioned, one level up).
+        prefix = os.path.dirname(python_exe)
+        site_dirs = _glob.glob(os.path.join(prefix, "Lib", "site-packages"))
+        site_dirs += _glob.glob(os.path.join(prefix, "lib", "site-packages"))
+    else:
+        prefix = os.path.dirname(os.path.dirname(python_exe))
+        site_dirs = _glob.glob(os.path.join(prefix, "lib", "python*", "site-packages"))
+        site_dirs += _glob.glob(os.path.join(prefix, "lib", "site-packages"))
     ok = bool(site_dirs)
     for mod in modules if ok else ():
         if not any(os.path.isdir(os.path.join(sd, mod)) or
