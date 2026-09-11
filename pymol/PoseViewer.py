@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.3
+PoseViewer - PyMOL Plugin  v1.9.4
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -2792,13 +2792,20 @@ class _MetricsJob:
     """
 
     def __init__(self, metrics, pose_keys, pose_blocks, ref_block, receptor_path,
-                 workdir):
+                 workdir, precomputed=None):
         self.metrics = [m for m in METRIC_ORDER if m in metrics]
         self.pose_keys = pose_keys
         self.pose_blocks = pose_blocks
         self.ref_block = ref_block
         self.receptor_path = receptor_path
         self.workdir = workdir
+        # Snapshot of _stepper.computed at collection time: {pose_key: {field: val}}.
+        # A field already present here (yes, even "N/A") is skipped — re-running
+        # Calculate after just stepping to a new pose, or adding a metric, must
+        # not re-bust/re-fingerprint poses a previous run already finished.
+        self.precomputed = precomputed if precomputed is not None else {}
+        self._pose_sdf_cache = None  # (todo, path, written) — shared across metrics
+                                      # that happen to need the exact same poses.
         self.results: Dict[tuple, dict] = {}
         self.errors: List[str] = []
         self.notes: List[str] = []
@@ -2846,12 +2853,13 @@ class _MetricsJob:
                 field = METRIC_FIELDS[metric]
                 self._set_message(f"{METRIC_LABELS[metric]}…")
                 try:
-                    values = self._run_metric(metric)
+                    out = self._run_metric(metric)
                 except Exception as e:
                     self.errors.append(f"{field}: {type(e).__name__}: {e}")
-                    values = None
-                if values:
-                    for key, val in zip(self.pose_keys, values):
+                    out = None
+                if out is not None:
+                    keys_out, values = out
+                    for key, val in zip(keys_out, values):
                         self.results.setdefault(key, {})[field] = (
                             "N/A" if val is None else val)
                 self._base += len(self.pose_blocks)
@@ -2868,27 +2876,32 @@ class _MetricsJob:
 
     def _run_rdkit(self, metric):
         """MCS_RMSD / Shape_Sim / Ref_Sim — RDKit only, one pose at a time."""
+        field = METRIC_FIELDS[metric]
+        label = METRIC_LABELS[metric]
+        todo = [i for i, key in enumerate(self.pose_keys)
+                if field not in self.precomputed.get(key, {})]
+        if not todo:
+            self._report(len(self.pose_blocks), f"{label}: cached")
+            return [], []
+
         ref_mol = _mol_from_block(self.ref_block)
         if ref_mol is None:
-            self.errors.append(f"{METRIC_FIELDS[metric]}: could not read reference ligand")
+            self.errors.append(f"{field}: could not read reference ligand")
             return None
         ref_fp = None
         if metric == "ref_sim":
             ref_fp = _morgan_generator().GetFingerprint(_standardize_2d(ref_mol))
         elif not ref_mol.GetNumConformers():
-            self.errors.append(f"{METRIC_FIELDS[metric]}: reference has no 3D coordinates")
+            self.errors.append(f"{field}: reference has no 3D coordinates")
             return None
 
-        values = []
-        label = METRIC_LABELS[metric]
-        for i, block in enumerate(self.pose_blocks):
+        keys_out, values = [], []
+        for n_done, i in enumerate(todo):
             if self.cancelled:
-                # Shorter list than pose_blocks: zip() in run() leaves the
-                # remaining poses untouched rather than marking them N/A.
-                return values
+                break
             val = None
             try:
-                pose_mol = _mol_from_block(block)
+                pose_mol = _mol_from_block(self.pose_blocks[i])
                 if pose_mol is not None:
                     if metric == "mcs_rmsd":
                         val = _calc_mcs_rmsd(ref_mol, pose_mol)
@@ -2898,14 +2911,29 @@ class _MetricsJob:
                         val = _calc_ref_sim(ref_fp, pose_mol)
             except Exception:
                 val = None
+            keys_out.append(self.pose_keys[i])
             values.append(None if val is None else round(float(val), 4))
-            if i % 5 == 0 or i == len(self.pose_blocks) - 1:
-                self._report(i + 1, f"{label}: {i + 1}/{len(self.pose_blocks)}")
-        return values
+            if n_done % 5 == 0 or n_done == len(todo) - 1:
+                self._report(n_done + 1, f"{label}: {n_done + 1}/{len(todo)}")
+        return keys_out, values
 
     def _run_external(self, metric):
-        """PLIF_Sim / PB_Flags — subprocess under an interpreter that has the deps."""
+        """PLIF_Sim / PB_Flags — subprocess under an interpreter that has the deps.
+
+        Poses whose field is already in self.precomputed are skipped, so a
+        second Calculate on an unchanged set — the common case of stepping to
+        a new pose then re-clicking — costs nothing instead of re-busting or
+        re-fingerprinting every pose again.
+        """
         field = METRIC_FIELDS[metric]
+        label = METRIC_LABELS[metric]
+        todo = [i for i, key in enumerate(self.pose_keys)
+                if field not in self.precomputed.get(key, {})]
+        skipped = len(self.pose_blocks) - len(todo)
+        if not todo:
+            self._report(len(self.pose_blocks), f"{label}: cached")
+            return [], []
+
         candidates = _external_python_candidates(metric)
         if not candidates:
             self.errors.append(
@@ -2917,17 +2945,16 @@ class _MetricsJob:
             self.errors.append(f"{field}: no receptor available")
             return None
 
-        # Write sanitized (H-bearing) SDFs once and reuse for both external
-        # metrics: the worker then needs no bond/valence fixing of its own.
-        poses_sdf = os.path.join(self.workdir, "poses.sdf")
-        index_path = os.path.join(self.workdir, "poses_index.json")
-        if os.path.exists(poses_sdf):
-            with open(index_path) as fh:
-                written = json.load(fh)
+        # Write sanitized (H-bearing) SDFs once and reuse across external
+        # metrics that happen to need the exact same poses (the common case:
+        # both freshly requested on a set with nothing cached yet).
+        cache = self._pose_sdf_cache
+        if cache is not None and cache[0] == todo:
+            poses_sdf, written = cache[1], cache[2]
         else:
-            written = self._write_pose_sdf(poses_sdf)
-            with open(index_path, "w") as fh:
-                json.dump(written, fh)
+            poses_sdf = os.path.join(self.workdir, f"poses_{field}.sdf")
+            written = self._write_pose_sdf(poses_sdf, todo)
+            self._pose_sdf_cache = (todo, poses_sdf, written)
         if not written:
             self.errors.append(f"{field}: no poses could be prepared for {field}")
             return None
@@ -2939,9 +2966,9 @@ class _MetricsJob:
                 return None
 
         n = len(written)
+        note = f" ({skipped} cached)" if skipped else ""
         report = (lambda done: self._report(
-            min(done, len(self.pose_blocks)),
-            f"{METRIC_LABELS[metric]}: {done}/{n}"))
+            min(done, len(self.pose_blocks)), f"{label}: {done}/{n}{note}"))
 
         # The filesystem check only says a package is present; if that
         # interpreter cannot actually import it, move on to the next candidate.
@@ -2962,22 +2989,30 @@ class _MetricsJob:
         if summary:
             self.notes.append(f"{field} most common failures — {summary}")
 
-        # Map worker results (SDF record order) back onto pose order.
-        out = [None] * len(self.pose_blocks)
-        for rec_i, pose_i in enumerate(written):
+        # Map worker results (SDF record order) back onto todo order.
+        out = [None] * len(todo)
+        for rec_i, local_i in enumerate(written):
             if rec_i < len(values):
-                out[pose_i] = values[rec_i]
-        return out
+                out[local_i] = values[rec_i]
+        self._report(len(self.pose_blocks), f"{label}: done{note}")
+        return [self.pose_keys[i] for i in todo], out
 
-    def _write_pose_sdf(self, path):
-        """Write sanitized poses (Hs added) to path; returns pose indices written."""
+    def _write_pose_sdf(self, path, indices=None):
+        """Write sanitized poses (Hs added) at `indices` (default: all) to path.
+
+        Returns positions within `indices` (0-based, write order) that
+        succeeded — i.e. SDF record order maps back to a pose via
+        indices[returned_position]. Bond-order/valence fixing all happens
+        here so the worker needs none of its own.
+        """
         Chem = _RDKIT["Chem"]
+        idx_list = list(range(len(self.pose_blocks))) if indices is None else indices
         written = []
         with open(path, "w") as fh:
-            for i, block in enumerate(self.pose_blocks):
+            for pos, i in enumerate(idx_list):
                 if self.cancelled:
                     break
-                mol = _mol_from_block(block, keep_hs=True)
+                mol = _mol_from_block(self.pose_blocks[i], keep_hs=True)
                 if mol is None:
                     continue
                 if not mol.GetPropsAsDict().get("_Name", "").strip():
@@ -2989,7 +3024,7 @@ class _MetricsJob:
                     fh.write(Chem.MolToMolBlock(mol) + "\n$$$$\n")
                 except Exception:
                     continue
-                written.append(i)
+                written.append(pos)
         return written
 
     def _write_ref_sdf(self, path):
@@ -3059,8 +3094,12 @@ def _collect_metric_inputs(metrics):
         pose_keys.append((obj, state))
         pose_blocks.append(block)
 
+    # Snapshot already-computed fields so the job can skip poses that don't
+    # need (re)computing — see _MetricsJob.precomputed.
+    precomputed = {key: dict(_stepper.computed.get(key, {})) for key in pose_keys}
+
     return _MetricsJob(metrics, pose_keys, pose_blocks, ref_block, receptor_path,
-                       workdir)
+                       workdir, precomputed)
 
 
 # ---------------------------------------------------------------------------
@@ -4714,7 +4753,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.3"
+__version__ = "1.9.4"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
