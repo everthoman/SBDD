@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.4
+PoseViewer - PyMOL Plugin  v1.9.5
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -2489,7 +2489,15 @@ def run_plif(job):
         fp = prolif.Fingerprint()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            fp.run_from_iterable([ref_lig] + ligs, protein, progress=False)
+            try:
+                # Explicit over relying on n_jobs=None's default: that only
+                # started meaning "use every core" as of prolif 2.1.0 (older
+                # versions ran serial unless told otherwise) -- see PoseBusters'
+                # analogous max_workers=None above.
+                fp.run_from_iterable([ref_lig] + ligs, protein, progress=False,
+                                      n_jobs=os.cpu_count() or None)
+            except TypeError:
+                fp.run_from_iterable([ref_lig] + ligs, protein, progress=False)
         bvs = fp.to_bitvectors()
         for i, bv in zip(valid, bvs[1:]):
             values[i] = round(DataStructs.TanimotoSimilarity(bvs[0], bv), 4)
@@ -4753,7 +4761,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.4"
+__version__ = "1.9.5"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
