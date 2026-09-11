@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.7
+PoseViewer - PyMOL Plugin  v1.9.8
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -2694,7 +2694,13 @@ def _looks_like_missing_module(error: str) -> bool:
 def _kill_child(proc, hard=False):
     """Terminate proc and anything it spawned (PoseBusters starts its own pool).
 
-    Falls back to killing just the child where process groups do not exist.
+    proc.terminate()/.kill() only signal the one process we hold a handle to --
+    on POSIX the pool workers are reaped too because start_new_session puts the
+    whole tree in one process group that os.killpg can target, but Windows has
+    no process-group equivalent here, so terminate()/kill() alone would leave
+    PoseBusters' ProcessPoolExecutor workers running as orphans, each still
+    holding a CPU core. taskkill /T walks the process tree by parent PID and
+    kills it in one shot -- the actual fix for that on Windows.
     """
     try:
         if os.name == "posix" and hasattr(os, "killpg"):
@@ -2703,6 +2709,13 @@ def _kill_child(proc, hard=False):
             return
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=10)
+            return
+        except Exception:
+            pass
     try:
         proc.kill() if hard else proc.terminate()
     except Exception:
@@ -4773,7 +4786,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.7"
+__version__ = "1.9.8"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
