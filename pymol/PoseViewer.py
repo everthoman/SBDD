@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.8
+PoseViewer - PyMOL Plugin  v1.9.9
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -3268,10 +3268,34 @@ EXAMPLES
                         (multi_ligs if cmd.count_states(n) > 1 else single_ligs).append(n)
                 except CmdException:
                     pass
-            # Multi-state objects are docking poses; single-state are ref-lig candidates
+            # Multi-state objects are docking poses.  Single-state ligand
+            # objects mixed in are ambiguous: they could be genuine poses
+            # that happen to have only one state each — e.g. an SDF where
+            # duplicate-titled entries collapse into extra states of one
+            # object while uniquely-titled entries stay single-state, so a
+            # 20-pose file can load as some multi-state + some single-state
+            # objects, all still poses — or a separate reference ligand.
+            # If a scores SDF is loaded, use name matching (as in the
+            # all-single-state branch below) to tell the two apart.
             if multi_ligs:
-                ligs = multi_ligs
-                ref_lig = single_ligs[0] if single_ligs else None
+                if single_ligs and _stepper.sdf_records:
+                    import re as _re
+                    sdf_names = {_re.sub(r'[^\w]', '_', r.get("_name", ""))
+                                 for r in _stepper.sdf_records if r.get("_name")}
+                    matched   = [n for n in single_ligs if n in sdf_names]
+                    unmatched = [n for n in single_ligs if n not in sdf_names]
+                    ligs    = multi_ligs + matched
+                    ref_lig = unmatched[0] if len(unmatched) == 1 else None
+                elif len(single_ligs) <= 1:
+                    ligs    = multi_ligs
+                    ref_lig = single_ligs[0] if single_ligs else None
+                else:
+                    # No SDF to disambiguate and more than one single-state
+                    # object: can't tell which (if any) is the reference, so
+                    # keep them all as poses rather than silently dropping
+                    # all but one.
+                    ligs    = multi_ligs + single_ligs
+                    ref_lig = None
             else:
                 # All single-state: if a scores SDF is loaded, use its molecule
                 # names to separate pose ligands (appear in SDF) from ref candidates
@@ -4786,7 +4810,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.8"
+__version__ = "1.9.9"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
