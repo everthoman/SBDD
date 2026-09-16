@@ -1,4 +1,4 @@
-# PoseViewer v1.10
+# PoseViewer v1.10.1
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -23,7 +23,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Docking poses mode**: explicit toggle that gates H-bond compare — avoids meaningless cross-pocket H-bond overlays when browsing extracted ligands from a multi-ligand crystal structure
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
 - Pose data table: sortable, clickable table of docking scores and SD properties per pose
-- **Computed pose metrics**: MCS RMSD, 3D shape similarity, 2D similarity, PLIF similarity and PoseBusters flags are calculated from what is loaded in the session, so they are available even when the docking program never wrote them into the SDF
+- **Computed pose metrics**: MCS RMSD, 3D shape similarity, 2D similarity, molecular weight, cLogP, PLIF similarity and PoseBusters flags are calculated from what is loaded in the session, so they are available even when the docking program never wrote them into the SDF (requires RDKit)
 - Qt GUI panel with collapsible groups and per-type interaction toggles
 - Interaction summary printed to the PyMOL console on every step
 
@@ -272,6 +272,12 @@ Docking output usually carries only the program's own score (`minimizedAffinity`
 already loaded in the session — the poses, the reference ligand and the receptor —
 so no re-docking or external post-processing pass is needed. Results are added to the
 Pose Data table as ordinary sortable columns.
+
+**All of these metrics require RDKit** in the interpreter running PyMOL — including
+`MolWt` and `cLogP`, which need nothing else. Without it, Calculate reports "RDKit not
+available in this PyMOL" and the whole group is a no-op; the rest of the plugin
+(interaction detection, stepping, the pose table) works normally. `PLIF_Sim` and
+`PB_Flags` need `prolif`/`posebusters` on top of RDKit — see [Dependencies](#dependencies).
 
 Field names match those written by the GNINA webapp, so a computed value and one read
 from the SDF are interchangeable; computing a metric overrides the SDF value for that

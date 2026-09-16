@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.10
+PoseViewer - PyMOL Plugin  v1.10.1
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-10
-Version: 1.10
+Version: 1.10.1
 License: MIT
 """
 
@@ -3895,6 +3895,13 @@ def _open_gui():
     # Calculate — metrics derived from the session instead of read from the SDF
     g_calc, _calc_en, _gcb, l_calc = _section("Calculate", expanded=False,
                                               show_enable=False)
+    lbl_calc_reqs = QtWidgets.QLabel(
+        "Requires RDKit in this PyMOL's interpreter. PLIF similarity and "
+        "PoseBusters also need prolif/posebusters, usually run in a "
+        "separate Python (see README).")
+    lbl_calc_reqs.setWordWrap(True)
+    lbl_calc_reqs.setStyleSheet("color: gray; font-style: italic;")
+    l_calc.addWidget(lbl_calc_reqs)
     cb_metrics = {}
     for _key in METRIC_ORDER:
         _cb_m = QtWidgets.QCheckBox(METRIC_LABELS[_key])
@@ -4850,7 +4857,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.10"
+__version__ = "1.10.1"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
