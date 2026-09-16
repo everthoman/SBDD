@@ -1,4 +1,4 @@
-# PoseViewer v1.9.9
+# PoseViewer v1.10
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -144,7 +144,7 @@ ci_setup
 ci_setup protein=chain A, ligands=LIG1,LIG2,LIG3
 ci_setup protein=polymer.protein, ligands=poses, mode=states
 ci_load_scores /path/to/gnina_output.sdf
-ci_calc                         # MCS_RMSD, Shape_Sim, Ref_Sim
+ci_calc                         # MCS_RMSD, Shape_Sim, Ref_Sim, MolWt, cLogP
 ci_calc all
 ci_calc mcs_rmsd,plif_sim
 ci_export /path/to/poses.csv
@@ -233,7 +233,7 @@ the current setup.
 
 | Control | Description |
 |---|---|
-| Metric checkboxes | MCS RMSD, shape similarity, 2D similarity are on by default; PLIF similarity and PoseBusters flags are opt-in (slower, and they need a second interpreter) |
+| Metric checkboxes | MCS RMSD, shape similarity, 2D similarity, molecular weight and cLogP are on by default; PLIF similarity and PoseBusters flags are opt-in (slower, and they need a second interpreter) |
 | Calculate | Exports poses/reference/receptor, then runs the selected metrics on a background thread. Only computes poses missing a value for each metric — re-clicking after stepping to a new pose doesn't redo the whole session, and a cached `N/A` from a prior failure isn't retried either. **Clear** resets the cache; changing the reference ligand forces recomputation of reference-based metrics. |
 | Cancel | Stops the run; metrics already finished are kept. Also tears down PoseBusters'/ProLIF's own worker-pool processes underneath the tracked subprocess (`taskkill /T /F` on Windows, process-group kill on POSIX), not just the one subprocess handle |
 | Progress bar / status | Per-metric progress, then a per-field count of how many poses got a value. Errors are shown here and printed to the console |
@@ -268,7 +268,7 @@ The Display group enable checkbox hides all display elements at once (surface, l
 ## Pose metrics
 
 Docking output usually carries only the program's own score (`minimizedAffinity`,
-`CNNscore`, ...). PoseViewer can compute five further per-pose metrics from what is
+`CNNscore`, ...). PoseViewer can compute seven further per-pose metrics from what is
 already loaded in the session — the poses, the reference ligand and the receptor —
 so no re-docking or external post-processing pass is needed. Results are added to the
 Pose Data table as ordinary sortable columns.
@@ -282,6 +282,8 @@ column.
 | `MCS_RMSD` | Heavy-atom RMSD over the maximum common substructure with the reference | reference | Symmetry-aware (all MCS matchings tried, best kept). **No superposition** — poses and reference already share the receptor frame, so this measures pose deviation, not conformer difference |
 | `Shape_Sim` | 3D shape Tanimoto vs the reference (1 = identical) | reference | Computed on the poses as placed, again without alignment, so it measures overlap with the reference in the site |
 | `Ref_Sim` | 2D Morgan ECFP4 (r=2, 2048 bit) Tanimoto vs the reference | reference | Both molecules are neutralized and tautomer-canonicalized first, so a different protomer/tautomer of the same compound scores 1.0 |
+| `MolWt` | Molecular weight (Da) | — | Plain RDKit descriptor of the pose itself; implicit hydrogens are counted via RDKit's valence model even though poses are compared as heavy atoms internally |
+| `cLogP` | Calculated LogP (Crippen atom contributions) | — | Same, no reference or receptor needed |
 | `PLIF_Sim` | ProLIF interaction-fingerprint Tanimoto vs the reference | reference + receptor + `prolif` | Reference and all poses run through one `Fingerprint` instance so the bitvectors stay comparable |
 | `PB_Flags` | Number of failed PoseBusters checks (0 = all pass) | receptor + `posebusters` | `dock` config: ligand internal geometry plus intermolecular checks against the receptor |
 
@@ -295,17 +297,18 @@ dropped automatically when you pick a different reference ligand.
 **Command line** — `ci_calc`, which blocks and prints progress:
 
 ```
-ci_calc                      # MCS_RMSD, Shape_Sim, Ref_Sim (the default set)
+ci_calc                      # MCS_RMSD, Shape_Sim, Ref_Sim, MolWt, cLogP (the default set)
 ci_calc all                  # adds PLIF_Sim and PB_Flags
 ci_calc mcs_rmsd,plif_sim    # or: MCS_RMSD,PLIF_Sim — field names work too
+ci_calc molwt,clogp
 ```
 
 An open GUI picks up `ci_calc` results on its next sync tick (within ~0.5 s).
 
 ### Dependencies
 
-`MCS_RMSD`, `Shape_Sim` and `Ref_Sim` need only **RDKit** in the interpreter running
-PyMOL, and run in-process.
+`MCS_RMSD`, `Shape_Sim`, `Ref_Sim`, `MolWt` and `cLogP` need only **RDKit** in the
+interpreter running PyMOL, and run in-process.
 
 `PLIF_Sim` and `PB_Flags` need `prolif` + `MDAnalysis` and `posebusters` respectively,
 which PyMOL's own environment rarely has. PoseViewer therefore runs them in a
@@ -339,10 +342,11 @@ when the job ends.
 
 ### Cost
 
-Per pose, roughly: `Ref_Sim` and `Shape_Sim` are milliseconds, `MCS_RMSD` tens of
-milliseconds, `PLIF_Sim` is one batched run of a few seconds plus the receptor parse,
-and `PB_Flags` is by far the most expensive (order of a second per pose, parallelized
-inside the worker). Tick PoseBusters only for a shortlist, not a full docking run.
+Per pose, roughly: `MolWt` and `cLogP` are sub-millisecond, `Ref_Sim` and `Shape_Sim`
+are milliseconds, `MCS_RMSD` tens of milliseconds, `PLIF_Sim` is one batched run of a
+few seconds plus the receptor parse, and `PB_Flags` is by far the most expensive (order
+of a second per pose, parallelized inside the worker). Tick PoseBusters only for a
+shortlist, not a full docking run.
 
 ### Caveats
 

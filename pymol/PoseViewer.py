@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.9.9
+PoseViewer - PyMOL Plugin  v1.10
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
 detects and visualizes all major non-covalent interactions, with ligand
@@ -20,7 +20,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-10
-Version: 1.9.2
+Version: 1.10
 License: MIT
 """
 
@@ -2127,17 +2127,20 @@ def _pose_title(lig_name: str, state: int) -> str:
 # in the PyMOL session, so they are available even when the docking program did
 # not write them into the SDF.  Field names match those written by the GNINA
 # webapp (MCS_RMSD, Shape_Sim, Ref_Sim, PLIF_Sim, PB_Flags) so computed and
-# SDF-supplied values are interchangeable in the Pose Data table.
+# SDF-supplied values are interchangeable in the Pose Data table. MolWt/cLogP
+# are plain RDKit descriptors of the pose itself and need no reference.
 #
-# MCS_RMSD / Shape_Sim / Ref_Sim need only RDKit and run in a background thread.
-# PLIF_Sim / PB_Flags need prolif / posebusters, which PyMOL's own interpreter
-# rarely has, so they run in a subprocess under an interpreter that does (see
-# _external_python_candidates).
+# MCS_RMSD / Shape_Sim / Ref_Sim / MolWt / cLogP need only RDKit and run in a
+# background thread. PLIF_Sim / PB_Flags need prolif / posebusters, which
+# PyMOL's own interpreter rarely has, so they run in a subprocess under an
+# interpreter that does (see _external_python_candidates).
 
 METRIC_FIELDS = {
     "mcs_rmsd":    "MCS_RMSD",
     "shape_sim":   "Shape_Sim",
     "ref_sim":     "Ref_Sim",
+    "molwt":       "MolWt",
+    "clogp":       "cLogP",
     "plif_sim":    "PLIF_Sim",
     "posebusters": "PB_Flags",
 }
@@ -2146,11 +2149,14 @@ METRIC_LABELS = {
     "mcs_rmsd":    "MCS RMSD vs reference (Å)",
     "shape_sim":   "Shape similarity vs reference (3D)",
     "ref_sim":     "2D similarity vs reference (ECFP4)",
+    "molwt":       "Molecular weight (Da)",
+    "clogp":       "Calculated LogP (Crippen)",
     "plif_sim":    "PLIF similarity vs reference",
     "posebusters": "PoseBusters flags (failed checks)",
 }
 
-METRIC_ORDER = ("mcs_rmsd", "shape_sim", "ref_sim", "plif_sim", "posebusters")
+METRIC_ORDER = ("mcs_rmsd", "shape_sim", "ref_sim", "molwt", "clogp",
+                "plif_sim", "posebusters")
 
 # Metrics compared against the reference ligand — dropped when the reference changes.
 REF_METRICS = ("mcs_rmsd", "shape_sim", "ref_sim", "plif_sim")
@@ -2177,13 +2183,14 @@ def _load_rdkit() -> bool:
         return bool(_RDKIT.get("ok"))
     try:
         from rdkit import Chem, DataStructs, RDLogger
-        from rdkit.Chem import rdFMCS, rdShapeHelpers, rdFingerprintGenerator
+        from rdkit.Chem import rdFMCS, rdShapeHelpers, rdFingerprintGenerator, Descriptors
         from rdkit.Chem.MolStandardize import rdMolStandardize
         RDLogger.DisableLog("rdApp.*")
         _RDKIT.update(ok=True, Chem=Chem, DataStructs=DataStructs, rdFMCS=rdFMCS,
                       rdShapeHelpers=rdShapeHelpers,
                       rdFingerprintGenerator=rdFingerprintGenerator,
-                      rdMolStandardize=rdMolStandardize)
+                      rdMolStandardize=rdMolStandardize,
+                      Descriptors=Descriptors)
     except Exception as e:
         _RDKIT.update(ok=False, error=f"{type(e).__name__}: {e}")
     return bool(_RDKIT.get("ok"))
@@ -2394,6 +2401,16 @@ def _calc_ref_sim(ref_fp, pose_mol):
     """Morgan ECFP4 Tanimoto to the reference, on standardized 2D structures."""
     fp = _morgan_generator().GetFingerprint(_standardize_2d(pose_mol))
     return _RDKIT["DataStructs"].TanimotoSimilarity(ref_fp, fp)
+
+
+def _calc_molwt(pose_mol):
+    """Molecular weight (Da), implicit Hs included via RDKit's valence model."""
+    return _RDKIT["Descriptors"].MolWt(pose_mol)
+
+
+def _calc_clogp(pose_mol):
+    """Crippen calculated LogP."""
+    return _RDKIT["Descriptors"].MolLogP(pose_mol)
 
 
 # --- External worker (prolif / posebusters) ---------------------------------
@@ -2908,7 +2925,7 @@ class _MetricsJob:
         return self._run_rdkit(metric)
 
     def _run_rdkit(self, metric):
-        """MCS_RMSD / Shape_Sim / Ref_Sim — RDKit only, one pose at a time."""
+        """MCS_RMSD / Shape_Sim / Ref_Sim / MolWt / cLogP — RDKit only, one pose at a time."""
         field = METRIC_FIELDS[metric]
         label = METRIC_LABELS[metric]
         todo = [i for i, key in enumerate(self.pose_keys)
@@ -2917,16 +2934,17 @@ class _MetricsJob:
             self._report(len(self.pose_blocks), f"{label}: cached")
             return [], []
 
-        ref_mol = _mol_from_block(self.ref_block)
-        if ref_mol is None:
-            self.errors.append(f"{field}: could not read reference ligand")
-            return None
-        ref_fp = None
-        if metric == "ref_sim":
-            ref_fp = _morgan_generator().GetFingerprint(_standardize_2d(ref_mol))
-        elif not ref_mol.GetNumConformers():
-            self.errors.append(f"{field}: reference has no 3D coordinates")
-            return None
+        ref_mol = ref_fp = None
+        if metric in REF_METRICS:
+            ref_mol = _mol_from_block(self.ref_block)
+            if ref_mol is None:
+                self.errors.append(f"{field}: could not read reference ligand")
+                return None
+            if metric == "ref_sim":
+                ref_fp = _morgan_generator().GetFingerprint(_standardize_2d(ref_mol))
+            elif not ref_mol.GetNumConformers():
+                self.errors.append(f"{field}: reference has no 3D coordinates")
+                return None
 
         keys_out, values = [], []
         for n_done, i in enumerate(todo):
@@ -2940,8 +2958,12 @@ class _MetricsJob:
                         val = _calc_mcs_rmsd(ref_mol, pose_mol)
                     elif metric == "shape_sim":
                         val = _calc_shape_sim(ref_mol, pose_mol)
-                    else:
+                    elif metric == "ref_sim":
                         val = _calc_ref_sim(ref_fp, pose_mol)
+                    elif metric == "molwt":
+                        val = _calc_molwt(pose_mol)
+                    else:
+                        val = _calc_clogp(pose_mol)
             except Exception:
                 val = None
             keys_out.append(self.pose_keys[i])
@@ -3089,18 +3111,30 @@ def _collect_metric_inputs(metrics):
     if not _stepper.poses:
         raise RuntimeError("No poses loaded — click Setup first.")
 
+    # Metrics that need no reference at all (MolWt, cLogP) should still run
+    # even when the batch also includes reference-based ones and no reference
+    # is selected — only bail out here if every requested metric needs one;
+    # otherwise leave ref_block empty and let each reference-based metric
+    # report its own "could not read reference ligand" error individually.
     needs_ref = any(m in REF_METRICS for m in metrics)
+    ref_only = needs_ref and all(m in REF_METRICS for m in metrics)
     ref_block = ""
     if needs_ref:
         ref = _stepper.ref_ligand
-        if not ref:
-            raise RuntimeError("Select a reference ligand first.")
         try:
+            if not ref:
+                raise RuntimeError("Select a reference ligand first.")
             ref_block = cmd.get_str("mol", f"({ref})", 1)
+            if not ref_block:
+                raise RuntimeError(f"Reference '{ref}' has no atoms.")
+        except RuntimeError:
+            if ref_only:
+                raise
+            ref_block = ""
         except Exception as e:
-            raise RuntimeError(f"Could not export reference '{ref}': {e}")
-        if not ref_block:
-            raise RuntimeError(f"Reference '{ref}' has no atoms.")
+            if ref_only:
+                raise RuntimeError(f"Could not export reference '{ref}': {e}")
+            ref_block = ""
 
     workdir = tempfile.mkdtemp(prefix="poseviewer_metrics_")
     receptor_path = ""
@@ -3390,24 +3424,30 @@ USAGE
     _stepper.sdf_records = _parse_sdf_records(path)
     print(f"PoseViewer: loaded {len(_stepper.sdf_records)} score records from '{path}'.")
 
-def ci_calc(metrics="", quiet=0):
+def ci_calc(*metrics, quiet=0, **_kw):
     """Compute pose metrics for the current setup, blocking until done.
 
 USAGE
-    ci_calc                          # MCS_RMSD, Shape_Sim, Ref_Sim
+    ci_calc                          # MCS_RMSD, Shape_Sim, Ref_Sim, MolWt, cLogP
     ci_calc all
     ci_calc mcs_rmsd,plif_sim
 
-    Names: mcs_rmsd, shape_sim, ref_sim, plif_sim, posebusters (or the field
-    names MCS_RMSD, Shape_Sim, Ref_Sim, PLIF_Sim, PB_Flags).  Reference-based
-    metrics need a reference ligand (ci_setup picks one up automatically, or
-    set _stepper.ref_ligand / choose one in the GUI).
+    Names: mcs_rmsd, shape_sim, ref_sim, molwt, clogp, plif_sim, posebusters
+    (or the field names MCS_RMSD, Shape_Sim, Ref_Sim, MolWt, cLogP, PLIF_Sim,
+    PB_Flags).  Reference-based metrics need a reference ligand (ci_setup
+    picks one up automatically, or set _stepper.ref_ligand / choose one in
+    the GUI); MolWt and cLogP are plain descriptors of the pose itself and
+    need neither a reference nor a receptor.
+
+    Variadic on purpose: typed at the PyMOL prompt, a bare comma splits into
+    separate positional arguments rather than staying inside one string, so
+    `ci_calc mcs_rmsd,plif_sim` arrives here as two args, not one.
     """
     import time
     by_field = {v.lower(): k for k, v in METRIC_FIELDS.items()}
-    text = str(metrics).replace(",", " ").split()
+    text = ",".join(str(m) for m in metrics).replace(",", " ").split()
     if not text:
-        wanted = ["mcs_rmsd", "shape_sim", "ref_sim"]
+        wanted = ["mcs_rmsd", "shape_sim", "ref_sim", "molwt", "clogp"]
     elif len(text) == 1 and text[0].lower() == "all":
         wanted = list(METRIC_ORDER)
     else:
@@ -4810,13 +4850,13 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.9.9"
+__version__ = "1.10"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
 print("  ci_refresh     - sync to current PyMOL state / state slider")
 print("  ci_load_scores - load per-pose properties from SDF file")
-print("  ci_calc        - compute MCS_RMSD / Shape_Sim / Ref_Sim / PLIF_Sim / PB_Flags")
+print("  ci_calc        - compute MCS_RMSD / Shape_Sim / Ref_Sim / MolWt / cLogP / PLIF_Sim / PB_Flags")
 print("  ci_export      - write the pose table to CSV/TSV")
 print("  ci_export_sdf  - write bookmarked (or all) poses to a combined SDF")
 print("  ci_hbond_angle - min D-H...A angle for H-bonds (default "
