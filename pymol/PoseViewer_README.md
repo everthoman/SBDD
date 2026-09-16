@@ -1,4 +1,4 @@
-# PoseViewer v1.9.1
+# PoseViewer v1.9.9
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -18,6 +18,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Water-mediated H-bonds**: bridging crystal waters between ligand and protein are detected and drawn as two-segment dashes
 - **Pose bookmarking**: mark interesting poses with ★ from the GUI; bookmarks are tied to the pose itself, so they stay put when objects are added, deleted or renumbered, and are visible in the pose table
 - **Table export**: copy the pose table to the clipboard or write it to CSV/TSV, from the GUI or via `ci_export`
+- **SDF export**: write bookmarked (or all) poses back out to a combined SDF — geometry from the live PyMOL state, titled by `Ligand_ID`, with loaded scores and `ci_calc` results carried over as SD tags — from the GUI or via `ci_export_sdf`
 - **Protein selector**: the Protein field is a dropdown listing all loaded protein objects, enabling quick switching between multiple structures in the same session
 - **Docking poses mode**: explicit toggle that gates H-bond compare — avoids meaningless cross-pocket H-bond overlays when browsing extracted ligands from a multi-ligand crystal structure
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
@@ -124,6 +125,7 @@ ci_gui
 | `ci_calc [metrics]` | Compute pose metrics (see [Pose metrics](#pose-metrics)) |
 | `ci_bookmarks` | List all bookmarked poses to the console |
 | `ci_export <path> [, bookmarked]` | Write the pose table (SD properties plus computed metrics) to CSV; a `.tsv`/`.txt` extension switches to tab-separated |
+| `ci_export_sdf <path> [, all]` | Write poses to a combined SDF, one record per pose, titled by `Ligand_ID`; default is bookmarked poses only, pass `all` for every pose |
 | `ci_hbond_angle [degrees]` | Show or set the minimum D–H···A angle for H-bonds (default 130°, 0 = off) |
 | `ci_clear` | Remove all PoseViewer objects |
 
@@ -147,6 +149,8 @@ ci_calc all
 ci_calc mcs_rmsd,plif_sim
 ci_export /path/to/poses.csv
 ci_export /path/to/marked.tsv, bookmarked
+ci_export_sdf /path/to/bookmarks.sdf
+ci_export_sdf /path/to/all_poses.sdf, all
 ci_hbond_angle 145              # stricter H-bond geometry
 ci_hbond_angle 0                # off: show whatever PyMOL reports
 ```
@@ -186,6 +190,9 @@ If no separate ligand objects are detected (e.g. a PDB loaded as a single object
 | Go to # | Jump to pose by 1-based number (exits compare mode) |
 | Docking poses | Marks the session as a docking run. Auto-checked when multi-state objects are detected; must be ticked manually for single-pose-per-ligand docking sessions. Gates the H-bonds in compare mode checkbox. |
 | H-bonds in compare mode | When checked, H-bond dashes are drawn during compare mode, colored to match each pose. Only available when **Docking poses** is checked (not meaningful when each ligand sits in a different pocket). |
+| ☆ Bookmark | Toggles the bookmark star on the current pose |
+| List bookmarks | Prints all bookmarked poses to the console (same as `ci_bookmarks`) |
+| Export bookmarks… | Writes bookmarked poses to a combined SDF, titled by `Ligand_ID`, with loaded scores and `ci_calc` results as SD tags (same as `ci_export_sdf`) |
 
 ### Reference ligand group
 
@@ -227,8 +234,8 @@ the current setup.
 | Control | Description |
 |---|---|
 | Metric checkboxes | MCS RMSD, shape similarity, 2D similarity are on by default; PLIF similarity and PoseBusters flags are opt-in (slower, and they need a second interpreter) |
-| Calculate | Exports poses/reference/receptor, then runs the selected metrics on a background thread |
-| Cancel | Stops the run; metrics already finished are kept |
+| Calculate | Exports poses/reference/receptor, then runs the selected metrics on a background thread. Only computes poses missing a value for each metric — re-clicking after stepping to a new pose doesn't redo the whole session, and a cached `N/A` from a prior failure isn't retried either. **Clear** resets the cache; changing the reference ligand forces recomputation of reference-based metrics. |
+| Cancel | Stops the run; metrics already finished are kept. Also tears down PoseBusters'/ProLIF's own worker-pool processes underneath the tracked subprocess (`taskkill /T /F` on Windows, process-group kill on POSIX), not just the one subprocess handle |
 | Progress bar / status | Per-metric progress, then a per-field count of how many poses got a value. Errors are shown here and printed to the console |
 
 ### Interaction groups (Non-covalent bonds / Pi interactions / Contacts/Clashes)
