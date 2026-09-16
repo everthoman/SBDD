@@ -1,25 +1,31 @@
 """
 PoseViewer - PyMOL Plugin  v1.10.1
 ==============================
-Maestro-inspired protein-ligand interaction viewer for PyMOL. Automatically
-detects and visualizes all major non-covalent interactions, with ligand
-stepping for docking pose review.
+Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
+for multi-pose docking review and multi-ligand structure browsing.
 
 H-bonds use PyMOL's built-in polar contact detection (cmd.distance mode=2)
-which correctly handles donor/acceptor chemistry. All other interaction
-types are detected geometrically.
+which correctly handles donor/acceptor chemistry, then are vetted on
+D-H...A geometry. All other interaction types are detected geometrically.
 
 Interaction categories:
-  Non-covalent bonds:  H-bonds, halogen bonds, salt bridges, aromatic H-bonds
+  Non-covalent bonds:  H-bonds, halogen bonds, salt bridges, aromatic H-bonds,
+                       water-mediated H-bonds
   Pi interactions:     Pi-pi stacking (face-to-face & edge-to-face), pi-cation
   Contacts/Clashes:    Good, bad, ugly  (off by default)
+
+Also: auto-split of multi-ligand PDBs into per-ligand objects, compare mode
+(overlay any two poses), charge-colored pocket surface, pose bookmarking,
+CSV/TSV and SDF export, and computed pose metrics (MCS RMSD, shape/2D/PLIF
+similarity, PoseBusters flags, MolWt, cLogP) when the docking program didn't
+write them into the SDF. See PoseViewer_README.md for the full feature list.
 
 Installation:
   1. Plugin > Plugin Manager > Install New Plugin > choose this file, or
   2. run /path/to/PoseViewer.py   then   ci_gui
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
-Date:    2026-09-10
+Date:    2026-09-16
 Version: 1.10.1
 License: MIT
 """
