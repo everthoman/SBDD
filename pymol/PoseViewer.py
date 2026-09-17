@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.11.2
+PoseViewer - PyMOL Plugin  v1.11.3
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -27,7 +27,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-17
-Version: 1.11.2
+Version: 1.11.3
 License: MIT
 """
 
@@ -53,6 +53,19 @@ except ImportError:
     np = None
 
 from pymol import cmd, CmdException
+
+# Rendering globals a .pse can silently overwrite on load (they're saved into
+# the session file along with everything else), captured here at import time —
+# i.e. as PyMOL itself set them up for this machine, including anything an rc
+# file forced for a specific GPU/driver — so _prepare_scene() can restore
+# them after a .pse clobbers them instead of imposing PyMOL's factory
+# defaults, which are not necessarily correct on every machine (e.g.
+# transparency_mode 2 renders surfaces opaque instead of alpha-blending on at
+# least one known NVIDIA driver, where the user's .pymolrc.py forces mode 1).
+_BASELINE_RENDER_SETTINGS = {
+    name: cmd.get(name)
+    for name in ("transparency_mode", "two_sided_lighting", "cache_display")
+}
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -1215,19 +1228,19 @@ def _prepare_scene(protein_sel, ligand_sels):
         # creates while stepping triggers a zoom-to-fit, so the camera lurches
         # toward each pose — the "zooms on the ligand every step" complaint.
         cmd.set("auto_zoom", 0)
-        # transparency_mode is a global setting saved inside .pse files: loading a
-        # complex as a .pse (rather than fresh PDB+SDF) can silently import a
-        # transparency_mode of 0 from whenever that file was saved, which disables
-        # real-time GL transparency session-wide and makes the pocket surface
-        # opaque even though its per-object `transparency` is still set correctly.
-        cmd.set("transparency_mode", 2)
-        # Two more rendering globals a .pse can carry away from a fresh
-        # session's defaults (observed diverging between a .pse load and a
-        # PDB+SDF load of the same complex): two_sided_lighting pinned on
-        # instead of left on "auto", and cache_display switched off. Neither is
-        # under PoseViewer's control otherwise, so put both back.
-        cmd.set("two_sided_lighting", -1)
-        cmd.set("cache_display", 1)
+        # transparency_mode, two_sided_lighting and cache_display are global
+        # settings saved inside .pse files: loading a complex as a .pse
+        # (rather than fresh PDB+SDF) can silently import whatever values were
+        # in effect when that file was saved, clobbering what this machine's
+        # PyMOL was actually configured with — e.g. a driver-specific rc file
+        # forcing transparency_mode to 1 because mode 2 (PyMOL's own default)
+        # renders surfaces opaque instead of alpha-blending on that GPU.
+        # Restore the values this session started with, not a hardcoded
+        # "default" — imposing PyMOL's factory default here reintroduces
+        # exactly the rendering bug a machine-specific override exists to
+        # avoid.
+        for _name, _val in _BASELINE_RENDER_SETTINGS.items():
+            cmd.set(_name, _val)
         cmd.hide("surface")   # remove any pre-existing surfaces before adding ours
 
         # A .pse can carry pre-existing distance/measurement objects (e.g. a
@@ -4954,7 +4967,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.11.2"
+__version__ = "1.11.3"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
