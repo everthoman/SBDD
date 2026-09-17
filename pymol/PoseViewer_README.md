@@ -1,4 +1,4 @@
-# PoseViewer v1.10.1
+# PoseViewer v1.11
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -47,6 +47,8 @@ H-bonds are found by PyMOL's `cmd.distance(mode=2)` polar contact detection, the
 **The angle filter.** PyMOL's `h_bond_max_angle` (default 63°) is measured *at the donor heavy atom* — between the D–H bond and the D···A vector — not on the D–H···A angle that gets quoted in papers. A 63° cone at the donor admits D–H···A angles down to about 100°, i.e. a perfect-looking donor–acceptor distance with the hydrogen pointing somewhere else entirely. PoseViewer therefore measures the angle at the proton and drops anything below **`hbond_min_angle`, 130° by default** (`ci_hbond_angle`, or the spin box beside the Hydrogen bonds checkbox; 0 disables it). The summary reports each surviving H-bond's angle and says how many were filtered out.
 
 A real example, a uracil fragment in UNG2: the ring N–H sits 2.91 Å from a backbone carbonyl O — textbook distance — but at a D–H···A angle of 102°, so the proton is not pointing at the acceptor at all. PyMOL draws it because the angle at the donor is 58°, inside its 63° default. The filter removes it; the two genuine H-bonds in that site (144° and 169°) are untouched.
+
+**The carbonyl acceptor angle.** The D–H···A filter above only checks that the *donor's* proton points at the acceptor — it says nothing about whether the acceptor itself is geometrically able to receive it there. A carbonyl oxygen is sp2: its two lone pairs sit in the carbonyl plane, each about 120° off the C=O bond. A hydrogen approaching from directly opposite the carbon — extending the C=O axis straight through the oxygen, base-atom···O···H near 180° — looks perfectly linear and can pass the D–H···A check easily, but that direction sits exactly between both lone pairs, the worst angle either one can offer. PoseViewer checks this separately: for an O acceptor with exactly one heavy neighbor at double-bond distance (a carbonyl or carboxylate C=O, not an ether/ester single-bonded O), it requires the base-atom···O···H angle to fall within 85–160°. This threshold is fixed, not exposed as a setting, and contacts it removes are counted separately in the summary.
 
 **This needs explicit hydrogens.** A contact with no hydrogen on either endpoint has nothing to measure, and is passed through unfiltered rather than guessed at — so the filter does its work on protonated or MD-minimised structures and stays out of the way on a bare PDB from the RCSB. (Before v1.6 the summary used a separate proximity rule — any N/O/S/F pair within 3.5 Å — which counted acceptor–acceptor pairs such as two carbonyl oxygens as H-bonds and could also miss ones PyMOL drew.) All other interaction types are detected geometrically.
 
@@ -388,7 +390,7 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 
 | Interaction | Criterion |
 |---|---|
-| H-bonds (dashes and console listing) | PyMOL polar contacts `cmd.distance(mode=2)`, then D–H···A ≥ `hbond_min_angle` (130° default) wherever an explicit hydrogen exists |
+| H-bonds (dashes and console listing) | PyMOL polar contacts `cmd.distance(mode=2)`, then D–H···A ≥ `hbond_min_angle` (130° default) wherever an explicit hydrogen exists, and for carbonyl/carboxylate O acceptors, base-atom···O···H within 85–160° |
 | Halogen bonds | Cl/Br/I donor ··· O/N/S acceptor, ≤ 3.5 Å |
 | Salt bridges | Cationic ligand N ··· Asp/Glu O, or Arg/Lys/His N ··· anionic ligand O, ≤ 4.0 Å. Ligand charges come from the file when it has them, otherwise inferred (see above) |
 | Aromatic H-bonds | Aromatic C ··· O/N/S acceptor, ≤ 3.5 Å, C-H···A angle > 120° |
