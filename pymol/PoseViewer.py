@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.11
+PoseViewer - PyMOL Plugin  v1.11.1
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -26,8 +26,8 @@ Installation:
   2. run /path/to/PoseViewer.py   then   ci_gui
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
-Date:    2026-09-16
-Version: 1.11
+Date:    2026-09-17
+Version: 1.11.1
 License: MIT
 """
 
@@ -1215,6 +1215,12 @@ def _prepare_scene(protein_sel, ligand_sels):
         # creates while stepping triggers a zoom-to-fit, so the camera lurches
         # toward each pose — the "zooms on the ligand every step" complaint.
         cmd.set("auto_zoom", 0)
+        # transparency_mode is a global setting saved inside .pse files: loading a
+        # complex as a .pse (rather than fresh PDB+SDF) can silently import a
+        # transparency_mode of 0 from whenever that file was saved, which disables
+        # real-time GL transparency session-wide and makes the pocket surface
+        # opaque even though its per-object `transparency` is still set correctly.
+        cmd.set("transparency_mode", 2)
         cmd.hide("surface")   # remove any pre-existing surfaces before adding ours
         cmd.show("cartoon", protein_sel)
         _color_rainbow_elem(protein_sel)
@@ -4924,7 +4930,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.11"
+__version__ = "1.11.1"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
