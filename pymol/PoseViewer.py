@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.11.1
+PoseViewer - PyMOL Plugin  v1.11.2
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -27,7 +27,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-17
-Version: 1.11.1
+Version: 1.11.2
 License: MIT
 """
 
@@ -1221,7 +1221,31 @@ def _prepare_scene(protein_sel, ligand_sels):
         # real-time GL transparency session-wide and makes the pocket surface
         # opaque even though its per-object `transparency` is still set correctly.
         cmd.set("transparency_mode", 2)
+        # Two more rendering globals a .pse can carry away from a fresh
+        # session's defaults (observed diverging between a .pse load and a
+        # PDB+SDF load of the same complex): two_sided_lighting pinned on
+        # instead of left on "auto", and cache_display switched off. Neither is
+        # under PoseViewer's control otherwise, so put both back.
+        cmd.set("two_sided_lighting", -1)
+        cmd.set("cache_display", 1)
         cmd.hide("surface")   # remove any pre-existing surfaces before adding ours
+
+        # A .pse can carry pre-existing distance/measurement objects (e.g. a
+        # "polar_contacts" object left over from whatever tool or session built
+        # it) that a fresh PDB+SDF load never has. Setup never sees these as
+        # ligand/protein candidates, so they just sit there rendered on top of
+        # PoseViewer's own scene — frozen at whatever coordinates existed when
+        # they were made, which can predate later editing/minimization and so
+        # no longer land on the current structure, making an old dash look like
+        # it ends in mid-air. Purge anything of that type we didn't create.
+        for n in cmd.get_names("objects"):
+            if n in _created_objects:
+                continue
+            try:
+                if cmd.get_type(n) == "object:measurement":
+                    cmd.delete(n)
+            except Exception:
+                pass
         cmd.show("cartoon", protein_sel)
         _color_rainbow_elem(protein_sel)
 
@@ -4930,7 +4954,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.11.1"
+__version__ = "1.11.2"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
