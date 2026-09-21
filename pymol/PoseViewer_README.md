@@ -1,4 +1,4 @@
-# PoseViewer v1.13
+# PoseViewer v1.15
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -91,11 +91,14 @@ ci_gui
 
 ### Docking poses (multi-state object)
 
-1. Load your protein and docking output into PyMOL
+1. Load your protein (and any reference ligand) into PyMOL
 2. Open the GUI: `ci_gui`
-3. Fill in protein/ligand fields and click **Setup**
+3. Put your poses SDF path in **Poses (SDF)** and click **Load poses** — this loads the file as one multi-state object and reads its SD tags for the score table in a single step, then runs Setup for you. Any SD-tag properties in the file end up as columns — docking score, ligand efficiency, a custom rank, whatever your pipeline wrote — there's nothing tool-specific about it.
 4. Step through poses with **Prev / Next** or the Go-to spinner
-5. Optionally load a scores SDF to display docking properties per pose
+
+Use **Poses (SDF)** / **Load poses** (or the equivalent `ci_load_poses` command) rather than opening the poses file yourself first. PyMOL's own File-Open/drag-and-drop splits a multi-record SDF into one object per record whenever titles aren't repeated across poses (common when poses come from different compounds, not just different poses of one), which defeats states mode and makes a same-shaped reference ligand indistinguishable from the poses themselves. `ci_load_poses` sidesteps both problems by forcing a single multi-state object and loading the scores at the same time — so the scores just need to already be SD tags in that same poses file.
+
+If you already have pose geometry loaded some other way (e.g. from an external tool) and just want its SD-tag scores added to the table, run `ci_load_scores <path>` before Setup.
 
 ### Multi-ligand PDB (e.g. crystal structure with cofactors)
 
@@ -117,12 +120,13 @@ ci_gui
 |---|---|
 | `ci_gui` | Open the GUI panel |
 | `ci_setup [protein [, ligands [, mode]]]` | Setup from command line |
+| `ci_load_poses <path> [, protein]` | Load a poses SDF's geometry (as one multi-state object) and SD scores together, then run Setup |
 | `ci_next` | Step to next pose |
 | `ci_prev` | Step to previous pose |
 | `ci_goto <index>` | Jump to pose by 0-based index |
 | `ci_update` | Re-detect interactions for current pose |
 | `ci_refresh` | Sync panel to current PyMOL state |
-| `ci_load_scores <path>` | Load per-pose SD properties from an SDF file |
+| `ci_load_scores <path>` | Load per-pose SD properties from an SDF file (scores only — use `ci_load_poses` if you also need the geometry loaded) |
 | `ci_bookmarks` | List all bookmarked poses to the console |
 | `ci_export <path> [, bookmarked]` | Write the pose table (SD properties) to CSV; a `.tsv`/`.txt` extension switches to tab-separated |
 | `ci_export_sdf <path> [, all]` | Write poses to a combined SDF, one record per pose, titled by `Ligand_ID`; default is bookmarked poses only, pass `all` for every pose |
@@ -143,7 +147,8 @@ ci_gui
 ci_setup
 ci_setup protein=chain A, ligands=LIG1,LIG2,LIG3
 ci_setup protein=polymer.protein, ligands=poses, mode=states
-ci_load_scores /path/to/gnina_output.sdf
+ci_load_poses /path/to/poses.sdf
+ci_load_scores /path/to/poses.sdf
 ci_export /path/to/poses.csv
 ci_export /path/to/marked.tsv, bookmarked
 ci_export_sdf /path/to/bookmarks.sdf
@@ -176,7 +181,7 @@ If no separate ligand objects are detected (e.g. a PDB loaded as a single object
 |---|---|
 | Protein | Editable dropdown listing all loaded objects that contain protein atoms, plus the default `polymer.protein`. Refreshes automatically when objects are added or removed. Custom selection strings can be typed directly. |
 | Ligand(s) | Object name(s) or selection (comma-separated for objects mode) |
-| Scores (SDF) | Optional path to an SDF file with per-pose SD data tags (e.g. GNINA output). Browse button available. Scores are read directly from the file since open-source PyMOL does not preserve SDF properties on load. |
+| Poses (SDF) + **Load poses** | Path to a poses SDF. **Load poses** loads it as one multi-state object (regardless of whether pose titles repeat) and reads any SD-tag properties in it — docking score, ligand efficiency, a custom rank, from any tool — into the score table, then runs Setup. This is the only supported way to bring in a poses file; there's no separate scores-file step. Browse button available. |
 
 ### Navigate group
 
@@ -205,11 +210,11 @@ Reference ligand interaction lines respect the same **Show distance labels** tog
 
 ### Pose Data group
 
-Sortable table showing SD data tag properties for all poses (e.g. `minimizedAffinity`, `CNNscore` from GNINA). Column headers are movable. Rank columns are excluded.
+Sortable table showing any SD data tag properties present in the poses SDF — docking score, ligand efficiency, a custom rank, whatever the file carries, from any tool. Column headers are movable. Rank columns are excluded.
 
-**Where the columns come from.** Only Incentive PyMOL reads SD tags off a loaded SDF automatically; open-source PyMOL discards them at load. Everywhere else you must point the **Scores (SDF)** field at the poses file (or run `ci_load_scores`) *before* pressing Setup, otherwise the table shows only the `Ligand_ID` column and none of the docking scores. Setup prints a note to the console when it ends up in that state.
+**Where the columns come from.** Only Incentive PyMOL reads SD tags off a loaded SDF automatically; open-source PyMOL discards them at load. Everywhere else, load the poses via **Poses (SDF)** / **Load poses** (or `ci_load_poses`) so the same file's SD tags get read alongside the geometry — otherwise the table shows only the `Ligand_ID` column and none of the scores. Setup prints a note to the console when it ends up in that state.
 
-The `Ligand_ID` column is always populated with the real per-pose name: PyMOL loads a multi-record SDF as one object named after the file, but it keeps each record's title line per state, and PoseViewer reads it back with `cmd.get_title`. Loading the Scores (SDF) is only needed for the score columns. (A few docking tools write the same title on every pose of a compound, or leave it blank — then `Ligand_ID` falls back to the object name.)
+The `Ligand_ID` column is always populated with the real per-pose name: PyMOL loads a multi-record SDF as one object named after the file, but it keeps each record's title line per state, and PoseViewer reads it back with `cmd.get_title`. (A few docking tools write the same title on every pose of a compound, or leave it blank — then `Ligand_ID` falls back to the object name.)
 
 **Single-click** a row to navigate to that pose. **Ctrl-click** (or click a second row) to enter compare mode — the two most recently selected rows are shown simultaneously. A third selection automatically drops the oldest, maintaining a rolling window of two. Clicking Prev/Next or Go exits compare mode and resumes single-pose navigation.
 
@@ -291,8 +296,8 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 - Requires PyMOL with Qt support (PyMOL 2.x+)
 - No third-party Python packages are required — the plugin depends only on the standard library and `pymol` itself, so it works on any PyMOL install, not just conda/pip-managed ones
 - `numpy` is optional. It is used only for the best-fit-plane SVD in the aromatic ring planarity test, which falls back to Newell's method without it. The per-pair geometry is deliberately scalar Python — numpy's per-call overhead dominates on 3-vectors and made pose stepping about twice as slow
-- **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no scores file needed, leave the Scores field blank
-- **Open-source PyMOL**: SDF data *tags* are stripped on load, so scores must be loaded from the original SDF file via the Scores field or `ci_load_scores`. The per-record *title* line is kept, though — `Ligand_ID` shows the real per-pose name without a scores file
+- **Incentive PyMOL**: SDF data fields are preserved on load and read automatically via `get_property_list` / `get_property` — no separate scores loading needed
+- **Open-source PyMOL**: SDF data *tags* are stripped on load, so scores must be read from the original SDF file via **Load poses** (or `ci_load_poses` / `ci_load_scores`). The per-record *title* line is kept regardless — `Ligand_ID` shows the real per-pose name even without any scores loaded
 - The shell shows residues within 5 Å of the current ligand as lines with CA labels. The pocket surface is a carved patch of the real protein molecular surface: the solvent-excluded surface is computed on a wider residue shell (surface reach + 3 Å) for correct geometry, then trimmed to the wall within the **surface reach** distance of the ligand (7.5 Å default, adjustable in the Display group) — so it hugs the binding site rather than closing over into a blob around whole side chains. In objects mode shell and surface update per ligand step; in states mode they are computed once at setup, around the first pose
 - **Large pose sets** are fine: Setup on a 1600-pose SDF takes well under a second, and stepping is ~20 ms per pose. Every distance-based selection is evaluated against a single-state copy of the current pose and pinned to state 1, because PyMOL's default evaluates `within` once per state in the session — 0.001 s at one state, 0.13 s at 800 — which is what used to make PyMOL appear to hang on a full docking run. A corollary: the shell and surface follow the pose on screen rather than the union of every pose
 - Duplicate interactions caused by alternate conformations (altloc atoms) in PDB structures are automatically removed by spatial deduplication

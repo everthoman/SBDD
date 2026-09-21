@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.13
+PoseViewer - PyMOL Plugin  v1.15
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -24,8 +24,8 @@ Installation:
   2. run /path/to/PoseViewer.py   then   ci_gui
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
-Date:    2026-09-18
-Version: 1.13
+Date:    2026-09-21
+Version: 1.15
 License: MIT
 """
 
@@ -1554,7 +1554,7 @@ class LigandStepper:
         self.zoom_buffer: float = ZOOM_BUFFER
         # How far the pocket surface reaches around the ligand (Display group).
         self.surf_dist: float = SURF_CARVE_DIST
-        self.sdf_records: list = []   # populated by ci_load_scores / GUI browse
+        self.sdf_records: list = []   # populated by ci_load_poses / ci_load_scores
         self.all_properties: list = []  # one dict per pose, built at setup time
         self.poses: list = []          # [(obj_name, state_1based), ...]
         self.ref_ligand: Optional[str] = None
@@ -2390,16 +2390,17 @@ def _warn_if_no_scores():
     """Say why the Pose Data table is bare, instead of leaving it a mystery.
 
     SD tags are read straight off a loaded SDF only by Incentive PyMOL; anywhere
-    else the Scores field (or ci_load_scores) is what fills the table.
+    else ci_load_poses (or ci_load_scores) is what fills the table.
     """
     if _stepper.sdf_records or not _stepper.all_properties:
         return
     if any(set(props) - {"_name"} for props in _stepper.all_properties):
         return
     print("PoseViewer: no per-pose score columns found. SD data is read from a "
-          "loaded SDF only by Incentive PyMOL — otherwise point the "
-          "Scores (SDF) field at the poses file (or run ci_load_scores <path>) "
-          "and press Setup again.")
+          "loaded SDF only by Incentive PyMOL — otherwise use Poses (SDF) / "
+          "Load poses (or ci_load_poses / ci_load_scores <path>) to load the "
+          "poses SDF that carries your SD-tag scores, whatever docking or "
+          "scoring tool wrote them.")
 
 
 def _print_summary():
@@ -2432,6 +2433,41 @@ USAGE
         return
     _stepper.sdf_records = _parse_sdf_records(path)
     print(f"PoseViewer: loaded {len(_stepper.sdf_records)} score records from '{path}'.")
+
+def ci_load_poses(path="", protein="polymer.protein"):
+    """Load a poses SDF's geometry and per-pose SD scores together, then Setup.
+
+    USAGE
+        ci_load_poses /path/to/poses.sdf [, protein]
+
+    Loads every record into ONE multi-state object (multiplex=0) regardless of
+    whether titles repeat or are unique per pose. Letting PyMOL's own loader
+    decide (its default splits a uniquely-titled multi-record SDF into one
+    object per record) defeats the states-mode stepper and, without a scores
+    SDF also loaded for name-matching, makes a same-shaped reference ligand
+    indistinguishable from the poses themselves. Reads the same file's SD
+    tags into the score table so scores can never drift out of sync with the
+    geometry, then runs ci_setup automatically.
+    """
+    if not path:
+        print("PoseViewer: ci_load_poses requires a file path.")
+        return
+    import re as _re
+    obj = _re.sub(r'[^\w]', '_', os.path.splitext(os.path.basename(path))[0]) or "poses"
+    if obj in cmd.get_names("objects"):
+        try:
+            cmd.delete(obj)
+        except Exception:
+            pass
+    try:
+        cmd.load(path, obj, multiplex=0)
+    except CmdException as e:
+        print(f"PoseViewer: could not load '{path}': {e}")
+        return
+    _stepper.sdf_records = _parse_sdf_records(path)
+    print(f"PoseViewer: loaded {cmd.count_states(obj)} pose(s) and "
+          f"{len(_stepper.sdf_records)} score record(s) from '{path}'.")
+    ci_setup(protein=protein, ligands=obj, mode="states")
 
 def ci_hbond_angle(degrees=""):
     """Show or set the minimum D-H...A angle for H-bonds.
@@ -2674,13 +2710,14 @@ def _open_gui():
     e_lig = QtWidgets.QLineEdit("organic")
     l_s.addWidget(e_lig, 1, 1)
 
-    l_s.addWidget(QtWidgets.QLabel("Scores (SDF):"), 2, 0)
-    hl_sf = QtWidgets.QHBoxLayout()
-    e_scores = QtWidgets.QLineEdit()
-    e_scores.setPlaceholderText("optional")
-    b_browse = QtWidgets.QPushButton("…"); b_browse.setFixedWidth(26)
-    hl_sf.addWidget(e_scores); hl_sf.addWidget(b_browse)
-    l_s.addLayout(hl_sf, 2, 1)
+    l_s.addWidget(QtWidgets.QLabel("Poses (SDF):"), 2, 0)
+    hl_pf = QtWidgets.QHBoxLayout()
+    e_poses = QtWidgets.QLineEdit()
+    e_poses.setPlaceholderText("geometry + any SD-tag scores, then Setup")
+    b_browse_poses = QtWidgets.QPushButton("…"); b_browse_poses.setFixedWidth(26)
+    b_load_poses = QtWidgets.QPushButton("Load poses")
+    hl_pf.addWidget(e_poses); hl_pf.addWidget(b_browse_poses); hl_pf.addWidget(b_load_poses)
+    l_s.addLayout(hl_pf, 2, 1)
 
     hl_b = QtWidgets.QHBoxLayout()
     b_setup = QtWidgets.QPushButton("Setup")
@@ -3135,12 +3172,23 @@ def _open_gui():
         except RuntimeError:
             pass  # Qt widget deleted (window closed while callback was in flight)
 
-    def do_browse():
+    def do_browse_poses():
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            win, "Select scores SDF", "",
+            win, "Select poses SDF", "",
             "SDF files (*.sdf *.SDF);;All files (*)")
         if path:
-            e_scores.setText(path)
+            e_poses.setText(path)
+
+    def do_load_poses():
+        path = e_poses.text().strip()
+        if not path:
+            return
+        ci_load_poses(path, protein=e_prot.currentText())
+        _populate_prot_combo()
+        _populate_ref_combo()
+        _update_cmp_hb_ui()
+        update_ui()
+        rebuild_table()
 
     def _populate_prot_combo():
         """Refill the protein combo with objects that contain protein atoms."""
@@ -3203,11 +3251,6 @@ def _open_gui():
             _stepper.show_cmp_hbonds = False
 
     def do_setup():
-        sf = e_scores.text().strip()
-        if sf:
-            ci_load_scores(sf)
-        else:
-            _stepper.sdf_records = []
         ci_setup(protein=e_prot.currentText(), ligands=e_lig.text(), mode="auto")
         _populate_prot_combo()
         _populate_ref_combo()
@@ -3323,7 +3366,8 @@ def _open_gui():
             ci_update(); update_ui()
         return h
 
-    b_browse.clicked.connect(do_browse)
+    b_browse_poses.clicked.connect(do_browse_poses)
+    b_load_poses.clicked.connect(do_load_poses)
     b_setup.clicked.connect(do_setup)
     b_clear.clicked.connect(do_clear)
     ref_combo.currentTextChanged.connect(on_ref_changed)
@@ -3676,10 +3720,11 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.13"
+__version__ = "1.15"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
+print("  ci_load_poses  - load a poses SDF's geometry + scores together, then Setup")
 print("  ci_refresh     - sync to current PyMOL state / state slider")
 print("  ci_load_scores - load per-pose properties from SDF file")
 print("  ci_export      - write the pose table to CSV/TSV")
