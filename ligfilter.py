@@ -41,6 +41,7 @@ Written by Claude Sonnet 4.6, 2026-02-27
 """
 
 import argparse
+import csv
 import math
 import os
 import statistics
@@ -130,26 +131,18 @@ _HEADER_KEYWORDS = {'smiles', 'smi', 'smile', 'mol', 'structure',
 def _split_smiles_line(line: str) -> List[str]:
     """Split a SMILES-file line into stripped fields.
 
-    Splits on tab when present (multi-column TSV); otherwise on commas while
-    treating '|...|' CXSMILES enhanced-stereo blocks as a single token so
-    embedded commas (e.g. '|&1:3,7,r|') survive into the SMILES field.
+    Splits on tab when present (multi-column TSV); otherwise parses as a
+    single RFC4180 CSV record.  CSV writers quote a whole field (with `"`)
+    whenever it contains a comma — which a CXSMILES enhanced-stereo layer
+    like '|&1:3,7,r|' always does — so proper CSV dequoting is required to
+    recover the bare SMILES instead of a comma-split fragment wrapped in
+    literal quote characters.
     """
     if '\t' in line:
         return [p.strip() for p in line.split('\t')]
     if ',' not in line:
         return [line.strip()]
-    parts, buf, in_cx = [], [], False
-    for ch in line:
-        if ch == '|':
-            in_cx = not in_cx
-            buf.append(ch)
-        elif ch == ',' and not in_cx:
-            parts.append(''.join(buf).strip())
-            buf = []
-        else:
-            buf.append(ch)
-    parts.append(''.join(buf).strip())
-    return parts
+    return [p.strip() for p in next(csv.reader([line]))]
 
 
 def _detect_smiles_col(path: Path) -> int:
