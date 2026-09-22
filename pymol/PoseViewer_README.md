@@ -100,6 +100,8 @@ Use **Poses (SDF)** / **Load poses** (or the equivalent `ci_load_poses` command)
 
 If you already have pose geometry loaded some other way (e.g. from an external tool) and just want its SD-tag scores added to the table, run `ci_load_scores <path>` before Setup.
 
+If there's no scores file at all (pure geometry, e.g. a session someone else built and shared for visual inspection) and the poses loaded as one separate object per compound, Setup can only tell a reference ligand apart from the poses by its object name: `reference_ligand`, `ref_ligand`, `reference`, `ref_lig`, `ref`, `crystal_ligand`, `crystal_lig`, `native_ligand` and `co_crystal_ligand` are recognized. Anything else loaded that way is indistinguishable from the poses and Setup keeps it in the pose list — rename the object or pick it from the **Object dropdown** in the Reference ligand group afterward.
+
 ### Multi-ligand PDB (e.g. crystal structure with cofactors)
 
 1. Load the PDB: `load 5VDH.pdb`

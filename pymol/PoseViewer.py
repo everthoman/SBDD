@@ -186,6 +186,14 @@ _INTERACTION_NAMES = {
 
 _AUTOSPLIT_PREFIX = "obj"
 
+# Object-name aliases recognised as "the reference ligand" when no scores SDF
+# is available to disambiguate poses from a reference by name-matching (see
+# ci_setup's all-single-state branch). Lower-cased, matched exactly.
+_REF_LIGAND_NAME_HINTS = {
+    "reference_ligand", "ref_ligand", "reference", "ref_lig", "ref",
+    "crystal_ligand", "crystal_lig", "native_ligand", "co_crystal_ligand",
+}
+
 def _track(name):
     _created_objects.add(name)
 
@@ -2170,12 +2178,19 @@ def _pose_title(lig_name: str, state: int) -> str:
     when no scores SDF has been loaded.  Docking output sometimes repeats one
     title across every pose of a compound, or leaves it blank — hence "" when
     the title is empty or just echoes the object name.
+
+    Some upstream tools (OpenBabel among them) stamp a molecule's title with
+    its *source file path* when the record itself has no name — e.g. a
+    reference ligand pushed through a "/tmp/tmpXXXXXX/ligand.pdb" prep step.
+    That is never a meaningful pose label, so it is rejected here too.
     """
     try:
         title = (cmd.get_title(lig_name, state) or "").strip()
     except Exception:
         return ""
-    return "" if title == lig_name else title
+    if title == lig_name or "/" in title or "\\" in title:
+        return ""
+    return title
 
 
 # ---------------------------------------------------------------------------
@@ -2358,8 +2373,20 @@ EXAMPLES
                         ligs    = single_ligs
                         ref_lig = None
                 else:
-                    ligs    = single_ligs
-                    ref_lig = None
+                    # No scores to match by name — fall back to a small set of
+                    # well-known reference-ligand aliases (e.g. gnina's web app
+                    # always names its co-crystal/reference object
+                    # "reference_ligand"), so geometry-only sessions with no
+                    # SD-tag data still separate a reference from the poses
+                    # instead of dumping everything into one pose list.
+                    hinted = [n for n in single_ligs
+                              if n.lower() in _REF_LIGAND_NAME_HINTS]
+                    if len(hinted) == 1 and len(single_ligs) > 1:
+                        ligs    = [n for n in single_ligs if n != hinted[0]]
+                        ref_lig = hinted[0]
+                    else:
+                        ligs    = single_ligs
+                        ref_lig = None
             if not ligs:
                 # If protein is a named object, scope the split to that object
                 # only — otherwise "organic" spans all loaded structures.
