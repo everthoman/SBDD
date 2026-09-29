@@ -1,4 +1,4 @@
-# FpocketViewer v1.0
+# FpocketViewer v1.1
 
 A PyMOL plugin for fpocket-based binding-site detection and pocket exploration.
 
@@ -17,6 +17,7 @@ A PyMOL plugin for fpocket-based binding-site detection and pocket exploration.
 - **Toggle surface** — creates/removes a transparent surface of the protein residues lining the selected pocket (4.5 Å shell around alpha spheres)
 - **Lining residues** — lists all protein residues within 4.5 Å of the selected pocket's alpha spheres
 - Selecting a pocket in the table automatically highlights it and dims the others in the 3D view
+- **Export / Copy** — write the pocket table to CSV or TSV, or copy it to the clipboard as tab-separated text
 - Optional fpocket detection parameter overrides (min/max α-sphere radius, min spheres per pocket, cluster distance)
 - WSL support for Windows hosts
 
@@ -92,6 +93,10 @@ Each row is one fpocket pocket. Columns are sortable and reorderable.
 - **Zoom to pocket** — flies the camera to the selected pocket with a 4 Å buffer.
 - **Toggle surface** — creates a transparent coloured surface of the protein residues lining the pocket; click again to remove it.
 - **Show all / Hide all** — enable or disable all pocket sphere objects at once.
+- **Copy** (or Ctrl+C with the table focused) — puts the whole table on the clipboard as tab-separated text, ready to paste into Excel or a notebook.
+- **Export…** — saves the table to a `.csv` or `.tsv` file (delimiter follows the extension; `.tsv`, `.tab` and `.txt` are tab-separated, anything else comma-separated). The default filename is `<protein>_pockets.csv` next to the `*_out/` directory.
+
+Both export the table **as displayed** — current sort order and any columns you have dragged around are preserved — except that the *Pocket* column is written as the bare pocket id so the file is easy to parse. Right-clicking the table offers the same two actions.
 
 ### Lining residues
 
@@ -104,6 +109,7 @@ Each row is one fpocket pocket. Columns are sortable and reorderable.
 
 ```
 fpv_load /path/to/protein_out/   Load an existing fpocket *_out/ directory
+fpv_export /path/to/pockets.csv  Write the pocket table to CSV/TSV (pocket-id order)
 fpv_clear                        Remove all fpv_* objects from the session
 fpv_gui                          Open the GUI
 ```

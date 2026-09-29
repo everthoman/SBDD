@@ -10,6 +10,7 @@ Features
 - Colour-coded alpha-sphere visualization per pocket
 - Sortable pocket table: score, druggability, volume, N spheres, SASA…
 - Per-pocket: lining residue list, zoom-to-pocket, toggle surface
+- Export the pocket table to CSV/TSV, or copy it to the clipboard
 
 Installation
 ------------
@@ -20,17 +21,19 @@ Installation
 CLI commands
 ------------
   fpv_load /path/to/protein_out/   load existing *_out/ directory
+  fpv_export pockets.csv           write the pocket table to CSV/TSV
   fpv_clear                        remove all FpocketViewer objects
   fpv_gui                          open the GUI
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
-Date:    2026-07-01
-Version: 1.0
+Date:    2026-09-29
+Version: 1.1
 License: MIT
 """
 
 from __future__ import annotations
 
+import csv
 import os
 import platform
 import re
@@ -333,6 +336,53 @@ def fpv_load(path=""):
           f"{len(_st.pockets)} pocket(s) from {path}.")
 
 
+def _fmt_export_value(val) -> str:
+    """Whole-number floats (N Spheres, Volume Score, …) export as plain
+    integers; everything else keeps 3 decimal places."""
+    if isinstance(val, float):
+        return str(int(val)) if val == int(val) else f"{val:.3f}"
+    return str(val)
+
+
+def _pocket_matrix() -> Tuple[List[str], List[List[str]]]:
+    """Header + one row per loaded pocket, in pocket-id order."""
+    header = ["Pocket"] + _INFO_COLS
+    rows = []
+    for p in _st.pockets:
+        row = [str(p.pid)]
+        for col in _INFO_COLS:
+            row.append(_fmt_export_value(p.info.get(col, "")))
+        rows.append(row)
+    return header, rows
+
+
+def _write_table(path: str, header: List[str], rows: List[List[str]]):
+    """Write header+rows; tab-separated for .tsv/.tab/.txt, comma otherwise."""
+    delim = "\t" if os.path.splitext(path)[1].lower() in (".tsv", ".tab", ".txt") else ","
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, delimiter=delim)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def fpv_export(path=""):
+    """Export the pocket table.  Usage: fpv_export /path/to/pockets.csv"""
+    path = path.strip()
+    if not path:
+        print("FpocketViewer: provide an output path, e.g. fpv_export pockets.csv")
+        return
+    if not _st.pockets:
+        print("FpocketViewer: no pockets loaded.")
+        return
+    header, rows = _pocket_matrix()
+    try:
+        _write_table(path, header, rows)
+    except OSError as e:
+        print(f"FpocketViewer: could not write {path}: {e}")
+        return
+    print(f"FpocketViewer: wrote {len(rows)} pocket(s) to {path}.")
+
+
 def fpv_clear():
     """Remove all FpocketViewer objects from the session.  Usage: fpv_clear"""
     for obj in list(_st._created_objs):
@@ -352,9 +402,10 @@ def fpv_gui():
     _open_gui()
 
 
-cmd.extend("fpv_load",  fpv_load)
-cmd.extend("fpv_clear", fpv_clear)
-cmd.extend("fpv_gui",   fpv_gui)
+cmd.extend("fpv_load",   fpv_load)
+cmd.extend("fpv_export", fpv_export)
+cmd.extend("fpv_clear",  fpv_clear)
+cmd.extend("fpv_gui",    fpv_gui)
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +490,7 @@ def _open_gui():
 
     win = QtWidgets.QWidget()
     _gui_window = win
-    win.setWindowTitle("FpocketViewer 1.0")
+    win.setWindowTitle("FpocketViewer 1.1")
     win.setMinimumWidth(540)
     win.setAttribute(QtCore.Qt.WA_DeleteOnClose)
     win.destroyed.connect(_set_gui_none)
@@ -573,9 +624,14 @@ def _open_gui():
     hl_vis = QtWidgets.QHBoxLayout()
     b_show_all = QtWidgets.QPushButton("Show all")
     b_hide_all = QtWidgets.QPushButton("Hide all")
+    b_copy     = QtWidgets.QPushButton("Copy")
+    b_export   = QtWidgets.QPushButton("Export…")
+    b_copy.setToolTip("Copy the table as tab-separated text (paste into Excel)")
+    b_export.setToolTip("Write the table to a CSV or TSV file")
     b_zoom     = QtWidgets.QPushButton("Zoom to pocket")
     b_surf     = QtWidgets.QPushButton("Toggle surface")
     hl_vis.addWidget(b_show_all); hl_vis.addWidget(b_hide_all)
+    hl_vis.addWidget(b_copy);     hl_vis.addWidget(b_export)
     hl_vis.addStretch()
     hl_vis.addWidget(b_zoom); hl_vis.addWidget(b_surf)
     l_pk.addLayout(hl_vis)
@@ -792,6 +848,74 @@ def _open_gui():
             if p.sph_obj in cmd.get_names("objects"):
                 cmd.disable(p.sph_obj)
 
+    def _table_matrix() -> Tuple[List[str], List[List[str]]]:
+        """Header + rows exactly as displayed: sort order, column order, hidden cols."""
+        hh = tw.horizontalHeader()
+        cols = [c for c in (hh.logicalIndex(v) for v in range(tw.columnCount()))
+                if c > 0 and not tw.isColumnHidden(c)]
+        header = []
+        for c in cols:
+            hdr = tw.horizontalHeaderItem(c)
+            header.append(hdr.text() if hdr is not None else "")
+        rows = []
+        for r in range(tw.rowCount()):
+            row = []
+            for c in cols:
+                item = tw.item(r, c)
+                if c == 1:
+                    # name cell reads "Pocket 3  (25 sph)" — export the bare id
+                    pid = item.data(QtCore.Qt.UserRole + 1) if item is not None else None
+                    row.append("" if pid is None else str(pid))
+                elif item is None:
+                    row.append("")
+                else:
+                    # data cells carry the raw float on UserRole+1 (used for
+                    # sorting); prefer it over the displayed ".3f" text so
+                    # whole numbers export as plain integers
+                    val = item.data(QtCore.Qt.UserRole + 1)
+                    row.append(_fmt_export_value(val) if val is not None else item.text())
+            rows.append(row)
+        return header, rows
+
+    def do_copy_table():
+        if tw.rowCount() == 0:
+            QtWidgets.QMessageBox.information(win, "FpocketViewer",
+                                              "No pockets to copy."); return
+        header, rows = _table_matrix()
+        text = "\n".join("\t".join(r) for r in [header] + rows)
+        QtWidgets.QApplication.clipboard().setText(text)
+        lbl_status.setText(f"Copied {len(rows)} pocket(s) to the clipboard")
+
+    def do_export_table():
+        if tw.rowCount() == 0:
+            QtWidgets.QMessageBox.information(win, "FpocketViewer",
+                                              "No pockets to export."); return
+        stem = "pockets"
+        default = f"{stem}.csv"
+        if _st.out_dir:
+            out = os.path.abspath(_st.out_dir.rstrip("/\\"))
+            stem = re.sub(r"_out$", "", os.path.basename(out)) or "pockets"
+            parent = os.path.dirname(out)
+            # fpocket run from a PyMOL object writes into a temp dir — don't
+            # default the export there
+            if parent.startswith(tempfile.gettempdir()):
+                parent = os.getcwd()
+            default = os.path.join(parent, f"{stem}_pockets.csv")
+        path, filt = QtWidgets.QFileDialog.getSaveFileName(
+            win, "Export pocket table", default,
+            "CSV (*.csv);;Tab-separated (*.tsv);;All files (*)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".tsv" if filt.startswith("Tab") else ".csv"
+        header, rows = _table_matrix()
+        try:
+            _write_table(path, header, rows)
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(win, "FpocketViewer",
+                                           f"Could not write file:\n{e}"); return
+        lbl_status.setText(f"Exported {len(rows)} pocket(s) → {path}")
+
     def do_get_residues():
         p = _selected_pocket()
         if p is None:
@@ -828,6 +952,20 @@ def _open_gui():
     b_surf.clicked.connect(do_toggle_surface)
     b_show_all.clicked.connect(do_show_all)
     b_hide_all.clicked.connect(do_hide_all)
+    b_copy.clicked.connect(do_copy_table)
+    b_export.clicked.connect(do_export_table)
+
+    # Right-click menu / Ctrl+C on the table
+    _QAction = getattr(QtWidgets, "QAction", None) or QtGui.QAction
+    tw.setContextMenuPolicy(QtCore.Qt.ActionsContextMenu)
+    act_copy = _QAction("Copy table (TSV)", tw)
+    act_copy.setShortcut(QtGui.QKeySequence.Copy)
+    act_copy.setShortcutContext(QtCore.Qt.WidgetShortcut)
+    act_copy.triggered.connect(do_copy_table)
+    tw.addAction(act_copy)
+    act_export = _QAction("Export table…", tw)
+    act_export.triggered.connect(do_export_table)
+    tw.addAction(act_export)
     b_get_res.clicked.connect(do_get_residues)
 
     _refresh_prot_combo()
