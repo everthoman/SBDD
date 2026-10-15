@@ -43,6 +43,7 @@ except ImportError:
     np = None
 
 from pymol import cmd, CmdException
+from pymol.creating import unquote
 
 # Rendering globals a .pse can silently overwrite on load (they're saved into
 # the session file along with everything else), captured here at import time —
@@ -52,6 +53,10 @@ from pymol import cmd, CmdException
 # defaults, which are not necessarily correct on every machine (e.g.
 # transparency_mode 2 renders surfaces opaque instead of alpha-blending on at
 # least one known NVIDIA driver, where the user's .pymolrc.py forces mode 1).
+# auto_zoom is switched off by _prepare_scene; remember the user's value so
+# ci_clear can put it back (None until the first setup).
+_user_auto_zoom = None
+
 _BASELINE_RENDER_SETTINGS = {
     name: cmd.get(name)
     for name in ("transparency_mode", "two_sided_lighting", "cache_display")
@@ -639,6 +644,18 @@ def _detect_interactions(
     else:
         lig_nonpolar_h = prot_nonpolar_h = set()
 
+    # Histidine is a cation only when protonated on both imidazole N: HIP/HSP,
+    # or an explicit-H model carrying both HD1 and HE2 (same rule as _HIS_POS
+    # for surface colouring).  HID/HIE/HSD/HSE are the neutral tautomers.
+    his_pos = set()
+    _his_h: Dict[tuple, set] = defaultdict(set)
+    for _i, a, c, e in prot_atoms:
+        if a.resn in ("HIP", "HSP"):
+            his_pos.add((a.chain, a.resi, a.resn))
+        elif a.resn in ("HIS", "HID", "HIE", "HSD", "HSE") and a.name in ("HD1", "HE2"):
+            _his_h[(a.chain, a.resi, a.resn)].add(a.name)
+    his_pos.update(k for k, v in _his_h.items() if len(v) == 2)
+
     def _il(a): return f"{a.resn} {a.name}"
     def _ip(a): return f"{a.chain}/{a.resn}{a.resi}.{a.name}"
 
@@ -700,8 +717,10 @@ def _detect_interactions(
                         "info1": _il(la), "info2": _ip(pa)})
 
             if do_salt and (l_pos or l_neg) and d <= SALT_BRIDGE_DIST_MAX:
-                ppos = (pa.resn in ("ARG", "LYS", "HIS", "HID", "HIE", "HIP")
-                        and pa.name in ("NH1", "NH2", "NE", "NZ", "ND1", "NE2"))
+                ppos = ((pa.resn in ("ARG", "LYS")
+                         and pa.name in ("NH1", "NH2", "NE", "NZ"))
+                        or (pa.name in ("ND1", "NE2")
+                            and (pa.chain, pa.resi, pa.resn) in his_pos))
                 pneg = ((pa.resn == "ASP" and pa.name in ("OD1", "OD2"))
                         or (pa.resn == "GLU" and pa.name in ("OE1", "OE2")))
                 if (l_pos and pneg) or (l_neg and ppos):
@@ -1259,6 +1278,9 @@ def _prepare_scene(protein_sel, ligand_sels):
         # auto_zoom left on, every distance object and pseudoatom that visualize()
         # creates while stepping triggers a zoom-to-fit, so the camera lurches
         # toward each pose — the "zooms on the ligand every step" complaint.
+        global _user_auto_zoom
+        if _user_auto_zoom is None:
+            _user_auto_zoom = cmd.get("auto_zoom")
         cmd.set("auto_zoom", 0)
         # transparency_mode, two_sided_lighting and cache_display are global
         # settings saved inside .pse files: loading a complex as a .pse
@@ -1282,15 +1304,23 @@ def _prepare_scene(protein_sel, ligand_sels):
         # PoseViewer's own scene — frozen at whatever coordinates existed when
         # they were made, which can predate later editing/minimization and so
         # no longer land on the current structure, making an old dash look like
-        # it ends in mid-air. Purge anything of that type we didn't create.
+        # it ends in mid-air. Hide (not delete) anything of that type we
+        # didn't create, and say so: get_type reports distance, angle and
+        # dihedral objects alike, so a hand-made measurement is caught too and
+        # the user can re-enable it.
+        hidden = []
         for n in cmd.get_names("objects"):
             if n in _created_objects:
                 continue
             try:
                 if cmd.get_type(n) == "object:measurement":
-                    cmd.delete(n)
+                    cmd.disable(n)
+                    hidden.append(n)
             except Exception:
                 pass
+        if hidden:
+            print("PoseViewer: disabled existing measurement object(s): "
+                  + ", ".join(hidden) + " (use 'enable <name>' to bring back).")
         cmd.show("cartoon", protein_sel)
         _color_rainbow_elem(protein_sel)
 
@@ -2153,45 +2183,59 @@ _stepper = LigandStepper()
 # Pose property helpers
 # ---------------------------------------------------------------------------
 
+def _parse_sdf_value(raw: str):
+    """Coerce an SD value to a number only when it clearly is one.
+
+    Ints must round-trip exactly and floats must be finite with a decimal
+    point, so "0012", "1e3", "nan" and "+5" stay strings (identifiers keep
+    their leading zeros) while scores such as "-8.10" or "1.2e-5" are still
+    numeric for sorting.
+    """
+    try:
+        v = int(raw)
+        if str(v) == raw:
+            return v
+    except (ValueError, OverflowError):
+        pass
+    try:
+        v = float(raw)
+        if math.isfinite(v) and "." in raw:
+            return v
+    except (ValueError, OverflowError):
+        pass
+    return raw
+
+
 def _parse_sdf_records(path: str) -> list:
     """Parse an SDF file and return a list of property dicts (one per record).
 
-    Reads ``> <name>\\nvalue`` SD data tags.  Tries to coerce values to int
-    or float; leaves them as str otherwise.  Also stores the molecule title
-    (first line of each record) under the key ``_name``.
+    Reads ``> <name>`` SD data tags; a value runs until the first blank line
+    and may span several lines (joined with newlines).  Numeric-looking
+    values are coerced to int or float only when that is lossless (see
+    _parse_sdf_value); anything else stays a str.  Also stores the molecule
+    title (first line of each record) under the key ``_name``.
     """
     import re
     records = []
     try:
-        with open(path) as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             content = fh.read()
-        for i, block in enumerate(content.split("$$$$")):
+        # The delimiter is "$$$$" on a line of its own, not the bare substring:
+        # an SD value that merely contains "$$$$" must not start a new record.
+        for i, block in enumerate(re.split(r"(?m)^\$\$\$\$[ \t]*\r?$\n?", content)):
             if not block.strip():
                 continue
-            if i:
-                # Drop only the newline left by the separator: strip() would eat
-                # an empty title line too, promoting the counts line to the title.
-                if block.startswith("\r\n"):
-                    block = block[2:]
-                elif block.startswith("\n"):
-                    block = block[1:]
             props = {}
             lines = block.splitlines()
             if lines and lines[0].strip():
                 props["_name"] = lines[0].strip()
             # The header line may carry extra fields after the tag name —
-            # "> <Ligand_ID>  (1) " as written by RDKit/GNINA — so skip to EOL
-            # rather than requiring the newline right after '>'.
-            for m in re.finditer(r">\s*<([^>]+)>[^\n]*\n([^\n]*)", block):
+            # "> <Ligand_ID>  (1) " as written by RDKit/GNINA — so skip to EOL.
+            for m in re.finditer(r"^>.*?<([^>]+)>[^\n]*\n((?:[^\n]+\n?)*)",
+                                 block, re.M):
                 key = m.group(1).strip()
-                raw = m.group(2).strip()
-                try:
-                    props[key] = int(raw)
-                except (ValueError, OverflowError):
-                    try:
-                        props[key] = float(raw)
-                    except (ValueError, OverflowError):
-                        props[key] = raw
+                raw = "\n".join(l.strip() for l in m.group(2).splitlines()).strip()
+                props[key] = _parse_sdf_value(raw)
             records.append(props)
     except Exception as e:
         print(f"PoseViewer: could not parse SDF '{path}': {e}")
@@ -2320,6 +2364,16 @@ def _auto_split_ligands(ligands_sel):
 # CLI commands
 # ---------------------------------------------------------------------------
 
+def _arg(value):
+    """Strip the quotes PyMOL's command parser leaves on an argument."""
+    return unquote(value) if isinstance(value, str) else value
+
+
+def _arg_path(value):
+    """Unquote a path argument and expand ~ / $VARS like PyMOL's own commands."""
+    return cmd.exp_path(_arg(value))
+
+
 def ci_setup(protein="polymer.protein", ligands="organic", mode="auto"):
     """
 DESCRIPTION
@@ -2330,9 +2384,10 @@ USAGE
 
 EXAMPLES
     ci_setup
-    ci_setup protein=chain A, ligands=LIG1,LIG2,LIG3
+    ci_setup protein=chain A, ligands="LIG1,LIG2,LIG3"
     ci_setup protein=polymer.protein, ligands=poses, mode=states
     """
+    protein, ligands, mode = _arg(protein), _arg(ligands), _arg(mode)
     if mode == "auto":
         names = cmd.get_names("objects")
         if ligands in names and cmd.count_states(ligands) > 1:
@@ -2505,6 +2560,7 @@ def ci_load_scores(path=""):
 USAGE
     ci_load_scores /path/to/poses.sdf
     """
+    path = _arg_path(path)
     if not path:
         print("PoseViewer: ci_load_scores requires a file path.")
         return
@@ -2526,6 +2582,7 @@ def ci_load_poses(path="", protein="polymer.protein"):
     tags into the score table so scores can never drift out of sync with the
     geometry, then runs ci_setup automatically.
     """
+    path, protein = _arg_path(path), _arg(protein)
     if not path:
         print("PoseViewer: ci_load_poses requires a file path.")
         return
@@ -2581,7 +2638,13 @@ USAGE
 
 
 def ci_clear():
-    _clear_all(); _stepper.reset(); _unbind_keys(); print("PoseViewer: cleared.")
+    global _user_auto_zoom
+    _clear_all(); _stepper.reset(); _unbind_keys()
+    if _user_auto_zoom is not None:
+        try: cmd.set("auto_zoom", _user_auto_zoom)
+        except Exception: pass
+        _user_auto_zoom = None
+    print("PoseViewer: cleared.")
 
 def ci_bookmarks():
     """List all bookmarked poses to the console."""
@@ -2605,6 +2668,7 @@ USAGE
 
     A .tsv or .txt extension switches the delimiter to tab.
     """
+    path, selection = _arg_path(path), _arg(selection)
     if not path:
         print("PoseViewer: ci_export requires a file path.")
         return
@@ -2691,6 +2755,7 @@ USAGE
     properties (SDF-loaded scores) are written as SD tags. Default selection
     is the bookmarked poses; pass "all" for every pose.
     """
+    path, selection = _arg_path(path), _arg(selection)
     if not path:
         print("PoseViewer: ci_export_sdf requires a file path.")
         return
