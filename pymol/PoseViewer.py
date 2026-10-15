@@ -123,6 +123,8 @@ HBOND_CARBONYL_ACC_ANGLE_RANGE = (85.0, 160.0)   # base_atom-O...H, sp2 lone-pai
 HALOGEN_DONORS = {"Cl", "Br", "I"}
 HALOGEN_ACCEPTORS = {"O", "N", "S"}
 HALOGEN_DIST_MAX = 3.5
+HALOGEN_ANGLE_MIN = 140.0     # C-X...A; a sigma-hole contact is near-linear
+PI_OFFSET_MAX = 2.0           # A; ring-centroid offset from the stacking / cation axis
 
 AROM_HBOND_DIST_MAX = 3.5
 AROM_HBOND_ACCEPTORS = {"O", "N", "S"}
@@ -275,6 +277,29 @@ def _centroid(pts):
     return (sum(p[0] for p in pts) / n,
             sum(p[1] for p in pts) / n,
             sum(p[2] for p in pts) / n)
+
+def _ring_offset(centroid, normal, point):
+    """Distance from `point` to the axis through `centroid` along `normal`."""
+    v = [point[i] - centroid[i] for i in range(3)]
+    h = _dot(v, _norm(normal))
+    return math.sqrt(max(0.0, _dot(v, v) - h * h))
+
+def _halogen_angle_ok(model, adj, xi, x_coord, a_coord):
+    """True if the C-X...A angle is at least HALOGEN_ANGLE_MIN.
+
+    A halogen bond is a sigma-hole interaction, so a chlorine merely passing
+    a carbonyl is not one.  Judged permissively (True) when X has no bonded
+    carbon in the model, since the angle cannot be defined.
+    """
+    for nb in adj.get(xi, ()):
+        c = model.atom[nb].coord
+        if _sym(model.atom[nb]) != "C":
+            continue
+        v1 = _norm([c[k] - x_coord[k] for k in range(3)])
+        v2 = _norm([a_coord[k] - x_coord[k] for k in range(3)])
+        ang = math.degrees(math.acos(min(1.0, max(-1.0, _dot(v1, v2)))))
+        return ang >= HALOGEN_ANGLE_MIN
+    return True
 
 def _angle_normals(n1, n2):
     c = abs(_dot(_norm(n1), _norm(n2)))
@@ -656,6 +681,11 @@ def _detect_interactions(
             _his_h[(a.chain, a.resi, a.resn)].add(a.name)
     his_pos.update(k for k, v in _his_h.items() if len(v) == 2)
 
+    # Bond graphs for the C-X...A halogen angle, built only when needed.
+    hal_lig_adj = _adjacency(lig_model) if do_halogen else None
+    hal_prot_adj = (_adjacency(prot_model) if do_halogen and
+                    any(e in HALOGEN_DONORS for _i, _a, _c, e in prot_atoms) else None)
+
     def _il(a): return f"{a.resn} {a.name}"
     def _ip(a): return f"{a.chain}/{a.resn}{a.resi}.{a.name}"
 
@@ -710,8 +740,14 @@ def _detect_interactions(
             d = math.sqrt(d2)
 
             if do_halogen and d <= HALOGEN_DIST_MAX:
-                if ((l_halogen and pe in HALOGEN_ACCEPTORS) or
-                        (pe in HALOGEN_DONORS and l_hal_acc)):
+                if l_halogen and pe in HALOGEN_ACCEPTORS:
+                    hal_ok = _halogen_angle_ok(lig_model, hal_lig_adj, li, lc, pc)
+                elif pe in HALOGEN_DONORS and l_hal_acc:
+                    hal_ok = hal_prot_adj is None or _halogen_angle_ok(
+                        prot_model, hal_prot_adj, pi, pc, lc)
+                else:
+                    hal_ok = False
+                if hal_ok:
                     result.halogen.append({
                         "p1": lc, "p2": pc, "dist": d,
                         "info1": _il(la), "info2": _ip(pa)})
@@ -775,7 +811,9 @@ def _detect_interactions(
                 ang = _angle_normals(lrn, prn)
                 a0 = _prm.atom[pri[0]]
                 info = f"{a0.chain}/{a0.resn}{a0.resi}"
-                if d <= PIPI_FTF_DIST_MAX and ang <= PIPI_FTF_ANGLE_MAX:
+                if (d <= PIPI_FTF_DIST_MAX and ang <= PIPI_FTF_ANGLE_MAX
+                        and min(_ring_offset(lrc, lrn, prc),
+                                _ring_offset(prc, prn, lrc)) <= PI_OFFSET_MAX):
                     result.pipi.append({
                         "p1": list(lrc), "p2": list(prc), "dist": d,
                         "angle": ang, "type": "face-to-face",
@@ -838,9 +876,10 @@ def _detect_interactions(
             pcm = cmd.get_model(_TMP, state=1)
             for pa in pcm.atom:
                 pac = tuple(pa.coord)
-                for _, lrc, _ in lig_rings_info:
+                for _, lrc, lrn in lig_rings_info:
                     d = _dist(pac, lrc)
-                    if d <= PI_CATION_DIST_MAX:
+                    if (d <= PI_CATION_DIST_MAX
+                            and _ring_offset(lrc, lrn, pac) <= PI_OFFSET_MAX):
                         result.pi_cation.append({
                             "p1": list(lrc), "p2": pac, "dist": d,
                             "info1": "lig ring", "info2": _ip(pa)})
@@ -852,9 +891,10 @@ def _detect_interactions(
         if _prm:
             for _li, la, lc, _le in lig_atoms:
                 if _li in lig_pos:
-                    for pri, prc, _ in prot_rings_info:
+                    for pri, prc, prn in prot_rings_info:
                         d = _dist(lc, prc)
-                        if d <= PI_CATION_DIST_MAX:
+                        if (d <= PI_CATION_DIST_MAX
+                                and _ring_offset(prc, prn, lc) <= PI_OFFSET_MAX):
                             a0 = _prm.atom[pri[0]]
                             result.pi_cation.append({
                                 "p1": lc, "p2": list(prc), "dist": d,
@@ -969,25 +1009,39 @@ def _add_pair_points(pts, pairs):
     one at a time costs about twice what a single load_model of the finished set
     does (0.62 s vs 0.27 s for 600 pairs).  Symbol "PS" keeps the points out of
     the organic/polymer selectors the rest of the plugin relies on.
+
+    Each pair's two points are joined by a bond and every distance object gets
+    its own chain letter, so one `cmd.distance(..., mode=1)` per object draws
+    all of its dashes.  (The old per-pair selection was quadratic in the number
+    of pairs: two selection evaluations over the whole point object per dash.)
+
+    Returns {object_name: chain_letter}.
     """
-    from chempy import Atom
+    from chempy import Atom, Bond
     from chempy.models import Indexed
 
     model = Indexed()
-    for i, (_name, p1, p2) in enumerate(pairs):
+    chains: Dict[str, str] = {}
+    for i, (name, p1, p2) in enumerate(pairs):
+        chain = chains.setdefault(name, chr(ord("A") + len(chains) % 26))
         for atom_name, pos in (("L", p1), ("P", p2)):
             a = Atom()
             a.name = atom_name
             a.resn = "PSD"
             a.resi = str(i)
-            a.chain = "X"
+            a.chain = chain
             a.symbol = "PS"
             a.hetatm = 1
             a.coord = [float(pos[0]), float(pos[1]), float(pos[2])]
             model.atom.append(a)
+        bnd = Bond()
+        bnd.index = [2 * i, 2 * i + 1]
+        bnd.order = 1
+        model.bond.append(bnd)
     try: cmd.delete(pts)
     except Exception: pass
     cmd.load_model(model, pts, 1)
+    return chains
 
 
 def _distance_object_pairs(name, state=0):
@@ -1226,11 +1280,10 @@ def visualize(lig_sel, prot_sel, result: InteractionResult,
 
     if pending:
         _track(pts)
-        _add_pair_points(pts, pending)
-        for i, (obj_name, _p1, _p2) in enumerate(pending):
-            cmd.distance(obj_name,
-                         f"{pts} and resi {i} and name L",
-                         f"{pts} and resi {i} and name P")
+        chains = _add_pair_points(pts, pending)
+        for obj_name, chain in chains.items():
+            sel = f"{pts} and chain {chain}"
+            cmd.distance(obj_name, sel, sel, mode=1)
         for obj_name, color, kw in styles:
             _style(obj_name, color, **kw)
         cmd.hide("everything", pts)
@@ -1393,11 +1446,13 @@ def _snapshot_ligands(ligand_sels, state=0):
     of a single-state receptor selects nothing at all.
 
     Returns (selection, temp_names); the caller must pass temp_names to
-    _delete_snapshots().  Falls back to the plain union if copying fails, so a
-    surprise here costs speed rather than function.
+    _delete_snapshots().  Raises RuntimeError if any ligand cannot be copied.
+    There is deliberately no fallback to the raw multi-state union: every caller
+    pins its selections to state=1, which on a multi-state object would silently
+    evaluate proximity against pose 1 for every pose.
     """
     names = [ligand_sels] if isinstance(ligand_sels, str) else list(ligand_sels)
-    temps, parts = [], []
+    temps, parts, failed = [], [], []
     for i, name in enumerate(names):
         tmp = f"{_OBJ_SNAP}{i}"
         try:
@@ -1417,10 +1472,17 @@ def _snapshot_ligands(ligand_sels, state=0):
             cmd.disable(tmp)
             temps.append(tmp)
             parts.append(f"({tmp})")
-        except Exception:
+        except Exception as e:
+            failed.append(f"{name} ({e})")
             try: cmd.delete(tmp)
             except Exception: pass
+    if failed:
+        _delete_snapshots(temps)
+        raise RuntimeError("could not snapshot ligand(s) for proximity "
+                           "detection: " + ", ".join(failed))
     if not parts:
+        # Every ligand is empty: the union matches nothing either, and with no
+        # atoms there is no multi-state pose for state=1 to mislead.
         return _lig_union(ligand_sels), []
     return " or ".join(parts), temps
 
@@ -1540,7 +1602,11 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     # superlinear in the state count (see _snapshot_ligands), and keeping the
     # shell as an expression string meant every later use of it — the residue
     # label toggle, _clear_shell — paid for that `within` all over again.
-    snap_sel, snaps = _snapshot_ligands(ligand_sels, state)
+    try:
+        snap_sel, snaps = _snapshot_ligands(ligand_sels, state)
+    except RuntimeError as e:
+        print(f"PoseViewer: shell not drawn - {e}")
+        return
     try:
         cmd.select(_OBJ_SHELL,
                    f"byres (({protein_sel}) within {dist} of ({snap_sel}))",
@@ -3101,6 +3167,24 @@ def _open_gui():
 
     splitter.setSizes([460, 200])
 
+    # One table drives the checkboxes: initial state (from _stepper, so a
+    # reopened panel shows the real flags), the per-box toggle handlers and the
+    # group enable boxes below.
+    _grp_bonds = [(cb_hb, "show_hbonds"), (cb_xb, "show_halogen"),
+                  (cb_sb, "show_salt"), (cb_ah, "show_arom_hb"),
+                  (cb_wb, "show_water")]
+    _grp_pi = [(cb_pp, "show_pipi"), (cb_pc, "show_pi_cation")]
+    _grp_clash = [(cb_cg, "show_clash_good"), (cb_cb, "show_clash_bad"),
+                  (cb_cu, "show_clash_ugly")]
+    for _cb_w, _attr in (_grp_bonds + _grp_pi + _grp_clash + [
+            (cb_lb, "show_labels"), (cb_surf, "show_surface"),
+            (cb_zoom, "auto_zoom"), (cb_lig_h, "show_lig_h"),
+            (cb_cstype, "color_surf_by_type"),
+            (cb_show_ref, "show_ref"), (cb_show_pose, "show_pose")]):
+        _cb_w.setChecked(bool(getattr(_stepper, _attr)))
+    for _en_w, _grp in ((g1_en, _grp_bonds), (g2_en, _grp_pi), (g3_en, _grp_clash)):
+        _en_w.setChecked(any(getattr(_stepper, _a) for _, _a in _grp))
+
     # Callbacks
     _sel_order: list = []   # table row indices in arrival order (max 2)
     _sel_busy  = [False]    # re-entrancy guard for programmatic selection changes
@@ -3521,19 +3605,11 @@ def _open_gui():
     b_go.clicked.connect(do_go)
 
 
-    cb_hb.stateChanged.connect(_tog(cb_hb, "show_hbonds"))
+    for _cb_w, _attr in _grp_bonds + _grp_pi + _grp_clash:
+        _cb_w.stateChanged.connect(_tog(_cb_w, _attr))
     sp_hba.valueChanged.connect(lambda v: [
         setattr(_stepper, "hbond_min_angle", float(v)),
         ci_update(), update_ui()])
-    cb_xb.stateChanged.connect(_tog(cb_xb, "show_halogen"))
-    cb_sb.stateChanged.connect(_tog(cb_sb, "show_salt"))
-    cb_ah.stateChanged.connect(_tog(cb_ah, "show_arom_hb"))
-    cb_wb.stateChanged.connect(_tog(cb_wb, "show_water"))
-    cb_pp.stateChanged.connect(_tog(cb_pp, "show_pipi"))
-    cb_pc.stateChanged.connect(_tog(cb_pc, "show_pi_cation"))
-    cb_cg.stateChanged.connect(_tog(cb_cg, "show_clash_good"))
-    cb_cb.stateChanged.connect(_tog(cb_cb, "show_clash_bad"))
-    cb_cu.stateChanged.connect(_tog(cb_cu, "show_clash_ugly"))
     cb_zoom.stateChanged.connect(lambda s: setattr(_stepper, "auto_zoom", cb_zoom.isChecked()))
 
     def do_bookmark():
@@ -3580,17 +3656,9 @@ def _open_gui():
     b_bm_list.clicked.connect(do_bm_list)
     b_bm_export.clicked.connect(do_bm_export)
 
-    g1_en.stateChanged.connect(_group_tog(g1_en, [
-        (cb_hb, "show_hbonds"), (cb_xb, "show_halogen"),
-        (cb_sb, "show_salt"),   (cb_ah, "show_arom_hb"),
-        (cb_wb, "show_water"),
-    ]))
-    g2_en.stateChanged.connect(_group_tog(g2_en, [
-        (cb_pp, "show_pipi"), (cb_pc, "show_pi_cation"),
-    ]))
-    g3_en.stateChanged.connect(_group_tog(g3_en, [
-        (cb_cg, "show_clash_good"), (cb_cb, "show_clash_bad"), (cb_cu, "show_clash_ugly"),
-    ]))
+    g1_en.stateChanged.connect(_group_tog(g1_en, _grp_bonds))
+    g2_en.stateChanged.connect(_group_tog(g2_en, _grp_pi))
+    g3_en.stateChanged.connect(_group_tog(g3_en, _grp_clash))
 
     def do_toggle_surf(state=None):
         _stepper.show_surface = cb_surf.isChecked()
