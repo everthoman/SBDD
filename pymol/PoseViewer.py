@@ -223,6 +223,15 @@ def _clear_all():
     _created_objects.clear()
     _stepper._cleanup_cmp()
 
+def _protein_only(sel):
+    """Restrict a protein selection to polymer protein atoms.
+
+    Picking a whole complex object as "Protein" would otherwise match the
+    ligand's own het records in that object, and every ligand atom would clash
+    with its own copy at d ~ 0.
+    """
+    return f"({sel}) and polymer.protein"
+
 def _cleanup_autosplit():
     """Delete any auto-split ligand objects from a previous ci_setup call."""
     for name in list(_created_objects):
@@ -327,6 +336,21 @@ def _ring_planarity_rmsd(coords):
             ss += d * d
         return math.sqrt(ss / n)
 
+# Longest ring bond (A) still compatible with an aromatic ring, by element pair.
+# Aromatic vs sp3 reference lengths: C-C 1.39/1.54, C-N 1.34/1.47,
+# C-O 1.36/1.43, C-S 1.71/1.82; each limit sits between the two.
+_AROM_BOND_MAX = {("C", "C"): 1.48, ("C", "N"): 1.42,
+                  ("C", "O"): 1.40, ("C", "S"): 1.77}
+
+def _ring_bond_too_long(model, i, j):
+    a, b = model.atom[i], model.atom[j]
+    lim = _AROM_BOND_MAX.get(tuple(sorted((_sym(a), _sym(b)))))
+    if lim is None:
+        return False
+    d2 = sum((a.coord[k] - b.coord[k]) ** 2 for k in range(3))
+    return d2 > lim * lim
+
+
 def _find_aromatic_rings(model):
     n = len(model.atom)
     adj = _adjacency(model)
@@ -357,9 +381,19 @@ def _find_aromatic_rings(model):
                     ok = False; break
         if not ok:
             continue
-        # Planarity check: aromatic rings are flat (RMSD < 0.15 A)
+        # Ring bond lengths.  The sp3 test above counts neighbours, so it is a
+        # no-op on a hydrogen-free model (a ligand read out of a PDB complex):
+        # a flat cyclopentane or THF then passes.  Bond length separates sp3
+        # from aromatic ring bonds without needing hydrogens.
+        ring_set = set(ring)
+        if any(_ring_bond_too_long(model, i, j)
+               for i in ring for j in adj[i] if j in ring_set and j > i):
+            continue
+        # Planarity check: aromatic rings are flat.  Without explicit H the
+        # neighbour-count filter is blind, so use a tighter bound there.
+        has_h = any(_sym(model.atom[nb]) == "H" for i in ring for nb in adj[i])
         coords = [model.atom[i].coord for i in ring]
-        if _ring_planarity_rmsd(coords) > 0.15:
+        if _ring_planarity_rmsd(coords) > (0.15 if has_h else 0.08):
             continue
         out.append(ring)
     return out, adj
@@ -1584,8 +1618,22 @@ class LigandStepper:
         self._bookmarks: Set[tuple]         = set()
         self._sdf_mismatch: Optional[tuple] = None
 
+    def reset(self):
+        """Forget the loaded poses so Next/Prev and the sync timer do nothing."""
+        self._cleanup_cmp()
+        self.protein_sel = ""
+        self.ligand_objects = []
+        self.current_index = 0
+        self.mode = "objects"
+        self.state_object = ""
+        self.last_result = None
+        self.poses = []
+        self.ref_ligand = None
+        self._cmp_indices = []
+        self._bookmarks.clear()
+
     def setup_objects(self, prot, ligs, ref_lig=None):
-        self.protein_sel = prot
+        self.protein_sel = _protein_only(prot)
         self.ligand_objects = ligs
         self.current_index = 0
         self.mode = "objects"
@@ -1603,7 +1651,7 @@ class LigandStepper:
         self._build_obj_colors()
 
     def setup_states(self, prot, obj):
-        self.protein_sel = prot
+        self.protein_sel = _protein_only(prot)
         self.state_object = obj
         self.current_index = 0
         self.mode = "states"
@@ -2203,9 +2251,11 @@ def _bind_keys():
     print("PoseViewer: LEFT/RIGHT arrow keys bound.")
 
 def _unbind_keys():
+    # A no-op lambda is still a live mapping and swallows the key; removing the
+    # mapping lets PyMOL's built-in frame stepping handle it again.
     try:
-        cmd.set_key("right", lambda: None)
-        cmd.set_key("left", lambda: None)
+        cmd.key_mappings.pop("right", None)
+        cmd.key_mappings.pop("left", None)
     except Exception:
         pass
 
@@ -2487,7 +2537,7 @@ def ci_load_poses(path="", protein="polymer.protein"):
         except Exception:
             pass
     try:
-        cmd.load(path, obj, multiplex=0)
+        cmd.load(path, obj, format="sdf", multiplex=0)
     except CmdException as e:
         print(f"PoseViewer: could not load '{path}': {e}")
         return
@@ -2531,7 +2581,7 @@ USAGE
 
 
 def ci_clear():
-    _clear_all(); _unbind_keys(); print("PoseViewer: cleared.")
+    _clear_all(); _stepper.reset(); _unbind_keys(); print("PoseViewer: cleared.")
 
 def ci_bookmarks():
     """List all bookmarked poses to the console."""
