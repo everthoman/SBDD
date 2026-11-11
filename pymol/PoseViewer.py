@@ -2124,11 +2124,44 @@ class LigandStepper:
         return (["_name"] if "_name" in cols else []) + [
             c for c in cols if c != "_name" and not _is_rank_column(c)]
 
+    def _prune_missing(self):
+        """Drop poses whose PyMOL object has been deleted from under us.
+
+        The GUI's sync timer does this on its own; the ci_* commands have no
+        timer, and stepping onto a deleted object raised CmdException.  Returns
+        True when anything was dropped.
+        """
+        if not self.poses:
+            return False
+        try:
+            live = set(cmd.get_names("objects"))
+        except Exception:
+            return False
+        keep = [(o, s) for o, s in self.poses if o in live]
+        if len(keep) == len(self.poses):
+            return False
+        gone = {o for o, _ in self.poses} - live
+        print(f"PoseViewer: object(s) deleted, dropping their poses: {', '.join(sorted(gone))}")
+        self.poses = keep
+        self.current_index = min(self.current_index, max(0, len(keep) - 1))
+        self.last_result = None
+        if keep:
+            self._build_obj_colors()
+            self._prefetch_all_properties()
+        else:
+            self._cleanup_cmp()
+            _clear_contacts()
+        return True
+
     def _label(self):
         if not self.poses:
             return "none"
         obj, st = self.poses[self.current_index]
-        base = f"{obj} state {st}" if cmd.count_states(obj) > 1 else obj
+        try:
+            multi = cmd.count_states(obj) > 1
+        except Exception:
+            multi = False
+        base = f"{obj} state {st}" if multi else obj
         i = self.current_index
         name = (self.all_properties[i].get("_name")
                 if 0 <= i < len(self.all_properties) else None)
@@ -2161,6 +2194,8 @@ class LigandStepper:
             return
         if not self.poses:
             return
+        if self._prune_missing() and not self.poses:
+            return
         if self.mode == "states":
             st = cmd.get_state()   # 1-based; follows the slider
             for i, (o, s) in enumerate(self.poses):
@@ -2176,7 +2211,7 @@ class LigandStepper:
             self._show_current()
 
     def rebuild_shell(self):
-        """Rebuild the residue shell + pocket surface for the current pose.
+        """Rebuild the residue shell + pocket surface (footprint of all poses).
 
         For use when something behind the shell changes mid-session (the
         surface reach, or switching the surface on).
@@ -2219,6 +2254,7 @@ class LigandStepper:
 
     def _show_current(self):
         self._cleanup_cmp()
+        self._prune_missing()
         if not self.poses:
             return
         obj, st = self.poses[self.current_index]
@@ -2239,8 +2275,8 @@ class LigandStepper:
                     cmd.disable(self.ref_ligand)
             except Exception:
                 pass
-        # Rebuild the shell/surface around the pose about to be shown, before the
-        # zoom, which targets the shell and so needs it to describe this pose.
+        # Make sure the shell/surface exists (a no-op while stepping within one
+        # site) before the zoom, which targets the shell.
         self._ensure_shell(obj, st)
         if self.auto_zoom:
             self._zoom_to_site(obj, st)
@@ -2946,7 +2982,10 @@ def ci_goto(index=1):
         print(f"PoseViewer: '{index}' is not a pose number.")
         return
     if not 1 <= i <= _stepper._count():
-        print(f"PoseViewer: pose number must be between 1 and {_stepper._count()}.")
+        if _stepper._count():
+            print(f"PoseViewer: pose number must be between 1 and {_stepper._count()}.")
+        else:
+            print("PoseViewer: no poses loaded - run ci_setup or ci_load_poses first.")
         return
     _stepper.goto(i - 1); _print_summary()
 
