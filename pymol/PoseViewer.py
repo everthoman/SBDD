@@ -1609,8 +1609,14 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     lig_union = _lig_union(ligand_sels)
     surf_dist = _stepper.surf_dist
 
-    key = (protein_sel, lig_union, dist, state, surf_dist)
-    if key == _shell_key and _shell_sel is not None and _OBJ_SURF in _created_objects:
+    # The surface is the expensive part (SES + carve + charge colouring, ~80 ms
+    # per pose) and PyMOL computes it even while hidden, so with the Surface
+    # checkbox off it is not built at all.  Switching it on rebuilds the shell.
+    want_surf = bool(_stepper.show_surface)
+
+    key = (protein_sel, lig_union, dist, state, surf_dist, want_surf)
+    if (key == _shell_key and _shell_sel is not None
+            and (not want_surf or _OBJ_SURF in _created_objects)):
         return
 
     _clear_shell()
@@ -1647,6 +1653,10 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     # trim to the wall within surf_dist of the ligand (the negative normal-cutoff
     # keeps the patch continuous rather than dropping to fragments).  surf_dist is
     # _stepper.surf_dist, tunable from the Display group.
+    if not want_surf:
+        _delete_snapshots(snaps)
+        _shell_key = key
+        return
     try:
         cmd.create(_OBJ_CARVE, snap_sel, 1, 1)
         _track(_OBJ_CARVE)
@@ -1758,9 +1768,10 @@ class LigandStepper:
         _prepare_scene(prot, all_ligs)
         if ref_lig:
             _color_ref_ligand(ref_lig)
-        _create_shell(prot, all_ligs)
         if ligs:
-            self._show_current()
+            self._show_current()    # builds the shell for the first pose
+        else:
+            _create_shell(prot, all_ligs)
         self._prefetch_all_properties()
         self._build_obj_colors()
 
@@ -3683,7 +3694,10 @@ def _open_gui():
 
     def do_toggle_surf(state=None):
         _stepper.show_surface = cb_surf.isChecked()
-        if _OBJ_SURF in _created_objects:
+        if _stepper.show_surface and _OBJ_SURF not in _created_objects:
+            if _stepper.poses:
+                _stepper.rebuild_shell()    # surface is not built while off
+        elif _OBJ_SURF in _created_objects:
             if _stepper.show_surface:
                 cmd.show("surface", _OBJ_SURF)
             else:
