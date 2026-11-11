@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.16
+PoseViewer - PyMOL Plugin  v1.20
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -25,7 +25,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-21
-Version: 1.16
+Version: 1.20
 License: MIT
 """
 
@@ -34,7 +34,7 @@ from __future__ import annotations
 import csv
 import math
 import os
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import List, Dict, Optional, Set
 
 try:
@@ -182,6 +182,16 @@ _created_objects: Set[str] = set()
 _shell_sel: Optional[str] = None   # selection used for lines/labels (no copy object)
 _shell_key: Optional[tuple] = None # inputs the current shell was built from
 
+# Pocket surfaces already built, keyed by what they were built from.  PyMOL only
+# computes a surface when it is first drawn and then keeps it on the object, so
+# the way to make revisiting a pose free is to keep the object (disabled) rather
+# than delete it.  Least-recently-used first; bounded because each entry holds a
+# copy of the pocket atoms.
+SURF_CACHE_MAX = 12
+_surf_cache: "OrderedDict[tuple, str]" = OrderedDict()
+_surf_cur_key: Optional[tuple] = None   # key of the live _OBJ_SURF
+_OBJ_SURF_CACHED = "_ci_surfc"
+
 _OBJ_PTS        = "_ci_pts"
 _OBJ_SNAP       = "_ci_snap"     # single-state pose copies used by `within`
 _OBJ_SHELL      = "_ci_shell"    # materialised shell selection
@@ -234,7 +244,42 @@ def _clear_shell():
             except Exception: pass
             _created_objects.discard(_o)
 
+def _surf_cache_clear():
+    """Forget every cached surface (the structure or the settings changed)."""
+    global _surf_cur_key
+    for name in _surf_cache.values():
+        try: cmd.delete(name)
+        except Exception: pass
+    _surf_cache.clear()
+    _surf_cur_key = None
+
+
+def _surf_stash():
+    """Park the live surface in the cache instead of deleting it."""
+    global _surf_cur_key
+    key, _surf_cur_key = _surf_cur_key, None
+    if key is None or _OBJ_SURF not in _created_objects:
+        return
+    old = _surf_cache.pop(key, None)
+    if old:
+        try: cmd.delete(old)
+        except Exception: pass
+    name = f"{_OBJ_SURF_CACHED}{abs(hash(key)) % 10**9}"
+    try:
+        cmd.set_name(_OBJ_SURF, name)
+        cmd.disable(name)
+    except Exception:
+        return
+    _created_objects.discard(_OBJ_SURF)
+    _surf_cache[key] = name
+    while len(_surf_cache) > SURF_CACHE_MAX:
+        _k, victim = _surf_cache.popitem(last=False)
+        try: cmd.delete(victim)
+        except Exception: pass
+
+
 def _clear_all():
+    _surf_cache_clear()
     _clear_shell()
     for name in list(_created_objects):
         try: cmd.delete(name)
@@ -1740,7 +1785,7 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     Surface colour and visibility are handled by their own toggles and so are
     deliberately not part of the key.
     """
-    global _shell_sel, _shell_key
+    global _shell_sel, _shell_key, _surf_cur_key
     lig_union = _lig_union(ligand_sels)
     surf_dist = _stepper.surf_dist
 
@@ -1754,6 +1799,7 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
             and (not want_surf or _OBJ_SURF in _created_objects)):
         return
 
+    _surf_stash()
     _clear_shell()
 
     # Single-state stand-in for the pose, then materialise the result as a named
@@ -1796,6 +1842,16 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
         cmd.create(_OBJ_CARVE, snap_sel, 1, 1)
         _track(_OBJ_CARVE)
         cmd.disable(_OBJ_CARVE)
+        surf_key = (protein_sel, lig_union, state, surf_dist,
+                    bool(_stepper.color_surf_by_type), _stepper.surf_charge_style)
+        cached = _surf_cache.pop(surf_key, None)
+        if cached and cached in cmd.get_names("objects"):
+            cmd.set_name(cached, _OBJ_SURF)
+            cmd.enable(_OBJ_SURF)
+            _track(_OBJ_SURF)
+            _surf_cur_key = surf_key
+            _shell_key = key
+            return
         cmd.select(_OBJ_SHELL_ATOMS,
                    f"byres (({protein_sel}) within {surf_dist + SURF_SHELL_PAD} "
                    f"of ({snap_sel}))",
@@ -1813,6 +1869,7 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
         else:
             cmd.set("surface_color", "grey80", _OBJ_SURF)
         cmd.set("transparency", 0.4, _OBJ_SURF)
+        _surf_cur_key = surf_key
     except Exception:
         pass
     finally:
@@ -2632,6 +2689,7 @@ EXAMPLES
     """
     protein, ligands, mode = _arg(protein), _arg(ligands), _arg(mode)
     _ref_warned.clear()
+    _surf_cache_clear()
     if mode == "auto":
         names = cmd.get_names("objects")
         if ligands in names and cmd.count_states(ligands) > 1:
@@ -2810,7 +2868,10 @@ def ci_update():
     _print_summary()
 
 def ci_refresh():
-    """Re-detect interactions for the current PyMOL state (follows state slider)."""
+    """Re-detect interactions for the current PyMOL state (follows state slider).
+
+    Also drops the cached pocket surfaces, so edits to the structure show up."""
+    _surf_cache_clear()
     _stepper.refresh(); _print_summary()
 
 def ci_load_scores(path=""):
@@ -4180,7 +4241,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.16"
+__version__ = "1.20"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_setup   - setup from command line")
