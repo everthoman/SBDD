@@ -246,7 +246,7 @@ The **Non-covalent bonds** group carries a `min D–H···A angle` spin box und
 | Option | Default | Description |
 |---|---|---|
 | Show distance labels | On | Show/hide Å labels on interaction dashes |
-| Show surface | On | Show/hide the transparent pocket surface. While off the surface is not built at all, which makes stepping much faster. Built surfaces are cached per pose (last 12), so revisiting a pose is quick; **Refresh** and **Setup** clear the cache |
+| Show surface | On | Show/hide the transparent pocket surface. It is built **once** around the footprint of *all* poses together, so it does not change or rebuild while you step through them (poses in separate objects that sit in one site share it too; ligands in different pockets each get their own). While off it is not built at all. Built surfaces are kept (last 12), and **Refresh** / **Setup** clear them |
 | surface reach | 7.5 Å | How far the pocket surface extends around the ligand. The surface is carved from the protein's molecular surface at this radius; larger shows more of the pocket wall. Rebuilds the surface on change. |
 | Show residue labels | On | Show/hide CA residue name+number labels on the shell |
 | Auto-zoom to binding site | On | Frame the residue shell on each pose change, rather than the ligand alone. Zooming the ligand puts the camera on top of it and the pocket falls out of view; on this test case the shell spans 20 Å against 7 Å for a single pose. Set `_stepper.zoom_to_shell = False` for the old ligand-only framing, or `_stepper.zoom_buffer` to change the padding (2 Å default) |

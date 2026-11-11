@@ -198,6 +198,11 @@ _surf_cache: "OrderedDict[tuple, str]" = OrderedDict()
 _surf_cur_key: Optional[tuple] = None   # key of the live _OBJ_SURF
 _OBJ_SURF_CACHED = "_ci_surfc"
 
+# Pose objects whose combined bounding box is no larger than this (A, longest
+# edge) are taken to share one binding site and get one shell and surface.
+SAME_POCKET_MAX = 24.0
+_pocket_memo: Dict[tuple, bool] = {}
+
 _OBJ_PTS        = "_ci_pts"
 _OBJ_SNAP       = "_ci_snap"     # single-state pose copies used by `within`
 _OBJ_SHELL      = "_ci_shell"    # materialised shell selection
@@ -257,7 +262,27 @@ def _surf_cache_clear():
         try: cmd.delete(name)
         except Exception: pass
     _surf_cache.clear()
+    _pocket_memo.clear()
     _surf_cur_key = None
+
+
+def _single_pocket(objs):
+    """True when the ligand objects together span one binding site."""
+    key = tuple(objs)
+    if key not in _pocket_memo:
+        lo = [1e9] * 3
+        hi = [-1e9] * 3
+        ok = True
+        for o in key:
+            try:
+                (a, b) = cmd.get_extent(o, state=0)
+            except Exception:
+                ok = False
+                break
+            lo = [min(lo[i], a[i]) for i in range(3)]
+            hi = [max(hi[i], b[i]) for i in range(3)]
+        _pocket_memo[key] = ok and max(hi[i] - lo[i] for i in range(3)) <= SAME_POCKET_MAX
+    return _pocket_memo[key]
 
 
 def _surf_stash():
@@ -1782,25 +1807,85 @@ def _color_surface_ramp(surf_obj):
         cmd.color("grey80", surf_obj)
 
 
-def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
+FOOTPRINT_GRID = 0.4   # A; ligand atoms closer than this share one footprint point
+
+
+def _build_footprint(ligand_sels, name):
+    """One single-state object holding where the ligand(s) sit in *every* pose.
+
+    The pocket surface is carved against this rather than against one pose, so a
+    single surface fits all the poses of a docking run and stays put while they
+    are stepped through.  Heavy atoms of every state are pooled and thinned onto a
+    grid (a 1600-pose run is ~40k atoms but only a few thousand distinct points
+    at this spacing), then loaded as one object.  Returns the number of points;
+    raises RuntimeError when there is nothing to build it from.
+    """
+    names = [ligand_sels] if isinstance(ligand_sels, str) else list(ligand_sels)
+    chunks = []
+    for lig in names:
+        try:
+            n_states = max(1, cmd.count_states(lig))
+        except Exception:
+            n_states = 1
+        for st in range(1, n_states + 1):
+            try:
+                xyz = cmd.get_coords(f"({lig}) and not elem H", st)
+            except Exception:
+                xyz = None
+            if xyz is not None and len(xyz):
+                chunks.append(xyz)
+    if not chunks:
+        raise RuntimeError("no ligand coordinates for the pocket footprint")
+    if np is not None:
+        allxyz = np.concatenate(chunks)
+        cells = np.round(allxyz / FOOTPRINT_GRID).astype(np.int64)
+        _u, first = np.unique(cells, axis=0, return_index=True)
+        pts = allxyz[np.sort(first)].tolist()
+    else:
+        seen, pts = set(), []
+        for xyz in chunks:
+            for x, y, z in xyz:
+                k = (round(x / FOOTPRINT_GRID), round(y / FOOTPRINT_GRID),
+                     round(z / FOOTPRINT_GRID))
+                if k not in seen:
+                    seen.add(k)
+                    pts.append([float(x), float(y), float(z)])
+    from chempy import Atom
+    from chempy.models import Indexed
+    model = Indexed()
+    for i, (x, y, z) in enumerate(pts):
+        a = Atom()
+        a.name = "C"; a.symbol = "C"; a.resn = "FTP"; a.resi = "1"
+        a.chain = "A"; a.hetatm = 1
+        a.coord = [float(x), float(y), float(z)]
+        model.atom.append(a)
+    try: cmd.delete(name)
+    except Exception: pass
+    cmd.load_model(model, name, 1)
+    return len(pts)
+
+
+def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, extra=None):
     """Show lines + labels for residues near the ligand, with a surface on top.
 
-    Rebuilding means re-running cmd.create and a full surface recalculation, so
-    skip it when nothing that feeds the shell has changed — every checkbox
-    toggle routes through _show_current() and would otherwise pay for it.
-    Surface colour and visibility are handled by their own toggles and so are
-    deliberately not part of the key.
+    The shell and surface describe the ligand's whole footprint over every pose
+    (see _build_footprint), not the pose on screen, so they are built once and
+    not touched while stepping.  They are rebuilt only when something that feeds
+    them changes: the protein, the ligand objects, the shell / surface reach or
+    the Surface checkbox.  `extra` lets a caller add to that key (compare mode,
+    whose temporary copies keep their names but change content).  Surface colour
+    and visibility are handled by their own toggles and are not part of the key.
     """
     global _shell_sel, _shell_key, _surf_cur_key
-    lig_union = _lig_union(ligand_sels)
+    names = (ligand_sels,) if isinstance(ligand_sels, str) else tuple(ligand_sels)
     surf_dist = _stepper.surf_dist
 
-    # The surface is the expensive part (SES + carve + charge colouring, ~80 ms
-    # per pose) and PyMOL computes it even while hidden, so with the Surface
-    # checkbox off it is not built at all.  Switching it on rebuilds the shell.
+    # The surface is the expensive part (SES + carve + charge colouring) and
+    # PyMOL computes it even while hidden, so with the Surface checkbox off it is
+    # not built at all.  Switching it on rebuilds the shell.
     want_surf = bool(_stepper.show_surface)
 
-    key = (protein_sel, lig_union, dist, state, surf_dist, want_surf)
+    key = (protein_sel, names, dist, surf_dist, want_surf, extra)
     if (key == _shell_key and _shell_sel is not None
             and (not want_surf or _OBJ_SURF in _created_objects)):
         return
@@ -1808,19 +1893,20 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
     _surf_stash()
     _clear_shell()
 
-    # Single-state stand-in for the pose, then materialise the result as a named
-    # selection.  Both matter: `within` against a multi-state object is
-    # superlinear in the state count (see _snapshot_ligands), and keeping the
-    # shell as an expression string meant every later use of it — the residue
-    # label toggle, _clear_shell — paid for that `within` all over again.
     try:
-        snap_sel, snaps = _snapshot_ligands(ligand_sels, state)
+        _build_footprint(ligand_sels, _OBJ_CARVE)
     except RuntimeError as e:
         print(f"PoseViewer: shell not drawn - {e}")
         return
+    _track(_OBJ_CARVE)
+    cmd.disable(_OBJ_CARVE)
+
+    # Materialise the shell as a named selection: keeping it as an expression
+    # string meant every later use of it (the residue label toggle, _clear_shell)
+    # paid for the proximity search all over again.
     try:
         cmd.select(_OBJ_SHELL,
-                   f"byres (({protein_sel}) within {dist} of ({snap_sel}))",
+                   f"byres (({protein_sel}) within {dist} of ({_OBJ_CARVE}))",
                    enable=0, state=1)
         cmd.show("lines", _OBJ_SHELL)
         cmd.hide("lines",
@@ -1829,26 +1915,21 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
         _shell_sel = _OBJ_SHELL
     except Exception as e:
         print(f"PoseViewer: shell setup warning: {e}")
-        _delete_snapshots(snaps)
         return
 
     # Pocket surface: a carved patch of the real protein molecular surface, not
     # the surface of a bag of clipped atoms.  Surfacing just the atoms within
     # SHELL_DIST closed the mesh over into a blob that swallowed the pocket
     # residues; instead build the SES on a wide residue shell (so it is correct
-    # at the pocket wall), keep a single-state ligand copy to carve against, and
-    # trim to the wall within surf_dist of the ligand (the negative normal-cutoff
-    # keeps the patch continuous rather than dropping to fragments).  surf_dist is
-    # _stepper.surf_dist, tunable from the Display group.
+    # at the pocket wall) and trim to the wall within surf_dist of the footprint
+    # (the negative normal-cutoff keeps the patch continuous rather than dropping
+    # to fragments).  surf_dist is _stepper.surf_dist, tunable from the Display
+    # group.
     if not want_surf:
-        _delete_snapshots(snaps)
         _shell_key = key
         return
     try:
-        cmd.create(_OBJ_CARVE, snap_sel, 1, 1)
-        _track(_OBJ_CARVE)
-        cmd.disable(_OBJ_CARVE)
-        surf_key = (protein_sel, lig_union, state, surf_dist,
+        surf_key = (protein_sel, names, surf_dist, extra,
                     bool(_stepper.color_surf_by_type), _stepper.surf_charge_style)
         cached = _surf_cache.pop(surf_key, None)
         if cached and cached in cmd.get_names("objects"):
@@ -1860,7 +1941,7 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
             return
         cmd.select(_OBJ_SHELL_ATOMS,
                    f"byres (({protein_sel}) within {surf_dist + SURF_SHELL_PAD} "
-                   f"of ({snap_sel}))",
+                   f"of ({_OBJ_CARVE}))",
                    enable=0, state=1)
         cmd.create(_OBJ_SURF, _OBJ_SHELL_ATOMS, 1, 1)
         cmd.delete(_OBJ_SHELL_ATOMS)
@@ -1878,8 +1959,6 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, state=0):
         _surf_cur_key = surf_key
     except Exception:
         pass
-    finally:
-        _delete_snapshots(snaps)
 
     _shell_key = key
 
@@ -2109,23 +2188,31 @@ class LigandStepper:
         obj, st = self.poses[self.current_index]
         self._ensure_shell(obj, st)
 
-    def _ensure_shell(self, obj, st):
-        """Shell, labels and pocket surface for pose (obj, st).
+    def _ensure_shell(self, obj, st=None):
+        """Shell, labels and pocket surface for the ligand `obj`.
 
-        Every pose gets its own: the surface is carved against the ligand, so a
-        shell left over from another pose lets this one poke through it.  That
-        is true in states mode too, where the poses are states of one object and
-        the shell used to be built once for the first.  Cheap when the pose was
-        seen before (see the surface cache) or when the surface is off.
+        Built around the ligand's footprint over all of its poses, so it is the
+        same for every pose of that object: a no-op while stepping within an
+        object, and a rebuild (or surface-cache hit) only when the object
+        changes, as it does in objects mode.
         """
         visible = []
         if self.show_pose:
-            visible.append(obj)
+            # Pose objects that sit in the same site share one footprint, so
+            # stepping between them does not rebuild anything; objects in
+            # different pockets (a crystal complex with several ligands) each
+            # get their own, as the view should follow the ligand.
+            pose_objs = list(dict.fromkeys(o for o, _ in self.poses))
+            if (self.mode == "objects" and len(pose_objs) > 1
+                    and _single_pocket(pose_objs)):
+                visible.extend(pose_objs)
+            else:
+                visible.append(obj)
         if self.ref_ligand and self.show_ref:
             visible.append(self.ref_ligand)
         if not visible:
             return
-        _create_shell(self.protein_sel, visible, state=st)
+        _create_shell(self.protein_sel, visible)
         if not self.show_surface and _OBJ_SURF in _created_objects:
             try: cmd.hide("surface", _OBJ_SURF)
             except Exception: pass
@@ -2260,7 +2347,7 @@ class LigandStepper:
                 _color_ref_ligand(self.ref_ligand)
 
         shell_ligs = lig_sels + ([self.ref_ligand] if self.ref_ligand and self.show_ref else [])
-        _create_shell(self.protein_sel, shell_ligs)
+        _create_shell(self.protein_sel, shell_ligs, extra=tuple(indices[:2]))
 
         if self.show_cmp_hbonds:
             # Same vetted pipeline as the single-pose view: candidates from PyMOL,
