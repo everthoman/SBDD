@@ -125,7 +125,7 @@ If there's no scores file at all (pure geometry, e.g. a session someone else bui
 | `ci_load_poses <path> [, protein]` | Load a poses SDF's geometry (as one multi-state object) and SD scores together, then run Setup |
 | `ci_next` | Step to next pose |
 | `ci_prev` | Step to previous pose |
-| `ci_goto <index>` | Jump to pose by 0-based index |
+| `ci_goto <index>` | Jump to pose by 1-based number (as shown in the summary and `ci_bookmarks`) |
 | `ci_update` | Re-detect interactions for current pose |
 | `ci_refresh` | Sync panel to current PyMOL state |
 | `ci_load_scores <path>` | Load per-pose SD properties from an SDF file (scores only — use `ci_load_poses` if you also need the geometry loaded) |

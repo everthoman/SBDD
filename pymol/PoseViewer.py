@@ -516,8 +516,10 @@ def _ligand_charges(model, aromatic_atoms=frozenset()):
     stops firing.  In that case infer the groups ionised at physiological pH,
     conservatively:
 
-      negative   carboxylate / phosphate / sulfonate: a terminal O on a C, P or
-                 S that carries at least two such terminal O
+      negative   carboxylate / phosphate / sulfonate: a terminal O on a C or P
+                 that carries at least two such terminal O, or on an S that
+                 carries three (two would also match sulfonamide and sulfone);
+                 acyl sulfonamide / sulfonylurea N without an explicit H
       positive   quaternary N; guanidinium / amidinium (N on a carbon bearing
                  two or more N); aliphatic amines outside the ring system that
                  are neither amides nor anilines
@@ -549,12 +551,28 @@ def _ligand_charges(model, aromatic_atoms=frozenset()):
             (x,) = tuple(hv)
             if el[x] not in ("C", "P", "S"):
                 continue
-            if sum(1 for o in heavy[x]
-                   if el[o] == "O" and len(heavy[o]) == 1) >= 2:
+            n_term_o = sum(1 for o in heavy[x]
+                           if el[o] == "O" and len(heavy[o]) == 1)
+            # Sulfonamides and sulfones also carry two terminal O on S, and
+            # are neutral; only a sulfonate / sulfonic acid has three.
+            if n_term_o >= (3 if el[x] == "S" else 2):
                 neg.add(i)
         elif e == "N":
             if len(adj[i]) >= 4:
                 pos.add(i)          # quaternary / protonated primary amine
+                continue
+            # Acyl sulfonamide / sulfonylurea: N between a sulfonyl S and a
+            # carbonyl C, pKa ~4-5, so ionised at pH 7.4.  An explicit H on N
+            # means the file says it is protonated; leave that one alone.
+            if (len(hv) == 2 and len(adj[i]) == 2
+                    and any(el[x] == "S" and sum(
+                        1 for o in heavy[x]
+                        if el[o] == "O" and len(heavy[o]) == 1) >= 2
+                        for x in hv)
+                    and any(el[x] == "C" and any(
+                        el[o] in ("O", "S") and len(heavy[o]) == 1
+                        for o in heavy[x]) for x in hv)):
+                neg.add(i)
                 continue
             if any(el[x] in ("N", "O", "S") for x in hv):
                 continue            # nitro, sulfonamide, hydrazine, N-oxide
@@ -2610,8 +2628,10 @@ def ci_next():
 def ci_prev():
     _stepper.prev(); _print_summary()
 
-def ci_goto(index=0):
-    _stepper.goto(int(index)); _print_summary()
+def ci_goto(index=1):
+    """Jump to a pose by its 1-based number, as shown in the summary and
+    ci_bookmarks."""
+    _stepper.goto(int(index) - 1); _print_summary()
 
 def ci_update():
     _stepper._show_current(); _print_summary()
@@ -2851,6 +2871,7 @@ cmd.extend("ci_goto", ci_goto)
 cmd.extend("ci_update", ci_update)
 cmd.extend("ci_refresh", ci_refresh)
 cmd.extend("ci_load_scores", ci_load_scores)
+cmd.extend("ci_load_poses", ci_load_poses)
 cmd.extend("ci_clear", ci_clear)
 cmd.extend("ci_bookmarks", ci_bookmarks)
 cmd.extend("ci_export", ci_export)
@@ -3373,7 +3394,7 @@ def _open_gui():
             _stepper.show_comparison(pose_indices)
             update_ui()
         elif len(pose_indices) == 1:
-            ci_goto(pose_indices[0])
+            ci_goto(pose_indices[0] + 1)
             update_ui()
 
     def update_ui():
@@ -3561,7 +3582,7 @@ def _open_gui():
         if item0 is not None:
             pose_idx = item0.data(QtCore.Qt.UserRole)
             if pose_idx is not None:
-                ci_goto(pose_idx)
+                ci_goto(pose_idx + 1)
         update_ui()
 
     def do_prev():
@@ -3574,7 +3595,7 @@ def _open_gui():
         ci_refresh(); update_ui()
 
     def do_go():
-        ci_goto(sp.value() - 1); update_ui()
+        ci_goto(sp.value()); update_ui()
 
     def _tog(cb, attr):
         def h(state):
@@ -3897,7 +3918,9 @@ def _open_gui():
                 for i, (o, s) in enumerate(_stepper.poses):
                     if o == cur_obj and s == pymol_st:
                         _stepper.current_index = i
-                        _stepper._update(o, state=s)
+                        # The shell/surface is built per pose in objects mode,
+                        # so it has to follow the slider too.
+                        _stepper._show_current()
                         update_ui()
                         break
 
