@@ -1997,11 +1997,8 @@ class LigandStepper:
         _prepare_scene(prot, all_ligs)
         if self.ref_ligand:
             _color_ref_ligand(self.ref_ligand)
-        # Before _show_current, because the auto-zoom frames the shell: build it
-        # after and the very first pose would be framed on the ligand alone.
-        # The state is passed explicitly, so it no longer matters what the state
-        # slider happened to read when Setup was pressed.
-        _create_shell(prot, all_ligs, state=self.poses[0][1] if self.poses else 1)
+        # _show_current builds the shell for the first pose before it zooms, so
+        # the state slider's position at Setup time does not matter.
         self._show_current()
         self._prefetch_all_properties()
         self._build_obj_colors()
@@ -2086,6 +2083,7 @@ class LigandStepper:
                     self.current_index = i
                     break
             obj, st2 = self.poses[self.current_index]
+            self._ensure_shell(obj, st2)
             if self.auto_zoom:
                 self._zoom_to_site(obj, st2)
             self._update(obj, state=st2)
@@ -2096,20 +2094,32 @@ class LigandStepper:
         """Rebuild the residue shell + pocket surface for the current pose.
 
         For use when something behind the shell changes mid-session (the
-        surface reach).  Objects mode reuses _show_current, which rebuilds the
-        shell anyway; states mode has to build it explicitly because there it
-        is otherwise static after setup.
+        surface reach, or switching the surface on).
         """
         global _shell_key
         if not self.poses:
             return
         _shell_key = None
-        if self.mode != "states":
-            self._show_current()
+        obj, st = self.poses[self.current_index]
+        self._ensure_shell(obj, st)
+
+    def _ensure_shell(self, obj, st):
+        """Shell, labels and pocket surface for pose (obj, st).
+
+        Every pose gets its own: the surface is carved against the ligand, so a
+        shell left over from another pose lets this one poke through it.  That
+        is true in states mode too, where the poses are states of one object and
+        the shell used to be built once for the first.  Cheap when the pose was
+        seen before (see the surface cache) or when the surface is off.
+        """
+        visible = []
+        if self.show_pose:
+            visible.append(obj)
+        if self.ref_ligand and self.show_ref:
+            visible.append(self.ref_ligand)
+        if not visible:
             return
-        _, st = self.poses[self.current_index]
-        ligs = [self.state_object] + ([self.ref_ligand] if self.ref_ligand else [])
-        _create_shell(self.protein_sel, ligs, state=st)
+        _create_shell(self.protein_sel, visible, state=st)
         if not self.show_surface and _OBJ_SURF in _created_objects:
             try: cmd.hide("surface", _OBJ_SURF)
             except Exception: pass
@@ -2136,21 +2146,9 @@ class LigandStepper:
                     cmd.disable(self.ref_ligand)
             except Exception:
                 pass
-        # In objects mode each ligand may sit in a different pocket, so rebuild
-        # the shell/surface around just the current ligand (+ ref if visible).
-        # Done before the zoom, which targets the shell and so needs it to
-        # describe the pose about to be shown rather than the previous one.
-        if self.mode == "objects":
-            visible = []
-            if self.show_pose:
-                visible.append(obj)
-            if self.ref_ligand and self.show_ref:
-                visible.append(self.ref_ligand)
-            if visible:
-                _create_shell(self.protein_sel, visible, state=st)
-                if not self.show_surface and _OBJ_SURF in _created_objects:
-                    try: cmd.hide("surface", _OBJ_SURF)
-                    except Exception: pass
+        # Rebuild the shell/surface around the pose about to be shown, before the
+        # zoom, which targets the shell and so needs it to describe this pose.
+        self._ensure_shell(obj, st)
         if self.auto_zoom:
             self._zoom_to_site(obj, st)
         self._update(obj, state=st)
@@ -4218,6 +4216,7 @@ def _open_gui():
             for i, (o, s) in enumerate(_stepper.poses):
                 if s == pymol_st:
                     _stepper.current_index = i
+                    _stepper._ensure_shell(o, s)
                     _stepper._update(o, state=s)
                     update_ui()
                     break
