@@ -1,4 +1,4 @@
-# PoseViewer v1.15
+# PoseViewer v1.16
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -51,7 +51,7 @@ A real example, a uracil fragment in UNG2: the ring N–H sits 2.91 Å from a ba
 
 **This needs explicit hydrogens.** A contact with no hydrogen on either endpoint has nothing to measure, and is passed through unfiltered rather than guessed at — so the filter does its work on protonated or MD-minimised structures and stays out of the way on a bare PDB from the RCSB. (Before v1.6 the summary used a separate proximity rule — any N/O/S/F pair within 3.5 Å — which counted acceptor–acceptor pairs such as two carbonyl oxygens as H-bonds and could also miss ones PyMOL drew.) All other interaction types are detected geometrically.
 
-Salt bridges and the ligand side of pi-cation need to know which ligand atoms are charged. SDF and mol2 carry formal charges and are used as-is; PDB has no charge column, so a ligand read out of a complex arrives neutral. In that case PoseViewer infers the groups that are ionised at physiological pH — carboxylate/phosphate/sulfonate as anions, quaternary N, guanidinium/amidinium and non-aromatic aliphatic amines as cations — and deliberately stays silent on ring nitrogens, anilines and ureas, whose basicity depends on context. Non-polar hydrogens (C-H) are excluded from clash detection. Contacts/clashes are hidden by default.
+Salt bridges and the ligand side of pi-cation need to know which ligand atoms are charged. SDF and mol2 carry formal charges and are used as given (a charge on one atom of a carboxylate or guanidinium is shared with its partner atoms; charge-separated nitro and N-oxide groups count as neutral); PDB has no charge column, so a ligand read out of a complex arrives neutral. In that case PoseViewer infers the groups that are ionised at physiological pH — carboxylate/phosphate/sulfonate and acyl sulfonamide/sulfonylurea N as anions (plain sulfonamides and sulfones are neutral), quaternary N, guanidinium/amidinium (not an aminopyrimidine-type NH2 on an aromatic carbon) and non-aromatic aliphatic amines as cations — and deliberately stays silent on ring nitrogens, anilines and ureas, whose basicity depends on context. Non-polar hydrogens (C-H) are excluded from clash detection, and donor/acceptor pairs (H···O/N, N···O) are judged against hydrogen-bond contact distances rather than the van der Waals sum, so an H-bond is never reported as a clash. Contacts/clashes are hidden by default.
 
 Reference ligand interactions are drawn with the same color scheme but thinner dashes (65% radius) to distinguish them from pose interactions.
 
@@ -268,7 +268,7 @@ Each selected pose is extracted into a temporary single-state PyMOL object (`_cm
 Poses from different ligand objects are colored by their object's palette entry (assigned at Setup). Poses from the same object (e.g. two states of the same docking run) receive distinct slot colors instead. The color palette is: cyan, orange, forest green, hotpink, violet, salmon. The reference ligand always remains magenta.
 
 **Interactions:**  
-All interaction types are hidden in compare mode to keep the view uncluttered — the spatial overlay is the primary information. Enable **H-bonds in compare mode** in the Navigate group to overlay H-bond dashes colored to match each pose. This option is only available when **Docking poses** is checked, since H-bond comparison is only meaningful when poses share the same binding site.
+All interaction types are hidden in compare mode to keep the view uncluttered — the spatial overlay is the primary information. Enable **H-bonds in compare mode** in the Navigate group to overlay H-bond dashes colored to match each pose, vetted by the same D–H···A and acceptor-geometry filters as the single-pose view. This option is only available when **Docking poses** is checked, since H-bond comparison is only meaningful when poses share the same binding site.
 
 **Limitations:**  
 Maximum two poses at a time (excluding the reference ligand). The full interaction panel (all types) remains available in single-pose mode.
@@ -281,7 +281,7 @@ Maximum two poses at a time (excluding the reference ligand). The full interacti
 |---|---|
 | H-bonds (dashes and console listing) | PyMOL polar contacts `cmd.distance(mode=2)`, then D–H···A ≥ `hbond_min_angle` (130° default) wherever an explicit hydrogen exists, and for carbonyl/carboxylate O acceptors, base-atom···O···H within 85–160° |
 | Halogen bonds | Cl/Br/I donor ··· O/N/S acceptor, ≤ 3.5 Å |
-| Salt bridges | Cationic ligand N ··· Asp/Glu O, or Arg/Lys/His N ··· anionic ligand O, ≤ 4.0 Å. Ligand charges come from the file when it has them, otherwise inferred (see above) |
+| Salt bridges | Cationic ligand N ··· Asp/Glu O, or Arg/Lys/His N ··· anionic ligand O, ≤ 4.0 Å. Ligand charges come from the file when it has them, otherwise inferred (see above). One bridge is reported per charged group and residue (the closest O···N pair), not one per atom pair |
 | Aromatic H-bonds | Aromatic C ··· O/N/S acceptor, ≤ 3.5 Å, C-H···A angle > 120° |
 | Water bridges | HOH oxygen simultaneously within 3.5 Å of ligand N/O/S/F and protein N/O/S/F |
 | Pi-pi face-to-face | Centroid distance ≤ 4.8 Å, normal angle ≤ 40° |
