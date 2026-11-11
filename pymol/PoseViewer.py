@@ -45,6 +45,12 @@ except ImportError:
 from pymol import cmd, CmdException
 from pymol.creating import unquote
 
+# Where this file was loaded from, for ci_reload.  Captured now, at load time:
+# `run` executes in PyMOL's shared namespace, where __file__ is PyMOL's own
+# __init__.py and only __script__ names the file being run, while a plugin
+# import has the reverse.
+_SOURCE_PATH = globals().get("__script__") or globals().get("__file__")
+
 # Rendering globals a .pse can silently overwrite on load (they're saved into
 # the session file along with everything else), captured here at import time —
 # i.e. as PyMOL itself set them up for this machine, including anything an rc
@@ -3120,6 +3126,34 @@ USAGE
 def ci_gui():
     _open_gui()
 
+
+def ci_reload():
+    """Re-run PoseViewer.py from disk, so an updated file takes effect without
+    restarting PyMOL.
+
+USAGE
+    ci_reload
+
+    Clears the current session (as ci_clear does), closes the PoseViewer window
+    and runs the file again; the window is reopened if it was open.  Loaded
+    poses and bookmarks are forgotten — run Setup / Load poses again.
+    """
+    path = _SOURCE_PATH
+    if (not path or not os.path.exists(path)
+            or os.path.basename(path).lower() != "poseviewer.py"):
+        print("PoseViewer: cannot reload - source file not found "
+              f"({path!r}).")
+        return
+    reopen = _gui_window is not None
+    ci_clear()
+    if _gui_window is not None:
+        try: _gui_window.close()
+        except Exception: pass
+    cmd.run(path)
+    print(f"PoseViewer: reloaded from '{path}'.")
+    if reopen:
+        cmd.do("ci_gui")
+
 cmd.extend("ci_setup", ci_setup)
 cmd.extend("ci_next", ci_next)
 cmd.extend("ci_prev", ci_prev)
@@ -3134,6 +3168,7 @@ cmd.extend("ci_export", ci_export)
 cmd.extend("ci_export_sdf", ci_export_sdf)
 cmd.extend("ci_hbond_angle", ci_hbond_angle)
 cmd.extend("ci_gui", ci_gui)
+cmd.extend("ci_reload", ci_reload)
 
 
 # ---------------------------------------------------------------------------
@@ -4243,6 +4278,7 @@ def _set_gui_none():
 __version__ = "1.21"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
+print("  ci_reload  - re-run this file from disk (pick up an updated version)")
 print("  ci_setup   - setup from command line")
 print("  ci_load_poses  - load a poses SDF's geometry + scores together, then Setup")
 print("  ci_refresh     - sync to current PyMOL state / state slider")

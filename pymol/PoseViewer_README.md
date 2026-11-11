@@ -128,6 +128,7 @@ If there's no scores file at all (pure geometry, e.g. a session someone else bui
 | `ci_goto <index>` | Jump to pose by 1-based number (as shown in the summary and `ci_bookmarks`) |
 | `ci_update` | Re-detect interactions for current pose |
 | `ci_refresh` | Sync panel to current PyMOL state |
+| `ci_reload` | Re-run `PoseViewer.py` from disk so an updated file takes effect without restarting PyMOL (clears the session; reopens the window if it was open) |
 | `ci_load_scores <path>` | Load per-pose SD properties from an SDF file (scores only — use `ci_load_poses` if you also need the geometry loaded) |
 | `ci_bookmarks` | List all bookmarked poses to the console |
 | `ci_export <path> [, bookmarked]` | Write the pose table (SD properties) to CSV; a `.tsv`/`.txt` extension switches to tab-separated |
