@@ -171,7 +171,7 @@ SHELL_DIST = 5.0
 # the pocket) and then carved back to just the wall facing the ligand.  Surfacing
 # only the atoms within SHELL_DIST instead produced a closed blob around a bag of
 # clipped side chains that swallowed the pocket residues whole.
-SURF_CARVE_DIST = 7.5                # default surface reach (Å); GUI-tunable per session
+SURF_CARVE_DIST = 5.0                # default surface reach (Å); GUI-tunable per session
 SURF_SHELL_PAD  = 3.0                # extra reach for the SES scratch geometry
 ZOOM_BUFFER = 2.0             # padding around the binding site when auto-zooming
 
@@ -3321,7 +3321,7 @@ def _open_gui():
 
     win = QtWidgets.QWidget()
     _gui_window = win
-    win.setWindowTitle("PoseViewer")
+    win.setWindowTitle(f"PoseViewer v{__version__}")
     win.setMinimumWidth(440)
     win.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
     win.destroyed.connect(lambda: _set_gui_none())
