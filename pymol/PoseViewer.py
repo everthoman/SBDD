@@ -1951,15 +1951,20 @@ def _create_shell(protein_sel, ligand_sels, dist=SHELL_DIST, extra=None):
         cmd.delete(_OBJ_SHELL_ATOMS)
         _track(_OBJ_SURF)
         cmd.hide("everything", _OBJ_SURF)
-        cmd.show("surface", _OBJ_SURF)
+        # Every setting goes on before the surface is shown.  PyMOL's render
+        # thread builds a surface as soon as it is visible, and each later
+        # surface_* setting throws that build away and starts another; with the
+        # carve settings applied after `show`, the first build ran on the whole
+        # uncarved residue shell.
         cmd.set("surface_carve_selection", _OBJ_CARVE, _OBJ_SURF)
         cmd.set("surface_carve_cutoff", surf_dist, _OBJ_SURF)
         cmd.set("surface_carve_normal_cutoff", -0.5, _OBJ_SURF)
+        cmd.set("transparency", 0.4, _OBJ_SURF)
         if _stepper.color_surf_by_type:
             _color_surface_by_type(_OBJ_SURF)
         else:
             cmd.set("surface_color", "grey80", _OBJ_SURF)
-        cmd.set("transparency", 0.4, _OBJ_SURF)
+        cmd.show("surface", _OBJ_SURF)
         _surf_cur_key = surf_key
     except Exception:
         pass
@@ -2432,7 +2437,11 @@ class LigandStepper:
         for idx in self._cmp_indices:
             if 0 <= idx < len(self.poses):
                 obj, st = self.poses[idx]
-                parts.append(f"{obj}(s{st})" if cmd.count_states(obj) > 1 else obj)
+                try:
+                    multi = cmd.count_states(obj) > 1
+                except Exception:   # object deleted since the comparison was drawn
+                    multi = False
+                parts.append(f"{obj}(s{st})" if multi else obj)
         return "  vs  ".join(parts) if parts else "Compare"
 
     def _update(self, lig, state=-1):
