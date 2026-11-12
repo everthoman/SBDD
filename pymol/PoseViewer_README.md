@@ -1,4 +1,4 @@
-# PoseViewer v1.22
+# PoseViewer v1.23
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
