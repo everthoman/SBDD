@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.24
+PoseViewer - PyMOL Plugin  v1.25
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -25,7 +25,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-21
-Version: 1.24
+Version: 1.25
 License: MIT
 """
 
@@ -4414,7 +4414,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.24"
+__version__ = "1.25"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_reload  - re-run this file from disk (pick up an updated version)")
