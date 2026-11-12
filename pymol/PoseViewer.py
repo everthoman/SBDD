@@ -843,7 +843,11 @@ def _detect_interactions(
 
     # --- Ligand rings and charges (the pairwise loop needs the charges) ------
     # Done once, up front, from the model already in hand.
-    need_rings = do_pipi or do_arom_hb or do_pi_cation
+    # Charge inference needs the ligand's aromatic atoms too (ring N and the
+    # exocyclic N of an aminopyrimidine are not cations), so rings are perceived
+    # for the salt-bridge check as well - otherwise switching off pi-pi, pi-cation
+    # and aromatic H-bonds turned every ring N into a phantom cation.
+    need_rings = do_pipi or do_arom_hb or do_pi_cation or do_salt
     lig_rings_info: list = []
     lig_adj = None
     if need_rings:
