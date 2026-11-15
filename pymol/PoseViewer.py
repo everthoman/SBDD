@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.25
+PoseViewer - PyMOL Plugin  v1.27
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -25,7 +25,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-21
-Version: 1.25
+Version: 1.27
 License: MIT
 """
 
@@ -2011,6 +2011,8 @@ class LigandStepper:
         # Frame the pocket rather than the ligand.  Set False to go back to
         # zooming the ligand alone.
         self.zoom_to_shell: bool = True
+        # States mode: step ligand by ligand instead of in file (score) order.
+        self.group_by_ligand: bool = True
         self.zoom_buffer: float = ZOOM_BUFFER
         # How far the pocket surface reaches around the ligand (Display group).
         self.surf_dist: float = SURF_CARVE_DIST
@@ -2086,7 +2088,8 @@ class LigandStepper:
                 pass
         self.ref_ligand = extras[0] if extras else None
         n_states = cmd.count_states(obj)
-        self.poses = [(obj, st) for st in range(1, n_states + 1)]
+        self.poses = self._group_by_ligand(
+            [(obj, st) for st in range(1, n_states + 1)])
         all_ligs = [obj] + extras if extras else obj
         _prepare_scene(prot, all_ligs)
         if self.ref_ligand:
@@ -2096,6 +2099,46 @@ class LigandStepper:
         self._show_current()
         self._prefetch_all_properties()
         self._build_obj_colors()
+
+    def _group_by_ligand(self, poses):
+        """Order the states of a multi-ligand object ligand by ligand.
+
+        Docking output is usually sorted by score across the whole library, so
+        the states of one ligand are scattered through the file.  Group them by
+        record title (first appearance first, file order within a ligand).
+        Titles come from the scores SDF when loaded, else from the per-state
+        titles; with fewer than two distinct titles the order is unchanged.
+        """
+        def title(i, obj, st):
+            if i < len(self.sdf_records):
+                return self.sdf_records[i].get("_name") or ""
+            return _pose_title(obj, st)
+        if not self.group_by_ligand:
+            return poses
+        names = [title(st - 1, o, st) for o, st in poses]
+        if len(set(names)) < 2 or "" in names:
+            return poses
+        rank = {}
+        for n in names:
+            rank.setdefault(n, len(rank))
+        order = sorted(range(len(poses)), key=lambda i: (rank[names[i]], i))
+        return [poses[i] for i in order]
+
+    def regroup(self):
+        """Re-order the states-mode pose list after group_by_ligand changes,
+        keeping the current pose selected."""
+        if self.mode != "states" or not self.poses:
+            return
+        key = self.pose_key()
+        obj = self.state_object
+        self._cleanup_cmp()
+        self._cmp_indices = []
+        self.poses = self._group_by_ligand(
+            [(obj, st) for st in range(1, cmd.count_states(obj) + 1)])
+        self.current_index = self.poses.index(key) if key in self.poses else 0
+        self.last_result = None
+        self._prefetch_all_properties()
+        self._show_current()
 
     def _count(self):
         return len(self.poses)
@@ -2528,7 +2571,8 @@ class LigandStepper:
                 self._sdf_mismatch = (len(recs), n)
                 print(f"PoseViewer: {len(recs)} SDF record(s) for {n} state(s) "
                       f"— table aligned to the states.")
-            self.all_properties = (recs + [{}] * n)[:n]
+            padded = recs + [{}] * n
+            self.all_properties = [padded[st - 1] for _o, st in self.poses]
             return
 
         # Objects mode with SDF loaded: match records to poses by _name.
@@ -3586,6 +3630,11 @@ def _open_gui():
                        "change.\nSet _stepper.zoom_to_shell = False to zoom the "
                        "ligand alone instead.")
     cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
+    cb_group = QtWidgets.QCheckBox("Group poses by ligand")
+    cb_group.setChecked(_stepper.group_by_ligand)
+    cb_group.setToolTip("Step through all poses of one ligand before the next.\n"
+                        "Off: follow the file order (e.g. a global score ranking).\n"
+                        "Applies to a single multi-ligand pose object.")
     cb_cstype = QtWidgets.QCheckBox("Color surface by charge"); cb_cstype.setChecked(True)
     cmb_cs = QtWidgets.QComboBox(); cmb_cs.addItems(["ramp", "tiers"])
     cmb_cs.setCurrentText(_stepper.surf_charge_style)
@@ -3612,6 +3661,7 @@ def _open_gui():
     l_disp.addWidget(cb_rlbl)
     l_disp.addWidget(cb_zoom)
     l_disp.addWidget(cb_lig_h)
+    l_disp.addWidget(cb_group)
     l_disp.addWidget(cb_cstype)
     hl_cs = QtWidgets.QHBoxLayout()
     hl_cs.addSpacing(20)
@@ -4083,6 +4133,13 @@ def _open_gui():
     _hba_later = _debounced(_apply_hba)
     cb_zoom.stateChanged.connect(lambda s: setattr(_stepper, "auto_zoom", cb_zoom.isChecked()))
 
+    def do_group_toggle(_s=None):
+        _stepper.group_by_ligand = cb_group.isChecked()
+        _stepper.regroup()
+        update_ui()
+        rebuild_table()
+    cb_group.stateChanged.connect(do_group_toggle)
+
     def do_bookmark():
         _stepper.toggle_bookmark()
         update_ui()
@@ -4414,7 +4471,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.25"
+__version__ = "1.27"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_reload  - re-run this file from disk (pick up an updated version)")
