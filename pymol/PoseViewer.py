@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.28
+PoseViewer - PyMOL Plugin  v1.30
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -25,7 +25,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-21
-Version: 1.28
+Version: 1.30
 License: MIT
 """
 
@@ -3417,7 +3417,13 @@ def _open_gui():
     bot_l = QtWidgets.QVBoxLayout(bot_w)
     bot_l.setContentsMargins(0, 0, 0, 0)
     bot_l.setSpacing(5)
-    splitter.addWidget(bot_w)
+    # Scrollable: with the Display group expanded the options outgrow the
+    # lower pane, and the rows past the bottom edge were simply cut off.
+    bot_scroll = QtWidgets.QScrollArea()
+    bot_scroll.setWidgetResizable(True)
+    bot_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+    bot_scroll.setWidget(bot_w)
+    splitter.addWidget(bot_scroll)
 
     # Setup
     g_s = QtWidgets.QGroupBox("Setup")
@@ -3540,7 +3546,12 @@ def _open_gui():
     b_export.setFixedWidth(80)
     lbl_pd = QtWidgets.QLabel("")
     lbl_pd.setStyleSheet("color: grey;")
-    hl_pd.addWidget(b_copy); hl_pd.addWidget(b_export)
+    cb_group = QtWidgets.QCheckBox("Group poses by ligand")
+    cb_group.setChecked(_stepper.group_by_ligand)
+    cb_group.setToolTip("Step through all poses of one ligand before the next.\n"
+                        "Off: follow the file order (e.g. a global score ranking).\n"
+                        "Applies to a single multi-ligand pose object.")
+    hl_pd.addWidget(b_copy); hl_pd.addWidget(b_export); hl_pd.addWidget(cb_group)
     hl_pd.addWidget(lbl_pd, 1)
     l_pd.addLayout(hl_pd)
     top_l.addWidget(g_pd, 1)
@@ -3647,11 +3658,6 @@ def _open_gui():
                        "change.\nSet _stepper.zoom_to_shell = False to zoom the "
                        "ligand alone instead.")
     cb_lig_h = QtWidgets.QCheckBox("Show nonpolar H on ligands"); cb_lig_h.setChecked(False)
-    cb_group = QtWidgets.QCheckBox("Group poses by ligand")
-    cb_group.setChecked(_stepper.group_by_ligand)
-    cb_group.setToolTip("Step through all poses of one ligand before the next.\n"
-                        "Off: follow the file order (e.g. a global score ranking).\n"
-                        "Applies to a single multi-ligand pose object.")
     cb_cstype = QtWidgets.QCheckBox("Color surface by charge"); cb_cstype.setChecked(True)
     cmb_cs = QtWidgets.QComboBox(); cmb_cs.addItems(["ramp", "tiers"])
     cmb_cs.setCurrentText(_stepper.surf_charge_style)
@@ -3678,7 +3684,6 @@ def _open_gui():
     l_disp.addWidget(cb_rlbl)
     l_disp.addWidget(cb_zoom)
     l_disp.addWidget(cb_lig_h)
-    l_disp.addWidget(cb_group)
     l_disp.addWidget(cb_cstype)
     hl_cs = QtWidgets.QHBoxLayout()
     hl_cs.addSpacing(20)
@@ -4488,7 +4493,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.28"
+__version__ = "1.30"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_reload  - re-run this file from disk (pick up an updated version)")
