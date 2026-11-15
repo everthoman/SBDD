@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.27
+PoseViewer - PyMOL Plugin  v1.28
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -25,7 +25,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-21
-Version: 1.27
+Version: 1.28
 License: MIT
 """
 
@@ -2086,7 +2086,24 @@ class LigandStepper:
                     extras.append(n)
             except Exception:
                 pass
-        self.ref_ligand = extras[0] if extras else None
+        # Several ligand objects besides the poses (e.g. a session that already
+        # holds the docked ligands): only one can be the reference.  Prefer a
+        # well-known name, then a single-state object; hide the rest so they
+        # do not sit on top of every pose.
+        def _single(n):
+            try: return cmd.count_states(n) <= 1
+            except Exception: return False
+        ref = next((n for n in extras if n.lower() in _REF_LIGAND_NAME_HINTS), None)
+        if ref is None:
+            ref = next((n for n in extras if _single(n)), None)
+        if ref is None and len(extras) == 1:
+            ref = extras[0]
+        self.ref_ligand = ref
+        for n in extras:
+            if n != ref:
+                try: cmd.disable(n)
+                except Exception: pass
+        extras = [ref] if ref else []
         n_states = cmd.count_states(obj)
         self.poses = self._group_by_ligand(
             [(obj, st) for st in range(1, n_states + 1)])
@@ -4471,7 +4488,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.27"
+__version__ = "1.28"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_reload  - re-run this file from disk (pick up an updated version)")
