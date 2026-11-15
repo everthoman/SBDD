@@ -1,4 +1,4 @@
-# PoseViewer v1.25
+# PoseViewer v1.31
 
 A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization with support for multi-pose docking review and multi-ligand structure browsing.
 
@@ -23,6 +23,7 @@ A PyMOL plugin for Maestro-inspired protein-ligand interaction visualization wit
 - **Docking poses mode**: explicit toggle that gates H-bond compare — avoids meaningless cross-pocket H-bond overlays when browsing extracted ligands from a multi-ligand crystal structure
 - Reference ligand overlay: always-visible co-crystal/reference with its own interaction lines
 - Pose data table: sortable, clickable table of docking scores and SD properties per pose
+- **Group poses by ligand**: docking output ranked across a whole library interleaves the ligands; with this on (the default) poses are stepped and listed ligand by ligand, and the grouping survives re-sorting on any column
 - Qt GUI panel with collapsible groups and per-type interaction toggles
 - Interaction summary printed to the PyMOL console on every step
 
@@ -213,13 +214,23 @@ Reference ligand interaction lines respect the same **Show distance labels** tog
 
 ### Pose Data group
 
-Sortable table showing any SD data tag properties present in the poses SDF — docking score, ligand efficiency, a custom rank, whatever the file carries, from any tool. Column headers are movable. Rank columns are excluded.
+Sortable table showing any SD data tag properties present in the poses SDF — docking score, ligand efficiency, a custom rank, whatever the file carries, from any tool. Column headers are movable. Rank columns are excluded. Click a header to sort ascending, click again for descending.
 
 **Where the columns come from.** Only Incentive PyMOL reads SD tags off a loaded SDF automatically; open-source PyMOL discards them at load. Everywhere else, load the poses via **Poses (SDF)** / **Load poses** (or `ci_load_poses`) so the same file's SD tags get read alongside the geometry — otherwise the table shows only the `Ligand_ID` column and none of the scores. Setup prints a note to the console when it ends up in that state.
 
 The `Ligand_ID` column is always populated with the real per-pose name: PyMOL loads a multi-record SDF as one object named after the file, but it keeps each record's title line per state, and PoseViewer reads it back with `cmd.get_title`. (A few docking tools write the same title on every pose of a compound, or leave it blank — then `Ligand_ID` falls back to the object name.)
 
 **Single-click** a row to navigate to that pose. **Ctrl-click** (or click a second row) to enter compare mode — the two most recently selected rows are shown simultaneously. A third selection automatically drops the oldest, maintaining a rolling window of two. Clicking Prev/Next or Go exits compare mode and resumes single-pose navigation.
+
+#### Group poses by ligand
+
+The checkbox next to **Copy all** / **Export…**. Docking output is usually sorted by score across the whole library, so the poses of one ligand are scattered through the file (for example, the first nine poses by `CNN_VS` come from five different ligands). With **Group poses by ligand** on (the default), the table keeps each ligand's poses together and Prev/Next steps through one ligand before moving on to the next.
+
+- Ligands are ordered by where each first appears in the current sort, and each ligand's poses keep that sort order. Sorting `CNN_VS` descending therefore puts the ligand holding the best pose first, with its poses running best to worst.
+- Grouping is re-applied on top of whichever column you sort on.
+- Turning it off gives the plain global sort. The selected pose and bookmarks stay put when you toggle.
+- Ligands are told apart by `Ligand_ID` (the per-pose record title). If the titles are blank or all identical there is nothing to group by and the order is unchanged.
+- In states mode, other ligand objects already in the session (for example docked ligands saved in a `.pse`) are hidden when poses are loaded; only the reference ligand stays visible.
 
 #### Getting the data out
 
