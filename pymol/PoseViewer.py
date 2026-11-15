@@ -1,5 +1,5 @@
 """
-PoseViewer - PyMOL Plugin  v1.30
+PoseViewer - PyMOL Plugin  v1.31
 ==============================
 Maestro-inspired protein-ligand interaction viewer for PyMOL, with support
 for multi-pose docking review and multi-ligand structure browsing.
@@ -25,7 +25,7 @@ Installation:
 
 Authors: Evert J. Homan, PhD; Claude (Anthropic)
 Date:    2026-09-21
-Version: 1.30
+Version: 1.31
 License: MIT
 """
 
@@ -3717,6 +3717,42 @@ def _open_gui():
     _sel_order: list = []   # table row indices in arrival order (max 2)
     _sel_busy  = [False]    # re-entrancy guard for programmatic selection changes
 
+    # Sorting is done here rather than by Qt so that "group by ligand" can be
+    # applied on top of any column's order: ligands stay contiguous, ordered by
+    # where they first appear in the sorted list, and each ligand's poses keep
+    # the sorted order.
+    _sort = {"col": None, "asc": True}
+
+    def _cell_key(props, col, data_cols):
+        """Sort key mirroring _SortItem: numbers first, then text."""
+        if col == 0:
+            return (1, "")
+        val = props.get(data_cols[col - 1], "")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return (0, val, "")
+        return (1, 0, "" if val == "" else str(val))
+
+    def _table_order(data_cols):
+        """Pose indices in the order the table rows should appear."""
+        props = _stepper.all_properties
+        order = list(range(len(props)))
+        col = _sort["col"]
+        if col is not None and 0 <= col <= len(data_cols):
+            if col == 0:
+                keys = [(0 if _stepper.is_bookmarked(i) else 1,) for i in order]
+            else:
+                keys = [_cell_key(props[i], col, data_cols) for i in order]
+            order.sort(key=lambda i: keys[i], reverse=not _sort["asc"])
+        if _stepper.group_by_ligand:
+            names = [props[i].get("_name") or "" for i in order]
+            if len(set(names)) > 1 and "" not in names:
+                rank = {}
+                for n in names:
+                    rank.setdefault(n, len(rank))
+                pos = {pi: k for k, pi in enumerate(order)}
+                order.sort(key=lambda i: (rank[props[i].get("_name") or ""], pos[i]))
+        return order
+
     def rebuild_table():
         tw_pd.setSortingEnabled(False)
         tw_pd.clearContents()
@@ -3726,15 +3762,19 @@ def _open_gui():
             tw_pd.setColumnCount(0)
             return
         data_cols = _stepper.table_columns()
+        if _sort["col"] is not None and _sort["col"] > len(data_cols):
+            _sort["col"] = None
+        order = _table_order(data_cols)
         # Column 0 = bookmark ★, then data columns
         tw_pd.setColumnCount(1 + len(data_cols))
         headers = ["★"] + ["Ligand_ID" if c == "_name" else c for c in data_cols]
         tw_pd.setHorizontalHeaderLabels(headers)
         tw_pd.setRowCount(len(all_props))
-        for r, props in enumerate(all_props):
+        for r, pi in enumerate(order):
+            props = all_props[pi]
             # Bookmark column
-            bm_item = _SortItem("★" if _stepper.is_bookmarked(r) else "")
-            bm_item.setData(QtCore.Qt.ItemDataRole.UserRole, r)
+            bm_item = _SortItem("★" if _stepper.is_bookmarked(pi) else "")
+            bm_item.setData(QtCore.Qt.ItemDataRole.UserRole, pi)
             bm_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.AlignmentFlag.AlignVCenter)
             tw_pd.setItem(r, 0, bm_item)
             # Data columns
@@ -3749,7 +3789,7 @@ def _open_gui():
                 else:
                     display = str(val)
                 item = _SortItem(display)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, r)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, pi)
                 if isinstance(val, (int, float)):
                     item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, val)
                     item.setTextAlignment(
@@ -3757,9 +3797,24 @@ def _open_gui():
                 tw_pd.setItem(r, 1 + c, item)
         tw_pd.resizeColumnsToContents()
         tw_pd.setColumnWidth(0, 24)  # bookmark column stays compact
-        tw_pd.setSortingEnabled(True)
+        hdr = tw_pd.horizontalHeader()
+        hdr.setSectionsClickable(True)
+        if _sort["col"] is None:
+            hdr.setSortIndicatorShown(False)
+        else:
+            hdr.setSortIndicatorShown(True)
+            hdr.setSortIndicator(
+                _sort["col"], QtCore.Qt.SortOrder.AscendingOrder if _sort["asc"]
+                else QtCore.Qt.SortOrder.DescendingOrder)
         _sel_order.clear()
         _highlight_current_row()
+
+    def _on_header_click(col):
+        if _sort["col"] == col:
+            _sort["asc"] = not _sort["asc"]
+        else:
+            _sort["col"], _sort["asc"] = col, True
+        rebuild_table()
 
     def _table_snapshot(selected_only):
         """(headers, rows) exactly as the table currently reads.
@@ -4302,6 +4357,7 @@ def _open_gui():
     sc_copy.activated.connect(lambda: do_copy(True))
 
     tw_pd.itemSelectionChanged.connect(on_selection_changed)
+    tw_pd.horizontalHeader().sectionClicked.connect(_on_header_click)
 
     g_pd.toggled.connect(lambda checked: update_ui())
 
@@ -4493,7 +4549,7 @@ def _set_gui_none():
 # Startup
 # ---------------------------------------------------------------------------
 
-__version__ = "1.30"
+__version__ = "1.31"
 print(f"PoseViewer v{__version__} loaded.")
 print("  ci_gui     - open GUI panel")
 print("  ci_reload  - re-run this file from disk (pick up an updated version)")
